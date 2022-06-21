@@ -18,6 +18,9 @@ height = 2160
 # 1080p
 width = 1920
 height = 1080
+# vga
+width = 640
+height = 480
 
 import numpy
 import time
@@ -405,13 +408,21 @@ startTime = time.time()
 for frameIndex in range(frameCount):
   draw_frame()
   frame = canvas.draw()
+  frame = frame.reshape((1, *frame.shape))
 
   try:
-    frameVolume = slicer.util.getNode("Volume")
-    frameArray = slicer.util.arrayFromVolume(frameVolume)
-    frameArray[:] = frame
-    slicer.util.arrayFromVolumeModified(frameVolume)
+    frameVolume = slicer.util.getNode("Frame")
   except slicer.util.MRMLNodeNotFoundException:
-    slicer.util.addVolumeFromArray(frame)
+    frameVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVectorVolumeNode", "Frame")
+    imageData = vtk.vtkImageData()
+    imageData.SetDimensions(width, height, 1)
+    imageData.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 4)
+    frameVolume.SetAndObserveImageData(imageData)
+    frameVolume.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(numpy.diag([1,-1,1,1])))
+
+  frameArray = slicer.util.arrayFromVolume(frameVolume)
+  frameArray[:] = frame
+  slicer.util.arrayFromVolumeModified(frameVolume)
+
   slicer.app.processEvents()
 print(f"{frameCount} frames at {frameCount / (time.time() - startTime)} fps")
