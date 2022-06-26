@@ -9,6 +9,8 @@ Use wgpu, a rust-python WebGPU implementation, in 3D Slicer
   * Rely on the web standard and mulitiple widely used implementations to provide stability.
 * Leverage the Python and WebGPU ecosystems in Slicer.
 * Share WebGPU experience and possibly code with web systems such as VTK, vtk.js, cornerstone3D, etc.
+* Support GPU computing without proprietary code or complex installations.
+* Allow editing the GPU code on-the-fly using metaprogramming to adapt to the data.
 
 ## Status
 
