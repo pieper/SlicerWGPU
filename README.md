@@ -16,6 +16,13 @@ Use wgpu, a rust-python WebGPU implementation, in 3D Slicer
 
 This is currently an experiment that works for a few test cases.  It is not clear yet what performance gains will be possible.
 
+### Usage
+In the Slicer Python console of a recent Slicer (tested on 5.0.2 on Mac, Linux, and Windows):
+```
+pip_install("wgpu")
+```
+Then download the examples from the [Experiments](Experiments) directory.  Edit the `filePath` variable to reflect your download location and past in the commands from the comment at the top of the file.
+
 ### What currently works
 * [Compute shaders](Experiments/slicer-compute.py) can be used to operate on numpy arrays (e.g. arrays from Slicer volumes).
 * [Vertex and fragment shaders](Experiments/slicer-render.py) can be used to render into off-screen framebuffers.  Results of rendering are available as numpy arrays that can be rendered in the Slicer interface via conventional VTK or Qt methods.
@@ -44,3 +51,9 @@ The wgpu Python module provides an api to access GPU features such as buffer all
    * [WGPU](https://github.com/gfx-rs/wgpu) is in Rust for use in Firefox
 * While both implementations should ultimately be compatible with Slicer, WGPU offers a convenient pip-installable package compatible with Slicer and ready to use today.
 * Longer-term there has [been discussion](https://discourse.vtk.org/t/vulkan-development/3307/22) of using WebGPU in VTK via Dawn, which would make it available via C++ or Python in Slicer.  Since Dawn and WGPU implement WGPU, porting code and shaders between the two should be managable.
+
+## Next steps
+* I plan to try implementing a useful algorithm in the form of a compute shader and compare performance with a CPU implementation.  The [GrowCut](Experiments/GrowCut.py) file is a work-in-progress example of that.
+* If these experiments are useful then this can be converted into a proper Slicer extension so it's easy for people to download and use.  Ideally we could have a set of filters and editor tools based on the infastructure.
+* Timing tests and feature comparisons to other GPU methods would be helpful.
+* The WebGPU and wgpu projects are developing rapidly so we should monitor them for progress
