@@ -16,6 +16,12 @@ Use wgpu, a rust-python WebGPU implementation, in 3D Slicer
 
 This is currently an experiment that works for a few test cases.  It is not clear yet what performance gains will be possible.
 
+## Architecture
+The wgpu Python module provides an api to access GPU features such as buffer allocation, memory transfers, and shader pipelines like you would have via JavaScript in a browser.  But note that wgpu does not call JavaScipt code.  Instead it calls the same underlying implementation that would be used by the browser itself (that is, the python code calls machine code that was generated from rust source code).  Shaders are cross-compiled on the fly from [W3C standard WGSL](https://www.w3.org/TR/WGSL/) to the platform's shader language, e.g. to [Metal Shading Language](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) on Apple machines.
+
+![image](https://user-images.githubusercontent.com/126077/175791989-4f3fdcdb-6e80-4d0c-b199-1ff7b51c2b6a.png)
+
+
 ### Usage
 In the Slicer Python console of a recent Slicer (tested on 5.0.2 on Mac, Linux, and Windows):
 ```
@@ -33,12 +39,6 @@ Then download the examples from the [Experiments](Experiments) directory.  Edit 
 * Compute shader operations that last over 2 seconds on windows can trigger windows to kill the process (async needed).
 * Because wgpu is an abstraction, it will in some ways be a least-common-denominator of functionality compared to native solutions like Metal.  It's not clear yet if this will be a significant issue in terms of performance or availability of features.
 * Using an abstraction and cross-compilation layer may introduce feature skew or implementation bugs across platforms.  Such issues may be difficult or impossible to track down and fix.  This is less of a concern for wgpu because it is not one-person or small team effort, but a coordinated project implementing a well defined web standard for a widely-used browser.
-
-## Architecture
-The wgpu Python module provides an api to access GPU features such as buffer allocation, memory transfers, and shader pipelines like you would have via JavaScript in a browser.  But note that wgpu does not call JavaScipt code.  Instead it calls the same underlying implementation that would be used by the browser itself (that is, the python code calls machine code that was generated from rust source code).  Shaders are cross-compiled on the fly from [W3C standard WGSL](https://www.w3.org/TR/WGSL/) to the platform's shader language, e.g. to [Metal Shading Language](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) on Apple machines.
-
-![image](https://user-images.githubusercontent.com/126077/175791989-4f3fdcdb-6e80-4d0c-b199-1ff7b51c2b6a.png)
-
 
 ## Background
 
