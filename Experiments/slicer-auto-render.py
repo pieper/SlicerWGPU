@@ -25,19 +25,23 @@ height = 2160
 #height = 480
 
 import numpy
+import sys
 import time
+
+if renderMode == "auto":
+    try:
+        import wgpu
+        import glfw
+    except ModuleNotFoundError:
+        pip_install("wgpu")
+        pip_install("glfw")
+        import glfw
+    import wgpu.gui.auto
 
 import wgpu
 import wgpu.backends.rs  # Select backend
 import wgpu.gui.offscreen
 
-if renderMode == "auto":
-    try:
-        import glfw
-    except ModuleNotFoundError:
-        pip_install("glfw")
-        import glfw
-    import wgpu.gui.auto
 
 forLaterUse = """
 try:
@@ -58,6 +62,16 @@ bufferSize = headArray.flatten().shape[0]
 # Create a canvas to render to
 if renderMode == "auto":
     canvas = wgpu.gui.auto.WgpuCanvas()
+    if sys.platform == "win32":
+      # canvas.close()
+      topLevel = qt.QWidget()
+      topLevel.geometry = qt.QRect(50,50, 500, 600)
+      topLayout = qt.QHBoxLayout()
+      topLevel.setLayout(topLayout)
+      window = qt.QWindow.fromWinId(canvas.get_window_id())
+      widget = qt.QWidget.createWindowContainer(window, slicer.util.mainWindow())
+      topLayout.addWidget(widget)
+      topLevel.show()
 else:
     canvas = wgpu.gui.offscreen.WgpuCanvas(width=width, height=height)
 
