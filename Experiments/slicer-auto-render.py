@@ -6,6 +6,7 @@ Install wgpu as described here: https://github.com/pygfx/wgpu-py
 Tested with Slicer 5.0.2 and wgpu (basically 0.8.1)
 
 filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/slicer-auto-render.py"
+filePath = "/home/ubuntu/slicer/SlicerWGPU/Experiments/slicer-auto-render.py"
 
 exec(open(filePath).read())
 
@@ -28,19 +29,25 @@ import numpy
 import sys
 import time
 
+try:
+    import wgpu
+    import wgpu.backends.rs  # Select backend
+    import wgpu.gui.offscreen
+except ModuleNotFoundError:
+    pip_install("wgpu")
+    import wgpu
+    import wgpu.backends.rs  # Select backend
+    import wgpu.gui.offscreen
+
 if renderMode == "auto":
     try:
-        import wgpu
         import glfw
     except ModuleNotFoundError:
-        pip_install("wgpu")
         pip_install("glfw")
         import glfw
     import wgpu.gui.auto
-
-import wgpu
-import wgpu.backends.rs  # Select backend
-import wgpu.gui.offscreen
+else:
+    import wgpu.gui.offscreen
 
 
 forLaterUse = """
@@ -62,7 +69,9 @@ bufferSize = headArray.flatten().shape[0]
 # Create a canvas to render to
 if renderMode == "auto":
     canvas = wgpu.gui.auto.WgpuCanvas()
-    if sys.platform == "win32":
+    #supportedPlatforms = ["win32", "linux2"]
+    supportedPlatforms = ["win32",]
+    if sys.platform in supportedPlatforms:
       # canvas.close()
       topLevel = qt.QWidget()
       topLevel.geometry = qt.QRect(50,50, 500, 600)
