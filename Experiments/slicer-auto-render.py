@@ -39,6 +39,7 @@ if renderMode == "auto":
         import glfw
     import wgpu.gui.auto
 
+forLaterUse = """
 try:
     mrHead = slicer.util.getNode("MRHead")
 except slicer.util.MRMLNodeNotFoundException:
@@ -50,6 +51,7 @@ sliceSize =  headArray.shape[1] * headArray.shape[2]
 headIntArray = headArray.astype('int32')
 bufferSize = headArray.flatten().shape[0]
 
+"""
 
 # %% Create canvas and device
 
