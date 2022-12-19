@@ -11,16 +11,16 @@ exec(open(filePath).read())
 
 """
 
-frameCount = 100
+frameCount = 500
 # 4k
 width = 3840
 height = 2160
 # 1080p
-width = 1920
-height = 1080
+#width = 1920
+#height = 1080
 # vga
-width = 640
-height = 480
+#width = 640
+#height = 480
 
 import numpy
 import time
@@ -425,4 +425,6 @@ for frameIndex in range(frameCount):
   slicer.util.arrayFromVolumeModified(frameVolume)
 
   slicer.app.processEvents()
+  if frameIndex % 100 == 0:
+      print(f"frame {frameIndex} of {frameCount}")
 print(f"{frameCount} frames at {frameCount / (time.time() - startTime)} fps")
