@@ -55,7 +55,7 @@ bufferSize = headArray.flatten().shape[0]
 
 # Create a canvas to render to
 if renderMode == "auto":
-    canvas = wgpu.gui.auto.WgpuCanvas(width=width, height=height)
+    canvas = wgpu.gui.auto.WgpuCanvas()
 else:
     canvas = wgpu.gui.offscreen.WgpuCanvas(width=width, height=height)
 
@@ -419,23 +419,27 @@ def draw_frame():
 
 startTime = time.time()
 for frameIndex in range(frameCount):
-  draw_frame()
-  frame = canvas.draw()
-  frame = frame.reshape((1, *frame.shape))
+  if renderMode == "auto":
+    canvas.request_draw(draw_frame)
+    canvas._draw_frame_and_present()
+  else:
+    draw_frame()
+    frame = canvas.draw()
+    frame = frame.reshape((1, *frame.shape))
 
-  try:
-    frameVolume = slicer.util.getNode("Frame")
-  except slicer.util.MRMLNodeNotFoundException:
-    frameVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVectorVolumeNode", "Frame")
-    imageData = vtk.vtkImageData()
-    imageData.SetDimensions(width, height, 1)
-    imageData.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 4)
-    frameVolume.SetAndObserveImageData(imageData)
-    frameVolume.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(numpy.diag([1,-1,1,1])))
+    try:
+      frameVolume = slicer.util.getNode("Frame")
+    except slicer.util.MRMLNodeNotFoundException:
+      frameVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLVectorVolumeNode", "Frame")
+      imageData = vtk.vtkImageData()
+      imageData.SetDimensions(width, height, 1)
+      imageData.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 4)
+      frameVolume.SetAndObserveImageData(imageData)
+      frameVolume.SetIJKToRASMatrix(slicer.util.vtkMatrixFromArray(numpy.diag([1,-1,1,1])))
 
-  frameArray = slicer.util.arrayFromVolume(frameVolume)
-  frameArray[:] = frame
-  slicer.util.arrayFromVolumeModified(frameVolume)
+    frameArray = slicer.util.arrayFromVolume(frameVolume)
+    frameArray[:] = frame
+    slicer.util.arrayFromVolumeModified(frameVolume)
 
   slicer.app.processEvents()
   if frameIndex % 100 == 0:
