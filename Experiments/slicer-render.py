@@ -29,18 +29,6 @@ import wgpu
 import wgpu.backends.rs  # Select backend
 import wgpu.gui.offscreen
 
-try:
-    mrHead = slicer.util.getNode("MRHead")
-except slicer.util.MRMLNodeNotFoundException:
-    import SampleData
-    mrHead = SampleData.SampleDataLogic().downloadMRHead()
-
-headArray = slicer.util.arrayFromVolume(mrHead)
-sliceSize =  headArray.shape[1] * headArray.shape[2]
-headIntArray = headArray.astype('int32')
-bufferSize = headArray.flatten().shape[0]
-
-
 # %% Create canvas and device
 
 # Create a canvas to render to
