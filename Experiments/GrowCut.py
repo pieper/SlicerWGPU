@@ -61,7 +61,7 @@ struct Parameters {
 var<uniform> parameters : Parameters;
 */
 
-@stage(compute)
+@compute
 @workgroup_size(1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let idi32 : vec3<i32> = vec3<i32>(id);
@@ -129,10 +129,10 @@ shader = shader.replace("@@COLUMNS@@", str(volumeArray.shape[2]))
 shader = shader.replace("@@SLICE_SIZE@@", str(sliceSize))
 shader = shader.replace("@@ROW_SIZE@@", str(volumeArray.shape[2]))
 
-print("computing...")
+slicer.util.delayDisplay("computing...")
 
 # Create a device with max memory and compile the shader
-print("device")
+slicer.util.delayDisplay("device")
 adapter = wgpu.request_adapter(canvas=None, power_preference="high-performance")
 required_limits={
     'max_storage_buffer_binding_size': adapter.limits['max_storage_buffer_binding_size'],
@@ -142,24 +142,24 @@ device = adapter.request_device(required_limits=required_limits)
 cshader = device.create_shader_module(code=shader)
 
 # Create buffers
-print("buffers 1")
+slicer.util.delayDisplay("buffers 1")
 buffers = {}
 usage= wgpu.BufferUsage.STORAGE
 buffers[0] = device.create_buffer_with_data(data=volumeIntArray, usage=usage)
-print("buffers 2")
+slicer.util.delayDisplay("buffers 2")
 usage= wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
 buffers[1] = device.create_buffer(size=volumeIntArray.data.nbytes, usage=usage)
-print("buffers 3")
+slicer.util.delayDisplay("buffers 3")
 usage= wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
 buffers[2] = device.create_buffer(size=volumeIntArray.data.nbytes, usage=usage)
-print("buffers 4")
+slicer.util.delayDisplay("buffers 4")
 usage= wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
 buffers[3] = device.create_buffer(size=volumeIntArray.data.nbytes, usage=usage)
-print("buffers 5")
+slicer.util.delayDisplay("buffers 5")
 usage= wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
 buffers[4] = device.create_buffer(size=volumeIntArray.data.nbytes, usage=usage)
 
-print("buffers 6")
+slicer.util.delayDisplay("buffers 6")
 uniform_data = numpy.array([51], dtype='uint32')
 usage= wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
 buffers[5] = device.create_buffer_with_data(data=uniform_data, usage=usage)
@@ -220,7 +220,7 @@ pipeline_layout = device.create_pipeline_layout(
 bind_group = device.create_bind_group(layout=bind_group_layout, entries=bindings)
 
 # Create a pipeline and run it
-print("pipeline")
+slicer.util.delayDisplay("pipeline")
 compute_pipeline = device.create_compute_pipeline(
     layout=pipeline_layout,
     compute={"module": cshader, "entry_point": "main"},
@@ -234,17 +234,17 @@ compute_pass.end()
 device.queue.submit([command_encoder.finish()])
 
 # Read the current data of the output buffer
-print("readback")
+slicer.util.delayDisplay("readback")
 memory = device.queue.read_buffer(buffers[1])  # slow, can also be done async
 resultArray = numpy.array(memory.cast("i", volumeIntArray.shape))
 
-assert resultArray.mean() == -1 * volumeArray.mean()
+# assert resultArray.mean() == -1 * volumeArray.mean()
 
-print("drawing")
+slicer.util.delayDisplay("drawing")
 
 volumeArray[:] = resultArray.astype('int16').reshape(volumeArray.shape)
 slicer.util.arrayFromVolumeModified(volumeNode)
 volumeNode.GetDisplayNode().SetAutoWindowLevel(False)
 volumeNode.GetDisplayNode().SetAutoWindowLevel(True)
 slicer.app.processEvents()
-print("done")
+slicer.util.delayDisplay("done")

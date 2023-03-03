@@ -4,7 +4,7 @@ Install wgpu as described here: https://github.com/pygfx/wgpu-py
 
 Tested with Slicer 5.0.2 and wgpu 0.8.1
 
-filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/GrowCut.py"
+filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/slicer-compute-long-form.py"
 
 exec(open(filePath).read())
 
@@ -35,7 +35,7 @@ var<storage,read> data1: array<i32>;
 @group(0) @binding(1)
 var<storage,read_write> data2: array<i32>;
 
-@stage(compute)
+@compute
 @workgroup_size(1)
 fn main(@builtin(global_invocation_id) index: vec3<u32>) {
     let i: u32 = index.x * @@SLICE_SIZE@@ + index.y * @@ROW_SIZE@@ + index.z;

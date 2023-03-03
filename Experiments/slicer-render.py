@@ -32,7 +32,7 @@ import wgpu.gui.offscreen
 # %% Create canvas and device
 
 # Create a canvas to render to
-canvas = wgpu.gui.offscreen.WgpuCanvas(width=width, height=height)
+canvas = wgpu.gui.offscreen.WgpuCanvas(size=(width, height))
 
 # Create a wgpu device
 adapter = wgpu.request_adapter(canvas=canvas, power_preference="high-performance")
@@ -153,7 +153,6 @@ device.queue.write_texture(
     {
         "offset": 0,
         "bytes_per_row": texture_data.strides[0],
-        "rows_per_image": 0,
     },
     texture_size,
 )
@@ -180,8 +179,11 @@ struct VertexOutput {
     @location(0) texcoord: vec2<f32>,
     @builtin(position) pos: vec4<f32>,
 };
+struct FragmentOutput {
+    @location(0) color : vec4<f32>,
+};
 
-@stage(vertex)
+@vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     let ndc: vec4<f32> = r_locals.transform * in.pos;
     var out: VertexOutput;
@@ -196,10 +198,13 @@ var r_tex: texture_2d<f32>;
 @group(0) @binding(2)
 var r_sampler: sampler;
 
-@stage(fragment)
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+@fragment
+fn fs_main(in: VertexOutput) -> FragmentOutput {
     let value = textureSample(r_tex, r_sampler, in.texcoord).r;
-    return vec4<f32>(value, value, value, 1.0);
+    let physical_color = vec3<f32>(pow(value, 2.2));  // gamma correct
+    var out: FragmentOutput;
+    out.color = vec4<f32>(physical_color.rgb, 1.0);
+    return out;
 }
 """
 
@@ -395,7 +400,7 @@ def draw_frame():
 startTime = time.time()
 for frameIndex in range(frameCount):
   draw_frame()
-  frame = canvas.draw()
+  frame = numpy.array(canvas.draw())
   frame = frame.reshape((1, *frame.shape))
 
   try:

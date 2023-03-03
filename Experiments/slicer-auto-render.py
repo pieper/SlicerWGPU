@@ -1,9 +1,7 @@
 
 """
 
-Install wgpu as described here: https://github.com/pygfx/wgpu-py
-
-Tested with Slicer 5.0.2 and wgpu (basically 0.8.1)
+NOT WORKING
 
 filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/slicer-auto-render.py"
 filePath = "/home/ubuntu/slicer/SlicerWGPU/Experiments/slicer-auto-render.py"

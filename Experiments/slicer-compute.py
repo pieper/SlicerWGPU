@@ -30,16 +30,16 @@ bufferSize = headArray.flatten().shape[0]
 shader = """
 
 @group(0) @binding(0)
-var<storage,read> data1: array<i32>;
+var<storage,read> inputData: array<i32>;
 
 @group(0) @binding(1)
-var<storage,read_write> data2: array<i32>;
+var<storage,read_write> outputData: array<i32>;
 
-@stage(compute)
+@compute
 @workgroup_size(1)
 fn main(@builtin(global_invocation_id) index: vec3<u32>) {
     let i: u32 = index.x * @@SLICE_SIZE@@ + index.y * @@ROW_SIZE@@ + index.z;
-    data2[i] = -1 * data1[i];
+    outputData[i] = -1 * inputData[i];
 }
 
 """
