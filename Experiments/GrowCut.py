@@ -5,6 +5,7 @@ Install wgpu as described here: https://github.com/pygfx/wgpu-py
 Tested with Slicer 5.0.2 and wgpu 0.8.1
 
 filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/GrowCut.py"
+filePath = "c:/pieper/SlicerWGPU/Experiments/GrowCut.py"
 exec(open(filePath).read())
 
 Note that wgsl only support 32 bit ints, but the short data could be

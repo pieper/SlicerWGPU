@@ -1,12 +1,16 @@
 """
-filePath = "/mnt/extra/pieper/SlicerWGPU/Experiments/glfwPyOpenGL.py"
-filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/glfwPyOpenGL.py"
+import sys
+if sys.platform == 'darwin':
+  filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/glfwPyOpenGL.py"
+if sys.platform == 'win32':
+  filePath = "c:/pieper/SlicerWGPU/Experiments/glfwPyOpenGL.py"
+if sys.platform == 'linux2':
+  filePath = "/home/ubuntu/SlicerWGPU/Experiments/glfwPyOpenGL.py"
 
 exec(open(filePath).read())
 """
 
 import sys
-
 
 try:
     import glfw

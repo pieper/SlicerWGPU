@@ -5,9 +5,9 @@ NOT WORKING
 
 filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/slicer-auto-render.py"
 filePath = "/home/ubuntu/slicer/SlicerWGPU/Experiments/slicer-auto-render.py"
+filePath = "c:/pieper/SlicerWGPU/Experiments/slicer-auto-render.py"
 
 exec(open(filePath).read())
-
 """
 
 renderMode = "auto"
@@ -39,9 +39,12 @@ except ModuleNotFoundError:
 
 if renderMode == "auto":
     try:
+        import wgpu
         import glfw
     except ModuleNotFoundError:
+        pip_install("wgpu")
         pip_install("glfw")
+        import wgpu
         import glfw
     import wgpu.gui.auto
 else:
@@ -67,8 +70,7 @@ bufferSize = headArray.flatten().shape[0]
 # Create a canvas to render to
 if renderMode == "auto":
     canvas = wgpu.gui.auto.WgpuCanvas()
-    #supportedPlatforms = ["win32", "linux2"]
-    supportedPlatforms = ["win32",]
+    supportedPlatforms = ["win32", "linux2"]
     if sys.platform in supportedPlatforms:
       # canvas.close()
       topLevel = qt.QWidget()
@@ -81,6 +83,7 @@ if renderMode == "auto":
       topLevel.show()
 else:
     canvas = wgpu.gui.offscreen.WgpuCanvas(width=width, height=height)
+
 
 # Create a wgpu device
 adapter = wgpu.request_adapter(canvas=canvas, power_preference="high-performance")
