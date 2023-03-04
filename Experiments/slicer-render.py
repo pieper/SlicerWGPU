@@ -6,6 +6,7 @@ Install wgpu as described here: https://github.com/pygfx/wgpu-py
 Tested with Slicer 5.0.2 and wgpu (basically 0.8.1)
 
 filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/slicer-render.py"
+filePath = "c:/pieper/SlicerWGPU/Experiments/slicer-render.py"
 
 exec(open(filePath).read())
 
@@ -400,6 +401,7 @@ def draw_frame():
 startTime = time.time()
 for frameIndex in range(frameCount):
   draw_frame()
+  slicer.app.processEvents()
   frame = numpy.array(canvas.draw())
   frame = frame.reshape((1, *frame.shape))
 
