@@ -40,6 +40,8 @@ if sys.platform == 'linux2':
     qwindow = qt.QWindow.fromWinId(glfw.get_x11_window(glfwWindow))
 elif sys.platform == 'darwin':
     qwindow = qt.QWindow.fromWinId(glfw.get_cocoa_window(glfwWindow))
+elif sys.platform == 'win32':
+    qwindow = qt.QWindow.fromWinId(glfw.get_win32_window(glfwWindow))
 
 qcontainer = qt.QWidget.createWindowContainer(qwindow)
 layout.addWidget(qcontainer)

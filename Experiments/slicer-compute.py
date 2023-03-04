@@ -5,6 +5,7 @@ Install wgpu as described here: https://github.com/pygfx/wgpu-py
 Tested with Slicer 5.0.2 and wgpu 537c3eab68e9eef77681fc5545532380df26d8cc (basically 0.8.1)
 
 filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/slicer-compute.py"
+filePath = "c:/pieper/SlicerWGPU/Experiments/slicer-compute.py"
 
 exec(open(filePath).read())
 
