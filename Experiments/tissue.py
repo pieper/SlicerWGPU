@@ -36,8 +36,8 @@ volumeArray = slicer.util.arrayFromVolume(volumeNode)
 sliceSize =  volumeArray.shape[1] * volumeArray.shape[2]
 volumeSize =  sliceSize  * volumeArray.shape[0]
 volumeIntArray = volumeArray.astype('int32')
-displacementsArray = numpy.zeros((2,*volumeArray.shape,3),dtype="float32")
-velocitiesArray = numpy.zeros((2,*volumeArray.shape,3),dtype="float32")
+displacementsArray = numpy.zeros((2,*volumeArray.shape,4),dtype="float32")
+velocitiesArray = numpy.zeros((2,*volumeArray.shape,4),dtype="float32")
 
 # wgsl Shader code
 shader = """
@@ -46,10 +46,10 @@ shader = """
 var<storage,read> density: array<i32>;
 
 @group(0) @binding(1)
-var<storage,read_write> displacements: array<vec3<f32>>;
+var<storage,read_write> displacements: array<vec4<f32>>;
 
 @group(0) @binding(2)
-var<storage,read_write> velocities: array<vec3<f32>>;
+var<storage,read_write> velocities: array<vec4<f32>>;
 
 struct Parameters {
     iterations : u32,
@@ -68,60 +68,53 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let idi32 : vec3<i32> = vec3<i32>(id);
     let dimensions = vec3<i32>(@@SLICES@@,@@ROWS@@,@@COLUMNS@@);
     let index: i32 = idi32.x * @@SLICE_SIZE@@ + idi32.y * @@ROW_SIZE@@ + idi32.z;
-    var iteration : u32 = 0u;
     var parameters : Parameters;
     parameters.iterations = 1u;
     parameters.timeStep = 0.01;
     parameters.gravity = vec3<f32>(0.0, 0.0, -0.9);
     let timeStepSquared = parameters.timeStep * parameters.timeStep;
-    loop {
-        if (iteration > parameters.iterations) {
-            break;
-        }
-        let iterationOffset : i32 = @@VOLUME_SIZE@@i * (i32(iteration) % 2i);
-        let indexDensity : i32 = density[index];
-        var mass : f32 = 1.0;
-        var stiffness : f32 = 1.0;
-        if (indexDensity < 0i) {
-            mass = 0.0; // air
-            stiffness = 0.1;
-        } else {
-            stiffness = f32(indexDensity) / 1000.0;
-        }
-        let position : vec3<f32> = vec3<f32>(id) + displacements[iterationOffset + index];
-        var force : vec3<f32> = vec3<f32>(0.0);
-        for (var k : i32 = -1; k < 2; k += 1) {
-            for (var j : i32 = -1; j < 2; j += 1) {
-                for (var i : i32 = -1; i < 2; i += 1) {
-                    if ((k != 0 && j != 0 && i != 0)
-                          && idi32.x + k > 0 && idi32.x + k < dimensions.x
-                          && idi32.y + j > 0 && idi32.y + j < dimensions.y
-                          && idi32.z + i > 0 && idi32.z + i < dimensions.z ) {
-                        let neighborOffset : i32 = k * @@SLICE_SIZE@@ + j * @@ROW_SIZE@@ + i;
-                        let neighborPosition : vec3<f32> = vec3<f32>(id) + displacements[iterationOffset + index + neighborOffset];
-                        let originalLength : f32 = length(vec3<f32>(id) - vec3<f32>(vec3<i32>(idi32.x + k, idi32.y + j, idi32.z+i)));
-                        let strain : f32 = (length(position - neighborPosition) - originalLength) / originalLength;
-                        var lineOfForce : vec3<f32> = normalize(neighborPosition - position);
-                        if (strain < 1.0) {
-                            lineOfForce *= -1.0;
-                        }
-                        let neighborForce : vec3<f32> = stiffness * strain * lineOfForce;
-                        force += neighborForce;
+    let iteration : u32 = 0u; // TODO: make this a function parameter
+    let iterationOffset : i32 = @@VOLUME_SIZE@@i * (i32(iteration) % 2i);
+    let indexDensity : i32 = density[index];
+    var mass : f32 = 1.0;
+    var stiffness : f32 = 1.0;
+    if (indexDensity < 0i) {
+        mass = 0.0; // air
+        stiffness = 0.1;
+    } else {
+        stiffness = f32(indexDensity) / 1000.0;
+    }
+    let position : vec3<f32> = vec3<f32>(id) + displacements[iterationOffset + index].xyz;
+    var force : vec3<f32> = parameters.gravity;
+    for (var k : i32 = -1; k < 2; k += 1) {
+        for (var j : i32 = -1; j < 2; j += 1) {
+            for (var i : i32 = -1; i < 2; i += 1) {
+                if ((k != 0 && j != 0 && i != 0)
+                      && idi32.x + k > 0 && idi32.x + k < dimensions.x
+                      && idi32.y + j > 0 && idi32.y + j < dimensions.y
+                      && idi32.z + i > 0 && idi32.z + i < dimensions.z ) {
+                    let neighborOffset : i32 = k * @@SLICE_SIZE@@ + j * @@ROW_SIZE@@ + i;
+                    let neighborPosition : vec3<f32> = vec3<f32>(id) + displacements[iterationOffset + index + neighborOffset].xyz;
+                    let originalLength : f32 = length(vec3<f32>(id) - vec3<f32>(vec3<i32>(idi32.x + k, idi32.y + j, idi32.z+i)));
+                    let strain : f32 = (length(position - neighborPosition) - originalLength) / originalLength;
+                    var lineOfForce : vec3<f32> = normalize(neighborPosition - position);
+                    if (strain < 1.0) {
+                        lineOfForce *= -1.0;
                     }
+                    let neighborForce : vec3<f32> = stiffness * strain * lineOfForce;
+                    force += neighborForce;
                 }
             }
         }
-        let acceleration : vec3<f32> = force / mass;
-        velocities[iterationOffset + index] += 0.5 * acceleration * timeStepSquared;
-        displacements[iterationOffset + index] += velocities[iterationOffset + index] * parameters.timeStep;
-
-        velocities[index] = vec3<f32>(0.1);
-        displacements[index] = vec3<f32>(0.2);
-        velocities[@@VOLUME_SIZE@@ + index] = vec3<f32>(0.3);
-        displacements[@@VOLUME_SIZE@@ + index] = vec3<f32>(0.4);
-
-        iteration += 1u;
     }
+    let acceleration : vec3<f32> = force / mass;
+    velocities[iterationOffset + index] += vec4<f32>(0.5 * acceleration * timeStepSquared, 0.0);
+    displacements[iterationOffset + index] += velocities[iterationOffset + index] * parameters.timeStep;
+
+    velocities[index] = vec4<f32>(0.1, 0.11, 0.12, 0.13);
+    displacements[index] = vec4<f32>(0.2, 0.21, 0.22, 0.23);
+    velocities[@@VOLUME_SIZE@@ + index] = vec4<f32>(0.3, 0.31, 0.32, 0.33);
+    displacements[@@VOLUME_SIZE@@ + index] = vec4<f32>(0.4, 0.41, 0.42, 0.43);
 }
 
 
@@ -205,8 +198,8 @@ velocitiesArray[:] = numpy.array(velocitiesMemory.cast("f", velocitiesArray.shap
 
 stats = []
 for buffer in range(2):
-    stats.append(velocitiesArray[buffer].max())
-    stats.append(displacementsArray[buffer].max())
+    stats.append(velocitiesArray[buffer].mean())
+    stats.append(displacementsArray[buffer].mean())
 print(stats)
 
 
