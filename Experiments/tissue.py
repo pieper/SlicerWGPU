@@ -17,6 +17,7 @@ packed: https://github.com/gpuweb/gpuweb/issues/2429
 """
 
 import numpy
+import time
 
 try:
     import wgpu
@@ -29,8 +30,8 @@ import wgpu.utils
 
 # Load data
 sampleScenarios = ["MRHead", "CTACardio"]
-scenario = sampleScenarios[0]
 scenario = "smallRandom"
+scenario = sampleScenarios[0]
 
 if scenario in sampleScenarios:
     try:
@@ -43,6 +44,8 @@ elif scenario == "smallRandom":
         volumeNode = slicer.util.getNode("smallRandom")
     except slicer.util.MRMLNodeNotFoundException:
         shape = [8,8,8]
+        shape = [256,256,256]
+        shape = [32,32,32]
         volumeArray = numpy.random.normal(500*numpy.ones(shape), 100)
         volumeArray[volumeArray < 0] = 0
         ijkToRAS = numpy.diag([20,20,20,1])
@@ -56,16 +59,16 @@ volumeIntArray = volumeArray.astype('int32')
 displacementsArray = numpy.zeros((2,*volumeArray.shape,4),dtype="float32")
 velocitiesArray = numpy.zeros((2,*volumeArray.shape,4),dtype="float32")
 
-def addGridTransformFromArray(narray, gridDirectionMatrix=None, name=None):
+def addGridTransformFromArray(narray, referenceVolume=None, name=None):
     """Create a new grid transform node from content of a numpy array and add it to the scene.
 
     Displacement values are deep-copied, therefore if the numpy array
     is modified after calling this method, voxel values in the volume node will not change.
 
     :param narray: numpy array containing grid transform vectors (shape should be [Nk, Nj, Ni, 3], i.e. one displacement vector for slice, row, column location).
-    :param gridDirectionMatrix: 4x4 numpy array or vtk.vtkMatrix4x4 that defines mapping from grid index space to RAS coordinate system (specifying origin, spacing, directions).  This corresponds to the ijkToRAS matrix for a vtkMRMLVolumeNode.
+    :param referenceVolume: a vtkMRMLVolumeNode or subclass to define the directions, origin, and spacing
     :param name: grid transform node name
-    :return: created new volume node
+    :return: created new grid transform node
 
     Example::
 
@@ -78,18 +81,19 @@ def addGridTransformFromArray(narray, gridDirectionMatrix=None, name=None):
     from vtk.util import numpy_support
 
     gridTransformNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLGridTransformNode")
-    if name is None:
+    if name is not None:
         gridTransformNode.SetName(name)
     gridTransform = gridTransformNode.GetTransformFromParent()
-    displacementGrid = slicer.vtkOrientedGridTransform()
-    if gridDirectionMatrix is not None:
-        if not isinstance(gridDirectionMatrix, vtkMatrix4x4):
-            gridDirectionMatrix = vtkMatrixFromArray(gridDirectionMatrix)
-        displacementGrid.SetGridDirectionMatrix(gridDirectionMatrix)
     gridImage = vtk.vtkImageData()
     gridImage.SetDimensions(tuple(reversed(narray.shape[:3])))
     gridType = numpy_support.get_vtk_array_type(narray.dtype)
     gridImage.AllocateScalars(gridType, 3)
+    if referenceVolume is not None:
+        gridDirectionMatrix = vtk.vtkMatrix4x4()
+        referenceVolume.GetIJKToRASDirectionMatrix(gridDirectionMatrix)
+        gridTransform.SetGridDirectionMatrix(gridDirectionMatrix)
+        gridImage.SetOrigin(referenceVolume.GetOrigin())
+        gridImage.SetSpacing(referenceVolume.GetSpacing())
     gridTransform.SetDisplacementGridData(gridImage)
     transformArray = slicer.util.arrayFromGridTransform(gridTransformNode)
     transformArray[:] = narray
@@ -97,11 +101,29 @@ def addGridTransformFromArray(narray, gridDirectionMatrix=None, name=None):
 
     return gridTransformNode
 
-ijkToRASMatrix = vtk.vtkMatrix4x4()
-volumeNode.GetIJKToRASMatrix(ijkToRASMatrix)
-gridTransformNode = addGridTransformFromArray(displacementsArray[0][:,:,:,0:3], gridDirectionMatrix=ijkToRASMatrix, name="Displacements")
+def addVolumeFromGridTransform(gridTransformNode, name=None):
+    """Create a new vector volume from grid transform node from content.
+
+    :param gridTransformNode: source transform
+    :param name: created volume node name
+    :return: created new volume
+    """
+    displacements = arrayFromGridTransform(gridTransformNode)
+    gridTransform = gridTransformNode.GetTransformFromParent()
+    gridDirectionMatrix = gridTransform.GetGridDirectionMatrix()
+    displacementGrid = gridTransform.GetDisplacementGrid()
+    scratchVolume = slicer.vtkMRMLScalarVolumeNode()
+    scratchVolume.SetIJKToRASDirectionMatrix(gridDirectionMatrix)
+    scratchVolume.SetSpacing(displacementGrid.GetSpacing())
+    scratchVolume.SetOrigin(displacementGrid.GetOrigin())
+    ijkToRAS = vtk.vtkMatrix4x4()
+    scratchVolume.GetIJKToRASMatrix(ijkToRAS)
+    return addVolumeFromArray(displacements, ijkToRAS=ijkToRAS, name=name, nodeClassName="vtkMRMLVectorVolumeNode")
+
+gridTransformNode = addGridTransformFromArray(displacementsArray[0][:,:,:,0:3], referenceVolume=volumeNode, name="Displacements")
 volumeNode.SetAndObserveTransformNodeID(gridTransformNode.GetID())
 gridTransformArray = slicer.util.arrayFromGridTransform(gridTransformNode)
+displacementVolume = addVolumeFromGridTransform(gridTransformNode, name="Displacement Volume")
 
 # wgsl Shader code
 shader = """
@@ -179,8 +201,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     // for testing
+    //displacements[index] = vec4<f32>(0.001 * f32(index) * parametersBound.iteration);
     displacements[index] = vec4<f32>(vec3<f32>(20.*mass), 0.0);
-    displacements[index] = vec4<f32>(0.001 * f32(index) * parametersBound.iteration);
 }
 """
 shader = shader.replace("@@SLICES@@", str(volumeArray.shape[0]))
@@ -265,7 +287,8 @@ compute_pipeline = device.create_compute_pipeline(
 
 slicer.app.processEvents()
 
-iterations = 300
+startTime = time.time()
+iterations = 3
 for iteration in range(iterations):
     parametersArray[0] = float(iteration)
     parametersBuffer = device.create_buffer_with_data(data=parametersArray, usage=wgpu.BufferUsage.COPY_SRC)
@@ -290,6 +313,10 @@ for iteration in range(iterations):
         # use for debugging
         velocitiesMemory = device.queue.read_buffer(buffers[2])
         velocitiesArray[:] = numpy.array(velocitiesMemory.cast("f", velocitiesArray.shape))
+
+endTime = time.time()
+
+print(f"Finished at {iterations / (endTime - startTime)} iterations/second, ")
 
 """
 
