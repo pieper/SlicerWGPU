@@ -123,7 +123,6 @@ def addVolumeFromGridTransform(gridTransformNode, name=None):
 gridTransformNode = addGridTransformFromArray(displacementsArray[0][:,:,:,0:3], referenceVolume=volumeNode, name="Displacements")
 volumeNode.SetAndObserveTransformNodeID(gridTransformNode.GetID())
 gridTransformArray = slicer.util.arrayFromGridTransform(gridTransformNode)
-displacementVolume = addVolumeFromGridTransform(gridTransformNode, name="Displacement Volume")
 
 # wgsl Shader code
 shader = """
@@ -202,7 +201,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // for testing
     //displacements[index] = vec4<f32>(0.001 * f32(index) * parametersBound.iteration);
-    displacements[index] = vec4<f32>(vec3<f32>(20.*mass), 0.0);
+    displacements[index] = vec4<f32>(vec3<f32>(id), 0.0);
 }
 """
 shader = shader.replace("@@SLICES@@", str(volumeArray.shape[0]))
@@ -315,6 +314,8 @@ for iteration in range(iterations):
         velocitiesArray[:] = numpy.array(velocitiesMemory.cast("f", velocitiesArray.shape))
 
 endTime = time.time()
+
+displacementVolume = addVolumeFromGridTransform(gridTransformNode, name="Displacement Volume")
 
 print(f"Finished at {iterations / (endTime - startTime)} iterations/second, ")
 
