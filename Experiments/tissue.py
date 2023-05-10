@@ -143,43 +143,44 @@ var<storage,read_write> displacements: array<vec4<f32>>;
 var<storage,read_write> velocities: array<vec4<f32>>;
 
 @group(0) @binding(3)
-var<uniform> parametersBound : Parameters;
+var<uniform> parameters : Parameters;
 
 @compute
 @workgroup_size(1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let idi32 : vec3<i32> = vec3<i32>(id);
     let dimensions = vec3<i32>(@@SLICES@@,@@ROWS@@,@@COLUMNS@@);
+    if (idi32.x > dimensions.x || idi32.y > dimensions.y || idi32.z > dimensions.z) {
+        return;
+    }
     let index: i32 = idi32.x * @@SLICE_SIZE@@ + idi32.y * @@ROW_SIZE@@ + idi32.z;
-
-    var parameters : Parameters;
-    parameters.timeStep = 0.1;
-    parameters.gravity = vec3<f32>(0.,0.,-1.);
+    let prevIndex : i32 = (@@VOLUME_SIZE@@ * (i32(parameters.iteration) % 2)) + index;
+    let nextIndex : i32 = (@@VOLUME_SIZE@@ * (1 - (i32(parameters.iteration) % 2))) + index;
 
     let timeStepSquared = parameters.timeStep * parameters.timeStep;
     let indexDensity : i32 = density[index];
     var mass : f32 = 1.0;
-    var stiffness : f32 = 1.0;
-    if (indexDensity < 0i) {
+    var stiffness : f32 = 10000.0;
+    if (indexDensity < 10i) {
         mass = 0.01; // air
         stiffness = 0.1;
     } else {
         stiffness = f32(indexDensity) / 1000.0;
     }
-    let position : vec3<f32> = vec3<f32>(id) + displacements[index].xyz;
+    let position : vec3<f32> = vec3<f32>(id) + displacements[prevIndex].xyz;
     var force : vec3<f32> = parameters.gravity;
     for (var k : i32 = -1; k < 2; k += 1) {
         for (var j : i32 = -1; j < 2; j += 1) {
             for (var i : i32 = -1; i < 2; i += 1) {
                 if ((k != 0 && j != 0 && i != 0)
-                      && idi32.x + k > 0 && idi32.x + k < dimensions.x
-                      && idi32.y + j > 0 && idi32.y + j < dimensions.y
-                      && idi32.z + i > 0 && idi32.z + i < dimensions.z ) {
+                      && idi32.x + k < 0 && idi32.x + k > dimensions.x
+                      && idi32.y + j < 0 && idi32.y + j > dimensions.y
+                      && idi32.z + i < 0 && idi32.z + i > dimensions.z ) {
                     let neighborOffset : i32 = k * @@SLICE_SIZE@@ + j * @@ROW_SIZE@@ + i;
-                    let neighborPosition : vec3<f32> = vec3<f32>(id) + displacements[index + neighborOffset].xyz;
+                    let neighborPosition : vec3<f32> = vec3<f32>(id) + displacements[prevIndex + neighborOffset].xyz;
                     let originalLength : f32 = length(vec3<f32>(vec3<i32>(k, j, i)));
                     let currentLength : f32 = length(position - neighborPosition) - originalLength;
-                    let strain : f32 = (currentLength - originalLength) / originalLength;
+                    let strain : f32 = abs(currentLength - originalLength) / originalLength;
                     var lineOfForce : vec3<f32> = normalize(neighborPosition - position);
                     if (currentLength < originalLength) {
                         lineOfForce *= -1.0;
@@ -192,16 +193,24 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let acceleration : vec3<f32> = force / mass;
     if (idi32.z < dimensions.z - 1i) {
-        velocities[index] += vec4<f32>(0.5 * acceleration * timeStepSquared, 0.0);
-        displacements[index] += velocities[index] * parameters.timeStep;
+        velocities[nextIndex] = velocities[prevIndex] + vec4<f32>(0.5 * acceleration * timeStepSquared, 0.0);
+        displacements[nextIndex] += velocities[nextIndex] * parameters.timeStep;
     } else {
-        velocities[index] += vec4<f32>(0.0);
-        displacements[index] += vec4<f32>(0.0);
+        velocities[nextIndex] += vec4<f32>(0.0);
+        displacements[nextIndex] += vec4<f32>(0.0);
     }
 
     // for testing
-    //displacements[index] = vec4<f32>(0.001 * f32(index) * parametersBound.iteration);
-    displacements[index] = vec4<f32>(vec3<f32>(id), 0.0);
+    //displacements[prevIndex] = vec4<f32>(vec3<f32>(id), 0.0);
+    //displacements[nextIndex] = vec4<f32>(vec3<f32>(id), 0.0);
+    //displacements[index] = vec4<f32>(vec3<f32>(-10.), 0.0);
+    //displacements[nextIndex] = vec4<f32>(vec3<f32>(parameters.gravity), 0.0);
+    //displacements[prevIndex] = vec4<f32>(2.5);
+    //displacements[nextIndex] = vec4<f32>(0.5);
+    //displacements[prevIndex] = vec4<f32>(mass);
+    //displacements[nextIndex] = vec4<f32>(f32(indexDensity));
+    displacements[prevIndex] = vec4<f32>(acceleration, 0.);
+    displacements[nextIndex] = vec4<f32>(force, 0.);
 }
 """
 shader = shader.replace("@@SLICES@@", str(volumeArray.shape[0]))
@@ -213,9 +222,9 @@ shader = shader.replace("@@ROW_SIZE@@", str(volumeArray.shape[2]))
 
 parametersArray = numpy.array([
     0., # iteration
-    0.01, # timeStep
-    0.0, 0.0, -0.00098, # gravity
-    0.0, 0.0, 0.0 # dummies
+    0.1, # timeStep
+    0.0, 0.0, -0.098, # gravity
+    0.0, 0.0, 0.0 # dummies - why?
     ], dtype="float32");
 
 
@@ -287,7 +296,7 @@ compute_pipeline = device.create_compute_pipeline(
 slicer.app.processEvents()
 
 startTime = time.time()
-iterations = 3
+iterations = 2
 for iteration in range(iterations):
     parametersArray[0] = float(iteration)
     parametersBuffer = device.create_buffer_with_data(data=parametersArray, usage=wgpu.BufferUsage.COPY_SRC)
@@ -302,9 +311,10 @@ for iteration in range(iterations):
     # Read the current data of the output buffer
     displacementsMemory = device.queue.read_buffer(buffers[1])  # slow, should be done async
     displacementsArray[:] = numpy.array(displacementsMemory.cast("f", displacementsArray.shape))
-    gridTransformArray[:] = displacementsArray[0][:,:,:,0:3]
+    gridTransformArray[:] = displacementsArray[1 - (iteration % 2)][:,:,:,0:3]
     slicer.util.arrayFromGridTransformModified(gridTransformNode)
-    slicer.util.arrayFromVolumeModified(volumeNode)
+    slicer.util.arrayFromVolumeModified(volumeNode) # to update display
+    print(f"gridTransform: {gridTransformArray.min()}, {gridTransformArray.max()}")
     print(f"{iteration} of {iterations}")
     slicer.app.processEvents()
 
