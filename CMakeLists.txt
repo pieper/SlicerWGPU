@@ -20,6 +20,7 @@ include(${Slicer_USE_FILE})
 #-----------------------------------------------------------------------------
 # Extension modules
 add_subdirectory(WGPUGrowCut)
+add_subdirectory(Graphix)
 ## NEXT_MODULE
 
 #-----------------------------------------------------------------------------
