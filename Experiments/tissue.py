@@ -30,8 +30,8 @@ import wgpu.utils
 
 # Load data
 sampleScenarios = ["MRHead", "CTACardio"]
-scenario = "smallRandom"
 scenario = sampleScenarios[0]
+scenario = "smallRandom"
 
 if scenario in sampleScenarios:
     try:
@@ -148,27 +148,27 @@ var<uniform> parameters : Parameters;
 @compute
 @workgroup_size(1)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let dimensions : vec3<i32> = vec3<i32>(@@SLICES@@,@@ROWS@@,@@COLUMNS@@);
     let idi32 : vec3<i32> = vec3<i32>(id);
-    let dimensions = vec3<i32>(@@SLICES@@,@@ROWS@@,@@COLUMNS@@);
-    if (idi32.x > dimensions.x || idi32.y > dimensions.y || idi32.z > dimensions.z) {
-        return;
-    }
-    let index: i32 = idi32.x * @@SLICE_SIZE@@ + idi32.y * @@ROW_SIZE@@ + idi32.z;
-    let prevIndex : i32 = (@@VOLUME_SIZE@@ * (i32(parameters.iteration) % 2)) + index;
-    let nextIndex : i32 = (@@VOLUME_SIZE@@ * (1 - (i32(parameters.iteration) % 2))) + index;
-
-    let timeStepSquared = parameters.timeStep * parameters.timeStep;
+    let index : i32 = idi32.x * @@SLICE_SIZE@@ + idi32.y * @@ROW_SIZE@@ + idi32.z;
+    let iteration : i32 = i32(parameters.iteration);
+    let currentOffset : i32 = (iteration % 2) * @@VOLUME_SIZE@@;
+    let nextOffset : i32 = ((iteration + 1) % 2) * @@VOLUME_SIZE@@;
+    let timeStepSquared : f32 = parameters.timeStep * parameters.timeStep;
     let indexDensity : i32 = density[index];
-    var mass : f32 = 1.0;
-    var stiffness : f32 = 10000.0;
-    if (indexDensity < 10i) {
-        mass = 0.01; // air
+    var mass : f32 = 5.25086 / 4039135.0; // kg/voxel from MRHead assuming 1 kg/liter
+    var stiffness : f32 = 30.; // MPa
+    if (indexDensity < 100i) {
+        mass /= 1000.; // air
         stiffness = 0.1;
     } else {
         stiffness = f32(indexDensity) / 1000.0;
     }
-    let position : vec3<f32> = vec3<f32>(id) + displacements[prevIndex].xyz;
-    var force : vec3<f32> = parameters.gravity;
+
+    mass *= f32(indexDensity) / 100.0;
+
+    let position : vec3<f32> = vec3<f32>(id) + displacements[currentOffset + index].xyz;
+    var force : vec3<f32> = mass * parameters.gravity;
     for (var k : i32 = -1; k < 2; k += 1) {
         for (var j : i32 = -1; j < 2; j += 1) {
             for (var i : i32 = -1; i < 2; i += 1) {
@@ -177,7 +177,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                       && idi32.y + j < 0 && idi32.y + j > dimensions.y
                       && idi32.z + i < 0 && idi32.z + i > dimensions.z ) {
                     let neighborOffset : i32 = k * @@SLICE_SIZE@@ + j * @@ROW_SIZE@@ + i;
-                    let neighborPosition : vec3<f32> = vec3<f32>(id) + displacements[prevIndex + neighborOffset].xyz;
+                    let neighborPosition : vec3<f32> = vec3<f32>(id) + displacements[currentOffset + index + neighborOffset].xyz;
                     let originalLength : f32 = length(vec3<f32>(vec3<i32>(k, j, i)));
                     let currentLength : f32 = length(position - neighborPosition) - originalLength;
                     let strain : f32 = abs(currentLength - originalLength) / originalLength;
@@ -193,24 +193,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let acceleration : vec3<f32> = force / mass;
     if (idi32.z < dimensions.z - 1i) {
-        velocities[nextIndex] = velocities[prevIndex] + vec4<f32>(0.5 * acceleration * timeStepSquared, 0.0);
-        displacements[nextIndex] += velocities[nextIndex] * parameters.timeStep;
+        velocities[nextOffset + index] += vec4<f32>(0.5 * acceleration * timeStepSquared, 0.0);
+        displacements[nextOffset + index] += velocities[currentOffset + index] * parameters.timeStep;
     } else {
-        velocities[nextIndex] += vec4<f32>(0.0);
-        displacements[nextIndex] += vec4<f32>(0.0);
+        velocities[nextOffset + index] += vec4<f32>(0.0);
+        displacements[nextOffset + index] += vec4<f32>(0.0);
     }
 
     // for testing
-    //displacements[prevIndex] = vec4<f32>(vec3<f32>(id), 0.0);
-    //displacements[nextIndex] = vec4<f32>(vec3<f32>(id), 0.0);
-    //displacements[index] = vec4<f32>(vec3<f32>(-10.), 0.0);
-    //displacements[nextIndex] = vec4<f32>(vec3<f32>(parameters.gravity), 0.0);
-    //displacements[prevIndex] = vec4<f32>(2.5);
-    //displacements[nextIndex] = vec4<f32>(0.5);
-    //displacements[prevIndex] = vec4<f32>(mass);
-    //displacements[nextIndex] = vec4<f32>(f32(indexDensity));
-    displacements[prevIndex] = vec4<f32>(acceleration, 0.);
-    displacements[nextIndex] = vec4<f32>(force, 0.);
+    //displacements[nextOffset + index] = vec4<f32>(0.001 * f32(index) * parameters.iteration);
+    //displacements[nextOffset + index] = vec4<f32>(vec3<f32>(id), 0.0);
 }
 """
 shader = shader.replace("@@SLICES@@", str(volumeArray.shape[0]))
@@ -222,9 +214,9 @@ shader = shader.replace("@@ROW_SIZE@@", str(volumeArray.shape[2]))
 
 parametersArray = numpy.array([
     0., # iteration
-    0.1, # timeStep
-    0.0, 0.0, -0.098, # gravity
-    0.0, 0.0, 0.0 # dummies - why?
+    0.05, # timeStep
+    0.0, 0.0, -9.8, # gravity
+    0.0, 0.0, 0.0 # dummies
     ], dtype="float32");
 
 
@@ -296,7 +288,7 @@ compute_pipeline = device.create_compute_pipeline(
 slicer.app.processEvents()
 
 startTime = time.time()
-iterations = 2
+iterations = 100
 for iteration in range(iterations):
     parametersArray[0] = float(iteration)
     parametersBuffer = device.create_buffer_with_data(data=parametersArray, usage=wgpu.BufferUsage.COPY_SRC)
@@ -309,14 +301,14 @@ for iteration in range(iterations):
     compute_pass.end()
     device.queue.submit([command_encoder.finish()])
     # Read the current data of the output buffer
-    displacementsMemory = device.queue.read_buffer(buffers[1])  # slow, should be done async
-    displacementsArray[:] = numpy.array(displacementsMemory.cast("f", displacementsArray.shape))
-    gridTransformArray[:] = displacementsArray[1 - (iteration % 2)][:,:,:,0:3]
-    slicer.util.arrayFromGridTransformModified(gridTransformNode)
-    slicer.util.arrayFromVolumeModified(volumeNode) # to update display
-    print(f"gridTransform: {gridTransformArray.min()}, {gridTransformArray.max()}")
-    print(f"{iteration} of {iterations}")
-    slicer.app.processEvents()
+    if iteration % 10 == 0:
+        displacementsMemory = device.queue.read_buffer(buffers[1])  # slow, should be done async
+        displacementsArray[:] = numpy.array(displacementsMemory.cast("f", displacementsArray.shape))
+        gridTransformArray[:] = displacementsArray[(iteration + 1) % 2][:,:,:,0:3]
+        slicer.util.arrayFromGridTransformModified(gridTransformNode)
+        slicer.util.arrayFromVolumeModified(volumeNode)
+        print(f"{iteration} of {iterations}")
+        slicer.app.processEvents()
 
     if False:
         # use for debugging
