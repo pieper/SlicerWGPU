@@ -300,7 +300,7 @@ class GraphixTest(ScriptedLoadableModuleTest):
         #self.test_GraphixVolume()
         #self.setUp()
         #self.test_GraphixModel()
-        self.setUp()
+        #self.setUp()
         self.test_GraphixTotalSeg()
 
     def test_GraphixVolume(self):
@@ -351,14 +351,14 @@ class GraphixTest(ScriptedLoadableModuleTest):
         def animate():
             renderer.render(scene, camera)
             canvas.request_draw()
-            
+
         canvas.request_draw(animate)
 
         self.delayDisplay('Test passed', 100)
 
 
     def test_GraphixModel(self):
-        """ 
+        """
         Create a pygfx geometry using a vtkPolyData
         """
 
@@ -444,14 +444,14 @@ class GraphixTest(ScriptedLoadableModuleTest):
         light3.bias = shadowBias
         scene.add(light3)
         """
-        
+
         def animate():
             renderer.render(scene, camera)
             canvas.request_draw()
-            
+
         canvas.request_draw(animate)
 
-       
+
 
         self.delayDisplay('Test passed', 100)
 
@@ -463,13 +463,19 @@ class GraphixTest(ScriptedLoadableModuleTest):
         slicer.util.loadScene(filePath)
 
     def test_GraphixTotalSeg(self):
-        """ 
+        """
         Create a pygfx geometry using a vtkPolyData
         """
 
         self.delayDisplay("Starting the test", 100)
 
-        self.loadTotalSeg()
+        needData = True
+        for model in slicer.util.getNodes("vtkMRMLModelNode*").values():
+            if model.GetDisplayNode().GetVisibility() != 0:
+                needData = False
+                break
+        if needData:
+            self.loadTotalSeg()
 
         import numpy
         import vtk
@@ -499,9 +505,16 @@ class GraphixTest(ScriptedLoadableModuleTest):
             trianglePointArray = vtk.util.numpy_support.vtk_to_numpy(trianglePoints)
 
             triangleNormals = polyData.GetPointData().GetArray('Normals')
-            triangleNormalsArray = vtk.util.numpy_support.vtk_to_numpy(triangleNormals)
+            if triangleNormals is None:
+                triangleNormalsArray = None
+            else:
+                triangleNormalsArray = vtk.util.numpy_support.vtk_to_numpy(triangleNormals)
 
-            geometry = pygfx.Geometry(indices=triangleIndexArray, positions=trianglePointArray, normals=triangleNormalsArray)
+            try:
+                geometry = pygfx.Geometry(indices=triangleIndexArray, positions=trianglePointArray, normals=triangleNormalsArray)
+            except AssertionError:
+                continue
+
             color = model.GetDisplayNode().GetColor()
             material = pygfx.MeshPhongMaterial(color=color, specular=[.6,.6,.6], shininess=100)
             mesh = pygfx.Mesh(geometry,material)
@@ -539,16 +552,16 @@ class GraphixTest(ScriptedLoadableModuleTest):
         light3.bias = shadowBias
         scene.add(light3)
         """
-        
+
         def animate():
             for mesh,node in meshesNodes:
                 mesh.visible = node.GetDisplayNode().GetVisibility()
             renderer.render(scene, camera)
             canvas.request_draw()
-            
+
         canvas.request_draw(animate)
 
-       
+
 
         self.delayDisplay('Test passed', 100)
 
