@@ -57,3 +57,7 @@ Then download the examples from the [Experiments](Experiments) directory.  Edit 
 * If these experiments are useful then this can be converted into a proper Slicer extension so it's easy for people to download and use.  Ideally we could have a set of filters and editor tools based on the infastructure.
 * Timing tests and feature comparisons to other GPU methods would be helpful.
 * The WebGPU and wgpu projects are developing rapidly so we should monitor them for progress
+
+## Tests with pygfx
+
+Install the modified wgpu that supports PythonQt rendering in Slicer following the instructions [in that forked repo](https://github.com/pieper/wgpu-py).  Then Run Slicer with the Graphix test module from this repo, e.g. `Slicer --additional-module-paths /path/to/Graphix`.  Go to the Graphix module and run the self-test (requires developer mode).
