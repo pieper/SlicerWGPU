@@ -44,14 +44,15 @@ elif scenario == "smallRandom":
     try:
         volumeNode = slicer.util.getNode("smallRandom")
     except slicer.util.MRMLNodeNotFoundException:
-        shape = [8,8,8]
         shape = [256,256,256]
         shape = [32,32,32]
+        shape = [8,8,8]
+        shape = [2,2,2]
         volumeArray = numpy.random.normal(1000*numpy.ones(shape), 100)
         volumeArray = scipy.ndimage.gaussian_filter(volumeArray, shape[0]/16.)
         volumeArray[volumeArray < 0] = 0
-        ijkToRAS = numpy.diag([20,20,20,1])
-        ijkToRAS[0:3,3] = -10
+        ijkToRAS = numpy.diag([50,50,50,1])
+        ijkToRAS[0:3,3] = -25
         volumeNode = slicer.util.addVolumeFromArray(volumeArray, ijkToRAS, "smallRandom")
         slicer.util.setSliceViewerLayers(volumeNode, fit=True)
 
@@ -166,10 +167,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         mass /= 1000.; // air
         stiffness = 0.1;
     } else {
-        stiffness = f32(indexDensity) / 1000.0;
+        stiffness = f32(indexDensity) / 100.0;
     }
-
-    mass *= f32(indexDensity);
+    //mass *= f32(indexDensity);
+    mass *= 10.;
+    stiffness = 100000.0;
 
     let position : vec3<f32> = vec3<f32>(id) + displacements[currentOffset + pointIndex].xyz;
     var force : vec3<f32> = mass * parameters.gravity;
@@ -184,16 +186,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         for (j = -1; j < 2; j += 1) {
             for (i = -1; i < 2; i += 1) {
                 if ((k != 0 && j != 0 && i != 0)
-                      && ((idi32.x + k) >= 0 && (idi32.x + k) < (dimensions.x - 2))
-                      && ((idi32.y + j) >= 0 && (idi32.y + j) < (dimensions.y - 2))
-                      && ((idi32.z + i) >= 0 && (idi32.z + i) < (dimensions.z - 2))) {
+                      && ((idi32.x + k) >= 0 && (idi32.x + k) <= (dimensions.x - 1))
+                      && ((idi32.y + j) >= 0 && (idi32.y + j) <= (dimensions.y - 1))
+                      && ((idi32.z + i) >= 0 && (idi32.z + i) <= (dimensions.z - 1))) {
                     neighborOffset = k * @@SLICE_SIZE@@ + j * @@ROW_SIZE@@ + i;
                     neighborPosition = vec3<f32>(vec3<i32>(id) + vec3<i32>(k, j, i)) + displacements[currentOffset + pointIndex + neighborOffset].xyz;
                     originalLength = length(vec3<f32>(vec3<i32>(k, j, i)));
                     currentLength = length(position - neighborPosition);
                     strain = abs(currentLength - originalLength) / originalLength;
                     lineOfForce = normalize(neighborPosition - position);
-                    if (currentLength < originalLength) {
+                    if (currentLength > originalLength) {
                         lineOfForce *= -1.0;
                     }
                     let neighborForce : vec3<f32> = stiffness * strain * lineOfForce;
@@ -207,7 +209,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let acceleration : vec3<f32> = force / mass;
     if (idi32.z < dimensions.z - 1i) {
-        velocities[nextOffset + pointIndex] += vec4<f32>(0.5 * acceleration * timeStepSquared, 0.0);
+        let maxVelocity = vec3<f32>(1.0);
+        let integratedVelocity = 0.5 * acceleration * timeStepSquared;
+        let velocity = vec4<f32>(min(maxVelocity, integratedVelocity), 0.0);
+        velocities[nextOffset + pointIndex] += velocity;
         displacements[nextOffset + pointIndex] += velocities[currentOffset + pointIndex] * parameters.timeStep;
     } else {
         velocities[nextOffset + pointIndex] += vec4<f32>(0.0);
@@ -233,14 +238,14 @@ shader = shader.replace("@@ROW_SIZE@@", str(volumeArray.shape[2]))
 
 parametersArray = numpy.array([
     0., # iteration
-    0.05, # timeStep
+    0.001, # timeStep
     0.0, 0.0, -9.8, # gravity
     0.0, 0.0, 0.0 # dummies
     ], dtype="float32");
 
 
 # Create a device with max memory and compile the shader
-adapter = wgpu.request_adapter(canvas=None, power_preference="high-performance")
+adapter = wgpu.gpu.request_adapter(canvas=None, power_preference="high-performance")
 required_limits={
     'max_storage_buffer_binding_size': adapter.limits['max_storage_buffer_binding_size'],
     'max_bind_groups': adapter.limits['max_bind_groups']
@@ -307,7 +312,22 @@ compute_pipeline = device.create_compute_pipeline(
 slicer.app.processEvents()
 
 startTime = time.time()
-iterations = 500
+iterations = 78900
+iterations = 10000
+stop = False
+def stopSimulation():
+    global stop
+    stop = True
+try:
+    stopButton
+except NameError:
+    stopButton = qt.QPushButton("Stop Simulation")
+    stopButton.connect("clicked()", stopSimulation)
+    toolbar = slicer.util.findChildren(name="MainToolBar")[0]
+    stopAction = qt.QWidgetAction(toolbar)
+    stopAction.setDefaultWidget(stopButton)
+    toolbar.addAction(stopAction)
+
 for iteration in range(iterations):
     parametersArray[0] = float(iteration)
     parametersBuffer = device.create_buffer_with_data(data=parametersArray, usage=wgpu.BufferUsage.COPY_SRC)
@@ -320,7 +340,7 @@ for iteration in range(iterations):
     compute_pass.end()
     device.queue.submit([command_encoder.finish()])
     # Read the current data of the output buffer
-    if iteration % 10 == 0 or iteration == iterations - 1:
+    if iteration % 1000 == 0 or iteration == iterations - 1 or stop:
         displacementsMemory = device.queue.read_buffer(buffers[1])  # slow, should be done async
         displacementsArray[:] = numpy.array(displacementsMemory.cast("f", displacementsArray.shape))
         gridTransformArray[:] = displacementsArray[(iteration + 1) % 2][:,:,:,0:3]
@@ -333,6 +353,9 @@ for iteration in range(iterations):
         # use for debugging
         velocitiesMemory = device.queue.read_buffer(buffers[2])
         velocitiesArray[:] = numpy.array(velocitiesMemory.cast("f", velocitiesArray.shape))
+
+    if stop == True:
+        break
 
 endTime = time.time()
 
