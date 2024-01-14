@@ -1,11 +1,15 @@
 """
 
-Note that wgsl only support 32 bit ints, but the short data could be
-packed: https://github.com/gpuweb/gpuweb/issues/2429
+This example tests if a triple nested loop works correctly.
 
+On a mac pro 2019 with wgpu '0.13.2' it fails (not all neighbors visited and
+loop variable ii is incorrect).
+AMD Radeon Pro W5700X 16 GB, macOS 13.4
 
-# TODO: for(var i: i32 = 0; i < 4; i++) broken in wgpu?
-# https://www.w3.org/TR/WGSL/#for-statement
+On a macbook air M2 it passes.
+
+On windows and linux it seems to work.
+
 
 """
 
@@ -118,4 +122,7 @@ displacementsArray = numpy.array(displacementsMemory.cast("f", displacementsArra
 print(displacementsArray)
 
 if displacementsArray[0,0,0][2] != 2:
-    raise ValueError("Inner loop variable not incrementing")
+    print("Inner loop variable not incrementing")
+
+if displacementsArray.max() != 8:
+    raise ValueError("not all neighbors visited")
