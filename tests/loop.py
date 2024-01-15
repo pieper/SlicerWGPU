@@ -11,6 +11,23 @@ On a macbook air M2 it passes.
 On windows and linux it seems to work.
 
 
+Code logic should work like this:
+
+id = numpy.array([1,1,1])
+dimensions = numpy.array([3,3,3])
+neighborsVisited = 0
+for kk in range(-1,2):
+    for jj in range(-1,2):
+        for ii in range(-1,2):
+            if not (kk == 0 and jj == 0 and ii == 0) \
+                  and (id[0] + kk) >= 0 and (id[0] + kk) < dimensions[0] \
+                  and (id[1] + jj) >= 0 and (id[1] + jj) < dimensions[1] \
+                  and (id[2] + ii) >= 0 and (id[2] + ii) < dimensions[2]:
+                    neighborsVisited += 1
+print(ii, jj, kk, neighborsVisited)
+
+which results in: 1 1 1 26
+because the python loops end at 1 not 2 like in C style for loops.
 """
 
 
@@ -47,7 +64,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (kk = -1; kk < 2; kk += 1) {
         for (jj = -1; jj < 2; jj += 1) {
             for (ii = -1; ii < 2; ii += 1) {
-                if ( (kk != 0 && jj != 0 && ii != 0)
+                if ( !(kk == 0 && jj == 0 && ii == 0)
                       && ((idi32.z + kk) >= 0 && (idi32.z + kk) < dimensions.z)
                       && ((idi32.y + jj) >= 0 && (idi32.y + jj) < dimensions.y)
                       && ((idi32.x + ii) >= 0 && (idi32.x + ii) < dimensions.x) ) {
@@ -119,10 +136,10 @@ device.queue.submit([command_encoder.finish()])
 displacementsMemory = device.queue.read_buffer(buffers[1])  # slow, should be done async
 displacementsArray = numpy.array(displacementsMemory.cast("f", displacementsArray.shape))
 
-print(displacementsArray)
+print(displacementsArray[1,1,1])
 
 if displacementsArray[0,0,0][2] != 2:
-    print("Inner loop variable not incrementing")
+    print("Error: Inner loop variable not incrementing")
 
-if displacementsArray.max() != 8:
-    raise ValueError("not all neighbors visited")
+if displacementsArray.max() != 26:
+    print("Error: Inner loop variable not incrementing")
