@@ -16,6 +16,10 @@ packed: https://github.com/gpuweb/gpuweb/issues/2429
 
 """
 
+def run():
+    filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/tissue.py"
+    exec(open(filePath).read())
+
 import numpy
 import scipy
 import time
@@ -29,6 +33,8 @@ except ModuleNotFoundError:
 import wgpu.backends.rs  # Select backend
 import wgpu.utils
 
+iterations = 10000
+
 # Load data
 sampleScenarios = ["MRHead", "CTACardio"]
 scenario = sampleScenarios[0]
@@ -41,13 +47,14 @@ if scenario in sampleScenarios:
         import SampleData
         volumeNode = SampleData.SampleDataLogic().downloadSample(scenario)
 elif scenario == "smallRandom":
+    iterations = 4
     try:
         volumeNode = slicer.util.getNode("smallRandom")
     except slicer.util.MRMLNodeNotFoundException:
         shape = [256,256,256]
         shape = [32,32,32]
         shape = [8,8,8]
-        shape = [2,2,2]
+        shape = [5,5,5]
         volumeArray = numpy.random.normal(1000*numpy.ones(shape), 100)
         volumeArray = scipy.ndimage.gaussian_filter(volumeArray, shape[0]/16.)
         volumeArray[volumeArray < 0] = 0
@@ -152,10 +159,11 @@ var<uniform> parameters : Parameters;
 
 @compute
 @workgroup_size(1)
+
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let dimensions : vec3<i32> = vec3<i32>(@@SLICES@@,@@ROWS@@,@@COLUMNS@@);
     let idi32 : vec3<i32> = vec3<i32>(id);
-    let pointIndex : i32 = idi32.x * @@SLICE_SIZE@@ + idi32.y * @@ROW_SIZE@@ + idi32.z;
+    let pointIndex : i32 = idi32.z * @@SLICE_SIZE@@ + idi32.y * @@ROW_SIZE@@ + idi32.x;
     let iteration : i32 = i32(parameters.iteration);
     let currentOffset : i32 = (iteration % 2) * @@VOLUME_SIZE@@;
     let nextOffset : i32 = ((iteration + 1) % 2) * @@VOLUME_SIZE@@;
@@ -170,36 +178,42 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         stiffness = f32(indexDensity) / 100.0;
     }
     //mass *= f32(indexDensity);
-    mass *= 10.;
-    stiffness = 100000.0;
 
-    let position : vec3<f32> = vec3<f32>(id) + displacements[currentOffset + pointIndex].xyz;
+    let displacement : vec3<f32> = displacements[currentOffset + pointIndex].xyz;
+    let position : vec3<f32> = vec3<f32>(f32(id.z), f32(id.y), f32(id.x));
+    let displacedPosition : vec3<f32> = vec3<f32>(id) + displacement;
     var force : vec3<f32> = mass * parameters.gravity;
     var lineOfForce : vec3<f32> = vec3<f32>(0.0);
     var neighborOffset : i32 = 0;
     var neighborPosition : vec3<f32> = vec3<f32>(0.0);
+    var neighborDisplacement : vec3<f32> = vec3<f32>(0.0);
+    var displacedNeighbor : vec3<f32> = vec3<f32>(0.0);
     var originalLength : f32 = 0.0;
     var currentLength : f32 = 0.0;
     var strain : f32 = 0.0;
-    var k : i32; var j : i32; var i : i32;
-    for (k = -1; k < 2; k += 1) {
-        for (j = -1; j < 2; j += 1) {
-            for (i = -1; i < 2; i += 1) {
-                if ((k != 0 && j != 0 && i != 0)
-                      && ((idi32.x + k) >= 0 && (idi32.x + k) <= (dimensions.x - 1))
-                      && ((idi32.y + j) >= 0 && (idi32.y + j) <= (dimensions.y - 1))
-                      && ((idi32.z + i) >= 0 && (idi32.z + i) <= (dimensions.z - 1))) {
-                    neighborOffset = k * @@SLICE_SIZE@@ + j * @@ROW_SIZE@@ + i;
-                    neighborPosition = vec3<f32>(vec3<i32>(id) + vec3<i32>(k, j, i)) + displacements[currentOffset + pointIndex + neighborOffset].xyz;
-                    originalLength = length(vec3<f32>(vec3<i32>(k, j, i)));
-                    currentLength = length(position - neighborPosition);
+    var kk : i32; var jj : i32; var ii : i32;
+    var neighborsVisited : i32 = 0;
+    for (kk = -1; kk < 2; kk += 1) {
+        for (jj = -1; jj < 2; jj += 1) {
+            for (ii = -1; ii < 2; ii += 1) {
+                if ( !(kk == 0 && jj == 0 && ii == 0)
+                      && ((idi32.z + kk) >= 0 && (idi32.z + kk) < dimensions.z)
+                      && ((idi32.y + jj) >= 0 && (idi32.y + jj) < dimensions.y)
+                      && ((idi32.x + ii) >= 0 && (idi32.x + ii) < dimensions.x) ) {
+                    neighborOffset = kk * @@SLICE_SIZE@@ + jj * @@ROW_SIZE@@ + ii;
+                    neighborDisplacement = displacements[currentOffset + pointIndex + neighborOffset].xyz;
+                    neighborPosition = vec3<f32>( vec3<i32>(id) + vec3<i32>(kk, jj, ii) );
+                    displacedNeighbor = neighborPosition + neighborDisplacement;
+                    originalLength = length(vec3<f32>(vec3<i32>(kk, jj, ii)));
+                    currentLength = length(displacedPosition - displacedNeighbor);
                     strain = abs(currentLength - originalLength) / originalLength;
-                    lineOfForce = normalize(neighborPosition - position);
+                    lineOfForce = normalize(displacedNeighbor - displacedPosition);
                     if (currentLength > originalLength) {
                         lineOfForce *= -1.0;
                     }
                     let neighborForce : vec3<f32> = stiffness * strain * lineOfForce;
                     force += neighborForce;
+                    neighborsVisited += 1;
                 }
                 //break;
             }
@@ -224,9 +238,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(id), 0.0);
     //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(mass), 0.0);
     //displacements[nextOffset + pointIndex] = vec4<f32>(force, 0.0);
+    //displacements[nextOffset + pointIndex] = vec4<f32>(neighborForce, 0.0);
+    //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(dimensions), 0.0);
     //displacements[nextOffset + pointIndex] = vec4<f32>(f32(k), f32(j), f32(i), 0.0);
     //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(currentLength), 0.0);
     //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(currentLength, originalLength, strain), 0.0);
+
+    //displacements[nextOffset + pointIndex] = vec4<f32>(f32(neighborsVisited), 0., 0., 0.);
+    //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(position), 0.0);
+    displacements[nextOffset + pointIndex] = vec4<f32>(f32(kk), f32(jj), f32(ii), 0.0);
 }
 """
 shader = shader.replace("@@SLICES@@", str(volumeArray.shape[0]))
@@ -312,8 +332,6 @@ compute_pipeline = device.create_compute_pipeline(
 slicer.app.processEvents()
 
 startTime = time.time()
-iterations = 78900
-iterations = 10000
 stop = False
 def stopSimulation():
     global stop
@@ -360,6 +378,7 @@ for iteration in range(iterations):
 endTime = time.time()
 
 displacementVolume = addVolumeFromGridTransform(gridTransformNode, name="Displacement Volume")
+displacementVolume.GetDisplayNode().SetInterpolate(False)
 slicer.util.setSliceViewerLayers(displacementVolume, fit=True)
 
 print(f"Finished at {iterations / (endTime - startTime)} iterations/second, ")
