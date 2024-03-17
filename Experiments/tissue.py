@@ -4,6 +4,7 @@ NOT WORKING
 Install wgpu as described here: https://github.com/pygfx/wgpu-py
 
 filePath = "c:/pieper/SlicerWGPU/Experiments/tissue.py"
+
 filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/tissue.py"
 exec(open(filePath).read())
 
@@ -17,6 +18,7 @@ packed: https://github.com/gpuweb/gpuweb/issues/2429
 """
 
 def run():
+    slicer.mrmlScene.Clear()
     filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/tissue.py"
     exec(open(filePath).read())
 
@@ -37,8 +39,8 @@ iterations = 10000
 
 # Load data
 sampleScenarios = ["MRHead", "CTACardio"]
-scenario = sampleScenarios[0]
 scenario = "smallRandom"
+scenario = sampleScenarios[0]
 
 if scenario in sampleScenarios:
     try:
@@ -196,33 +198,38 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     for (kk = -1; kk < 2; kk += 1) {
         for (jj = -1; jj < 2; jj += 1) {
             for (ii = -1; ii < 2; ii += 1) {
-                if ( !(kk == 0 && jj == 0 && ii == 0)
-                      && ((idi32.z + kk) >= 0 && (idi32.z + kk) < dimensions.z)
-                      && ((idi32.y + jj) >= 0 && (idi32.y + jj) < dimensions.y)
-                      && ((idi32.x + ii) >= 0 && (idi32.x + ii) < dimensions.x) ) {
-                    neighborOffset = kk * @@SLICE_SIZE@@ + jj * @@ROW_SIZE@@ + ii;
-                    neighborDisplacement = displacements[currentOffset + pointIndex + neighborOffset].xyz;
-                    neighborPosition = vec3<f32>( vec3<i32>(id) + vec3<i32>(kk, jj, ii) );
-                    displacedNeighbor = neighborPosition + neighborDisplacement;
-                    originalLength = length(vec3<f32>(vec3<i32>(kk, jj, ii)));
-                    currentLength = length(displacedPosition - displacedNeighbor);
-                    strain = abs(currentLength - originalLength) / originalLength;
-                    lineOfForce = normalize(displacedNeighbor - displacedPosition);
-                    if (currentLength > originalLength) {
-                        lineOfForce *= -1.0;
-                    }
-                    let neighborForce : vec3<f32> = stiffness * strain * lineOfForce;
-                    force += neighborForce;
-                    neighborsVisited += 1;
+                if ( kk == 0 && jj == 0 && ii == 0 ) {
+                    continue;
                 }
-                //break;
+                if (idi32.z + kk < 0 || idi32.z + kk > dimensions.z - 1) {
+                    continue;
+                }
+                if (idi32.y + jj < 0 || idi32.y + jj > dimensions.y - 1) {
+                    continue;
+                }
+                if (idi32.x + ii < 0 || idi32.x + ii > dimensions.x - 1) {
+                    continue;
+                }
+                neighborOffset = kk * @@SLICE_SIZE@@ + jj * @@ROW_SIZE@@ + ii;
+                neighborDisplacement = displacements[currentOffset + pointIndex + neighborOffset].xyz;
+                neighborPosition = vec3<f32>( vec3<i32>(id) + vec3<i32>(kk, jj, ii) );
+                displacedNeighbor = neighborPosition + neighborDisplacement;
+                originalLength = length(vec3<f32>(vec3<i32>(kk, jj, ii)));
+                currentLength = length(displacedPosition - displacedNeighbor);
+                strain = abs(currentLength - originalLength) / originalLength;
+                lineOfForce = normalize(displacedNeighbor - displacedPosition);
+                if (currentLength > originalLength) {
+                    lineOfForce *= -1.0;
+                }
+                let neighborForce : vec3<f32> = stiffness * strain * lineOfForce;
+                force += neighborForce;
+                neighborsVisited += 1;
             }
-            //break;
         }
-        //break;
     }
+
     let acceleration : vec3<f32> = force / mass;
-    if (idi32.z < dimensions.z - 1i) {
+    if (idi32.z < dimensions.z - 1) {
         let maxVelocity = vec3<f32>(1.0);
         let integratedVelocity = 0.5 * acceleration * timeStepSquared;
         let velocity = vec4<f32>(min(maxVelocity, integratedVelocity), 0.0);
@@ -244,9 +251,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(currentLength), 0.0);
     //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(currentLength, originalLength, strain), 0.0);
 
-    //displacements[nextOffset + pointIndex] = vec4<f32>(f32(neighborsVisited), 0., 0., 0.);
+    displacements[nextOffset + pointIndex] = vec4<f32>(f32(neighborsVisited), 0., 0., 0.);
     //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(position), 0.0);
-    displacements[nextOffset + pointIndex] = vec4<f32>(f32(kk), f32(jj), f32(ii), 0.0);
+    //displacements[nextOffset + pointIndex] = vec4<f32>(f32(kk), f32(jj), f32(ii), 0.0);
 }
 """
 shader = shader.replace("@@SLICES@@", str(volumeArray.shape[0]))
