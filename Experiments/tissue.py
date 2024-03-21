@@ -17,10 +17,7 @@ packed: https://github.com/gpuweb/gpuweb/issues/2429
 
 """
 
-def run():
-    slicer.mrmlScene.Clear()
-    filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/tissue.py"
-    exec(open(filePath).read())
+DEBUGGING = True
 
 import numpy
 import scipy
@@ -35,12 +32,13 @@ except ModuleNotFoundError:
 import wgpu.backends.rs  # Select backend
 import wgpu.utils
 
-iterations = 10000
+iterations = 1000
+iterationInterval = 10
 
 # Load data
 sampleScenarios = ["MRHead", "CTACardio"]
-scenario = "smallRandom"
 scenario = sampleScenarios[0]
+scenario = "smallRandom"
 
 if scenario in sampleScenarios:
     try:
@@ -49,14 +47,15 @@ if scenario in sampleScenarios:
         import SampleData
         volumeNode = SampleData.SampleDataLogic().downloadSample(scenario)
 elif scenario == "smallRandom":
-    iterations = 4
+    iterations = 4000
+    iterationInterval = 1
     try:
         volumeNode = slicer.util.getNode("smallRandom")
     except slicer.util.MRMLNodeNotFoundException:
-        shape = [256,256,256]
+        #shape = [256,256,256]
         shape = [32,32,32]
-        shape = [8,8,8]
-        shape = [5,5,5]
+        #shape = [8,8,8]
+        #shape = [5,5,5]
         volumeArray = numpy.random.normal(1000*numpy.ones(shape), 100)
         volumeArray = scipy.ndimage.gaussian_filter(volumeArray, shape[0]/16.)
         volumeArray[volumeArray < 0] = 0
@@ -72,6 +71,11 @@ volumeSize =  sliceSize  * volumeArray.shape[0]
 volumeIntArray = volumeArray.astype('int32')
 displacementsArray = numpy.zeros((2,*volumeArray.shape,4),dtype="float32")
 velocitiesArray = numpy.zeros((2,*volumeArray.shape,4),dtype="float32")
+debugArray = numpy.zeros((2,*volumeArray.shape,4),dtype="float32")
+ijkToRAS = vtk.vtkMatrix4x4()
+volumeNode.GetIJKToRASMatrix(ijkToRAS)
+debug0Volume = slicer.util.addVolumeFromArray(debugArray[0], ijkToRAS=ijkToRAS, name="Debug0", nodeClassName="vtkMRMLVectorVolumeNode")
+debug1Volume = slicer.util.addVolumeFromArray(debugArray[1], ijkToRAS=ijkToRAS, name="Debug1", nodeClassName="vtkMRMLVectorVolumeNode")
 
 def addGridTransformFromArray(narray, referenceVolume=None, name=None):
     """Create a new grid transform node from content of a numpy array and add it to the scene.
@@ -159,6 +163,9 @@ var<storage,read_write> velocities: array<vec4<f32>>;
 @group(0) @binding(3)
 var<uniform> parameters : Parameters;
 
+@group(0) @binding(4)
+var<storage,read_write> debugBuffer : array<vec4<f32>>;
+
 @compute
 @workgroup_size(1)
 
@@ -183,7 +190,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let displacement : vec3<f32> = displacements[currentOffset + pointIndex].xyz;
     let position : vec3<f32> = vec3<f32>(f32(id.z), f32(id.y), f32(id.x));
-    let displacedPosition : vec3<f32> = vec3<f32>(id) + displacement;
+    let displacedPosition : vec3<f32> = position + displacement;
     var force : vec3<f32> = mass * parameters.gravity;
     var lineOfForce : vec3<f32> = vec3<f32>(0.0);
     var neighborOffset : i32 = 0;
@@ -228,16 +235,17 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
+    // boundary conditions
     let acceleration : vec3<f32> = force / mass;
-    if (idi32.z < dimensions.z - 1) {
+    if (idi32.z == 0 && idi32.x == 0) {
+        velocities[nextOffset + pointIndex] += vec4<f32>(0.0);
+        displacements[nextOffset + pointIndex] += vec4<f32>(0.0);
+    } else {
         let maxVelocity = vec3<f32>(1.0);
         let integratedVelocity = 0.5 * acceleration * timeStepSquared;
         let velocity = vec4<f32>(min(maxVelocity, integratedVelocity), 0.0);
         velocities[nextOffset + pointIndex] += velocity;
         displacements[nextOffset + pointIndex] += velocities[currentOffset + pointIndex] * parameters.timeStep;
-    } else {
-        velocities[nextOffset + pointIndex] += vec4<f32>(0.0);
-        displacements[nextOffset + pointIndex] += vec4<f32>(0.0);
     }
 
     // for testing
@@ -250,10 +258,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     //displacements[nextOffset + pointIndex] = vec4<f32>(f32(k), f32(j), f32(i), 0.0);
     //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(currentLength), 0.0);
     //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(currentLength, originalLength, strain), 0.0);
-
-    displacements[nextOffset + pointIndex] = vec4<f32>(f32(neighborsVisited), 0., 0., 0.);
-    //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(position), 0.0);
+    //displacements[nextOffset + pointIndex] = vec4<f32>(f32(neighborsVisited), 0., 0., 0.);
     //displacements[nextOffset + pointIndex] = vec4<f32>(f32(kk), f32(jj), f32(ii), 0.0);
+    //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(position), 0.0);
+
+    debugBuffer[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(force), 0.0);
 }
 """
 shader = shader.replace("@@SLICES@@", str(volumeArray.shape[0]))
@@ -265,7 +274,7 @@ shader = shader.replace("@@ROW_SIZE@@", str(volumeArray.shape[2]))
 
 parametersArray = numpy.array([
     0., # iteration
-    0.001, # timeStep
+    0.0001, # timeStep
     0.0, 0.0, -9.8, # gravity
     0.0, 0.0, 0.0 # dummies
     ], dtype="float32");
@@ -289,6 +298,7 @@ buffers[0] = device.create_buffer_with_data(data=volumeIntArray, usage=storageUs
 buffers[1] = device.create_buffer_with_data(data=displacementsArray, usage=storageCopyUsage)
 buffers[2] = device.create_buffer_with_data(data=velocitiesArray, usage=storageCopyUsage)
 buffers[3] = device.create_buffer_with_data(data=parametersArray, usage=uniformUsage)
+buffers[4] = device.create_buffer_with_data(data=debugArray, usage=storageCopyUsage)
 
 # Create bindings and binding layouts
 binding_layouts = [
@@ -307,6 +317,10 @@ binding_layouts = [
     { "binding": 3,
       "visibility": wgpu.ShaderStage.COMPUTE,
       "buffer": {"type": wgpu.BufferBindingType.uniform, "has_dynamic_offset": False}
+    },
+    { "binding": 4,
+      "visibility": wgpu.ShaderStage.COMPUTE,
+      "buffer": {"type": wgpu.BufferBindingType.storage, "has_dynamic_offset": False}
     },
 ]
 bind_group_layout = device.create_bind_group_layout(entries=binding_layouts)
@@ -327,6 +341,9 @@ bindings = [
     { "binding": 3,
       "resource": {"buffer": buffers[3], "offset": 0, "size": buffers[3].size}
     },
+    { "binding": 4,
+      "resource": {"buffer": buffers[4], "offset": 0, "size": buffers[4].size}
+    },
 ]
 bind_group = device.create_bind_group(layout=bind_group_layout, entries=bindings)
 
@@ -346,12 +363,14 @@ def stopSimulation():
 try:
     stopButton
 except NameError:
-    stopButton = qt.QPushButton("Stop Simulation")
-    stopButton.connect("clicked()", stopSimulation)
     toolbar = slicer.util.findChildren(name="MainToolBar")[0]
-    stopAction = qt.QWidgetAction(toolbar)
-    stopAction.setDefaultWidget(stopButton)
-    toolbar.addAction(stopAction)
+    stopText = "Stop Simulation"
+    if slicer.util.findChildren(toolbar, text=stopText) == []:
+        stopButton = qt.QPushButton(stopText)
+        stopButton.connect("clicked()", stopSimulation)
+        stopAction = qt.QWidgetAction(toolbar)
+        stopAction.setDefaultWidget(stopButton)
+        toolbar.addAction(stopAction)
 
 for iteration in range(iterations):
     parametersArray[0] = float(iteration)
@@ -365,7 +384,7 @@ for iteration in range(iterations):
     compute_pass.end()
     device.queue.submit([command_encoder.finish()])
     # Read the current data of the output buffer
-    if iteration % 1000 == 0 or iteration == iterations - 1 or stop:
+    if iteration % iterationInterval == 0 or iteration == iterations - 1 or stop:
         displacementsMemory = device.queue.read_buffer(buffers[1])  # slow, should be done async
         displacementsArray[:] = numpy.array(displacementsMemory.cast("f", displacementsArray.shape))
         gridTransformArray[:] = displacementsArray[(iteration + 1) % 2][:,:,:,0:3]
@@ -374,10 +393,17 @@ for iteration in range(iterations):
         print(f"{iteration} of {iterations}")
         slicer.app.processEvents()
 
-    if False:
-        # use for debugging
+    if DEBUGGING:
         velocitiesMemory = device.queue.read_buffer(buffers[2])
         velocitiesArray[:] = numpy.array(velocitiesMemory.cast("f", velocitiesArray.shape))
+        debugMemory = device.queue.read_buffer(buffers[4])
+        debugArray[:] = numpy.array(debugMemory.cast("f", debugArray.shape))
+        dubug0Array = slicer.util.arrayFromVolume(debug0Volume)
+        dubug1Array = slicer.util.arrayFromVolume(debug1Volume)
+        dubug0Array[:] = debugArray[0]
+        dubug1Array[:] = debugArray[1]
+        slicer.util.arrayFromVolumeModified(debug0Volume)
+        slicer.util.arrayFromVolumeModified(debug1Volume)
 
     if stop == True:
         break
