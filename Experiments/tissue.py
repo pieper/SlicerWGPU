@@ -47,7 +47,7 @@ if scenario in sampleScenarios:
         import SampleData
         volumeNode = SampleData.SampleDataLogic().downloadSample(scenario)
 elif scenario == "smallRandom":
-    iterations = 3
+    iterations = 300
     iterationInterval = 1
     try:
         volumeNode = slicer.util.getNode("smallRandom")
@@ -221,7 +221,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 }
                 neighborOffset = kk * @@SLICE_SIZE@@ + jj * @@ROW_SIZE@@ + ii;
                 //neighborDisplacement = displacements[currentOffset + pointIndex + neighborOffset].xyz;
-                neighborPosition = vec3<f32>( vec3<i32>(id) + vec3<i32>(kk, jj, ii) );
+                neighborPosition = vec3<f32>( f32(idi32.z + kk), f32(idi32.y + jj), f32(idi32.x + ii) );
                 displacedNeighbor = neighborPosition + neighborDisplacement;
                 originalLength = length(vec3<f32>(vec3<i32>(kk, jj, ii)));
                 currentLength = length(displacedPosition - displacedNeighbor);
@@ -233,11 +233,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 let neighborForce : vec3<f32> = stiffness * strain * lineOfForce;
                 force += neighborForce;
                 neighborsVisited += 1;
-                break;
             }
-            break;
         }
-        break;
     }
 
     // boundary conditions
@@ -271,6 +268,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     //debugBuffer[nextOffset + pointIndex] = vec4<f32>(strain, stiffness, 0.0, 1.0);
     //debugBuffer[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(position), 1.0);
     debugBuffer[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(neighborPosition), 1.0);
+    //debugBuffer[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(vec3<i32>(kk, jj, ii)), 1.0);
 }
 """
 shader = shader.replace("@@SLICES@@", str(volumeArray.shape[0]))
