@@ -47,15 +47,15 @@ if scenario in sampleScenarios:
         import SampleData
         volumeNode = SampleData.SampleDataLogic().downloadSample(scenario)
 elif scenario == "smallRandom":
-    iterations = 4000
+    iterations = 3
     iterationInterval = 1
     try:
         volumeNode = slicer.util.getNode("smallRandom")
     except slicer.util.MRMLNodeNotFoundException:
         #shape = [256,256,256]
-        shape = [32,32,32]
+        #shape = [32,32,32]
         #shape = [8,8,8]
-        #shape = [5,5,5]
+        shape = [5,5,5]
         volumeArray = numpy.random.normal(1000*numpy.ones(shape), 100)
         volumeArray = scipy.ndimage.gaussian_filter(volumeArray, shape[0]/16.)
         volumeArray[volumeArray < 0] = 0
@@ -76,6 +76,8 @@ ijkToRAS = vtk.vtkMatrix4x4()
 volumeNode.GetIJKToRASMatrix(ijkToRAS)
 debug0Volume = slicer.util.addVolumeFromArray(debugArray[0], ijkToRAS=ijkToRAS, name="Debug0", nodeClassName="vtkMRMLVectorVolumeNode")
 debug1Volume = slicer.util.addVolumeFromArray(debugArray[1], ijkToRAS=ijkToRAS, name="Debug1", nodeClassName="vtkMRMLVectorVolumeNode")
+debug0Array = slicer.util.arrayFromVolume(debug0Volume)
+debug1Array = slicer.util.arrayFromVolume(debug1Volume)
 
 def addGridTransformFromArray(narray, referenceVolume=None, name=None):
     """Create a new grid transform node from content of a numpy array and add it to the scene.
@@ -203,22 +205,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     var kk : i32; var jj : i32; var ii : i32;
     var neighborsVisited : i32 = 0;
     for (kk = -1; kk < 2; kk += 1) {
+        if (idi32.z + kk < 0 || idi32.z + kk > dimensions.z - 1) {
+            continue;
+        }
         for (jj = -1; jj < 2; jj += 1) {
+            if (idi32.y + jj < 0 || idi32.y + jj > dimensions.y - 1) {
+                continue;
+            }
             for (ii = -1; ii < 2; ii += 1) {
-                if ( kk == 0 && jj == 0 && ii == 0 ) {
-                    continue;
-                }
-                if (idi32.z + kk < 0 || idi32.z + kk > dimensions.z - 1) {
-                    continue;
-                }
-                if (idi32.y + jj < 0 || idi32.y + jj > dimensions.y - 1) {
-                    continue;
-                }
                 if (idi32.x + ii < 0 || idi32.x + ii > dimensions.x - 1) {
                     continue;
                 }
+                if ( kk == 0 && jj == 0 && ii == 0 ) {
+                    continue;
+                }
                 neighborOffset = kk * @@SLICE_SIZE@@ + jj * @@ROW_SIZE@@ + ii;
-                neighborDisplacement = displacements[currentOffset + pointIndex + neighborOffset].xyz;
+                //neighborDisplacement = displacements[currentOffset + pointIndex + neighborOffset].xyz;
                 neighborPosition = vec3<f32>( vec3<i32>(id) + vec3<i32>(kk, jj, ii) );
                 displacedNeighbor = neighborPosition + neighborDisplacement;
                 originalLength = length(vec3<f32>(vec3<i32>(kk, jj, ii)));
@@ -231,15 +233,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 let neighborForce : vec3<f32> = stiffness * strain * lineOfForce;
                 force += neighborForce;
                 neighborsVisited += 1;
+                break;
             }
+            break;
         }
+        break;
     }
 
     // boundary conditions
     let acceleration : vec3<f32> = force / mass;
-    if (idi32.z == 0 && idi32.x == 0) {
-        velocities[nextOffset + pointIndex] += vec4<f32>(0.0);
-        displacements[nextOffset + pointIndex] += vec4<f32>(0.0);
+    if (idi32.z == 0) {
+        velocities[nextOffset + pointIndex] = vec4<f32>(0.0);
+        displacements[nextOffset + pointIndex] = vec4<f32>(0.0);
     } else {
         let maxVelocity = vec3<f32>(1.0);
         let integratedVelocity = 0.5 * acceleration * timeStepSquared;
@@ -262,7 +267,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     //displacements[nextOffset + pointIndex] = vec4<f32>(f32(kk), f32(jj), f32(ii), 0.0);
     //displacements[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(position), 0.0);
 
-    debugBuffer[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(force), 0.0);
+    //debugBuffer[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(force), 1.0);
+    //debugBuffer[nextOffset + pointIndex] = vec4<f32>(strain, stiffness, 0.0, 1.0);
+    //debugBuffer[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(position), 1.0);
+    debugBuffer[nextOffset + pointIndex] = vec4<f32>(vec3<f32>(neighborPosition), 1.0);
 }
 """
 shader = shader.replace("@@SLICES@@", str(volumeArray.shape[0]))
@@ -275,7 +283,8 @@ shader = shader.replace("@@ROW_SIZE@@", str(volumeArray.shape[2]))
 parametersArray = numpy.array([
     0., # iteration
     0.0001, # timeStep
-    0.0, 0.0, -9.8, # gravity
+    #0.0, 0.0, -9.8, # gravity
+    0.0, 0.0, 0.0, # gravity
     0.0, 0.0, 0.0 # dummies
     ], dtype="float32");
 
@@ -398,10 +407,10 @@ for iteration in range(iterations):
         velocitiesArray[:] = numpy.array(velocitiesMemory.cast("f", velocitiesArray.shape))
         debugMemory = device.queue.read_buffer(buffers[4])
         debugArray[:] = numpy.array(debugMemory.cast("f", debugArray.shape))
-        dubug0Array = slicer.util.arrayFromVolume(debug0Volume)
-        dubug1Array = slicer.util.arrayFromVolume(debug1Volume)
-        dubug0Array[:] = debugArray[0]
-        dubug1Array[:] = debugArray[1]
+        debug0Array = slicer.util.arrayFromVolume(debug0Volume)
+        debug1Array = slicer.util.arrayFromVolume(debug1Volume)
+        debug0Array[:] = debugArray[0]
+        debug1Array[:] = debugArray[1]
         slicer.util.arrayFromVolumeModified(debug0Volume)
         slicer.util.arrayFromVolumeModified(debug1Volume)
 
