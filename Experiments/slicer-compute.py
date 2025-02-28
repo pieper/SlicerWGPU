@@ -14,8 +14,7 @@ exec(open(filePath).read())
 import numpy
 
 import wgpu
-import wgpu.backends.rs  # Select backend
-from wgpu.utils import compute_with_buffers  # Convenience function
+from wgpu.utils.compute import compute_with_buffers  # Convenience function
 
 try:
     mrHead = slicer.util.getNode("MRHead")

@@ -2,18 +2,13 @@
 
 Install wgpu as described here: https://github.com/pygfx/wgpu-py
 
-Tested with Slicer 5.0.2 and wgpu 0.8.1
-
-filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/slicer-compute-long-form.py"
-
-exec(open(filePath).read())
+Tested with Slicer 5.8.0 and wgpu 0.19.3
 
 """
 
 import numpy
 
 import wgpu
-import wgpu.backends.rs  # Select backend
 import wgpu.utils
 
 try:
@@ -27,7 +22,7 @@ sliceSize =  headArray.shape[1] * headArray.shape[2]
 headIntArray = headArray.astype('int32')
 bufferSize = headArray.flatten().shape[0]
 
-shader = """
+shaderCode = """
 
 @group(0) @binding(0)
 var<storage,read> data1: array<i32>;
@@ -43,19 +38,22 @@ fn main(@builtin(global_invocation_id) index: vec3<u32>) {
 }
 
 """
-shader = shader.replace("@@SLICE_SIZE@@", str(sliceSize)+"u")
-shader = shader.replace("@@ROW_SIZE@@", str(headArray.shape[2])+"u")
+shaderCode = shaderCode.replace("@@SLICE_SIZE@@", str(sliceSize)+"u")
+shaderCode = shaderCode.replace("@@ROW_SIZE@@", str(headArray.shape[2])+"u")
 
 print("computing...")
 
-# Create a device with max memory and compile the shader
-print("device")
-adapter = wgpu.request_adapter(canvas=None, power_preference="high-performance")
+# Create a device with max memory and compile the shaderCode
+adapters = wgpu.gpu.enumerate_adapters_sync()
+for a in adapters:
+    print(a.summary)
+adapter = adapters[0]
 required_limits={
-    'max_storage_buffer_binding_size': adapter.limits['max_storage_buffer_binding_size']
+    'max-storage-buffer-binding-size': adapter.limits['max-storage-buffer-binding-size']
 }
-device = adapter.request_device(required_limits=required_limits)
-cshader = device.create_shader_module(code=shader)
+device = adapter.request_device_sync(required_limits=required_limits)
+shaderModule = device.create_shader_module(code=shaderCode)
+
 
 # Create buffers
 print("buffers")
@@ -96,7 +94,7 @@ bind_group = device.create_bind_group(layout=bind_group_layout, entries=bindings
 print("pipeline")
 compute_pipeline = device.create_compute_pipeline(
     layout=pipeline_layout,
-    compute={"module": cshader, "entry_point": "main"},
+    compute={"module": shaderModule, "entry_point": "main"},
 )
 command_encoder = device.create_command_encoder()
 compute_pass = command_encoder.begin_compute_pass()
