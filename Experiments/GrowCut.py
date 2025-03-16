@@ -1,17 +1,12 @@
 """
-NOT WORKING
+NOT QUITE WORKING
 
-Install wgpu as described here: https://github.com/pygfx/wgpu-py
+Tested with Slicer 5.9.2 and wgpu 0.20.1
 
-Tested with Slicer 5.0.2 and wgpu 0.8.1
-
-filePath = "/Users/pieper/slicer/latest/SlicerWGPU/Experiments/GrowCut.py"
-filePath = "c:/pieper/SlicerWGPU/Experiments/GrowCut.py"
-exec(open(filePath).read())
+Cut and paste this file into the python console
 
 Note that wgsl only support 32 bit ints, but the short data could be
 packed: https://github.com/gpuweb/gpuweb/issues/2429
-
 
 # TODO: for(var i: i32 = 0; i < 4; i++) broken in wgpu?
 # https://www.w3.org/TR/WGSL/#for-statement
@@ -20,25 +15,34 @@ packed: https://github.com/gpuweb/gpuweb/issues/2429
 
 import numpy
 
-import wgpu
-import wgpu.backends.rs  # Select backend
+try:
+    import wgpu
+except ModuleNotFoundError:
+    pip_install("wgpu")
+    import wgpu
 import wgpu.utils
+
+import SampleData
+
+def infoPrint(message):
+    print(message)
+    slicer.util.showStatusMessage(message)
 
 # Load data
 try:
-    #volumeNode = slicer.util.getNode("MRHead")
-    volumeNode = slicer.util.getNode("CTACardio")
+    volumeNode = slicer.util.getNode("MRHead")
+    #volumeNode = slicer.util.getNode("CTACardio")
 except slicer.util.MRMLNodeNotFoundException:
     import SampleData
-    #volumeNode = SampleData.SampleDataLogic().downloadMRHead()
-    volumeNode = SampleData.SampleDataLogic().downloadCTACardio()
+    volumeNode = SampleData.SampleDataLogic().downloadMRHead()
+    #volumeNode = SampleData.SampleDataLogic().downloadCTACardio()
 
 volumeArray = slicer.util.arrayFromVolume(volumeNode)
 sliceSize =  volumeArray.shape[1] * volumeArray.shape[2]
 volumeIntArray = volumeArray.astype('int32')
 
 # wgsl Shader code
-shader = """
+shaderCode = """
 
 @group(0) @binding(0)
 var<storage,read> background: array<i32>;
@@ -71,7 +75,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let index: i32 = idi32.x * @@SLICE_SIZE@@ + idi32.y * @@ROW_SIZE@@ + idi32.z;
     var iteration : u32 = 0u;
     var parameters : Parameters;
-    parameters.iterations = 9u;
+    parameters.iterations = 90u;
     loop {
         if (iteration > parameters.iterations) {
             break;
@@ -125,43 +129,45 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
 
 """
-shader = shader.replace("@@SLICES@@", str(volumeArray.shape[0]))
-shader = shader.replace("@@ROWS@@", str(volumeArray.shape[1]))
-shader = shader.replace("@@COLUMNS@@", str(volumeArray.shape[2]))
-shader = shader.replace("@@SLICE_SIZE@@", str(sliceSize))
-shader = shader.replace("@@ROW_SIZE@@", str(volumeArray.shape[2]))
+shaderCode = shaderCode.replace("@@SLICES@@", str(volumeArray.shape[0]))
+shaderCode = shaderCode.replace("@@ROWS@@", str(volumeArray.shape[1]))
+shaderCode = shaderCode.replace("@@COLUMNS@@", str(volumeArray.shape[2]))
+shaderCode = shaderCode.replace("@@SLICE_SIZE@@", str(sliceSize))
+shaderCode = shaderCode.replace("@@ROW_SIZE@@", str(volumeArray.shape[2]))
 
-slicer.util.delayDisplay("computing...")
+infoPrint("computing...")
 
-# Create a device with max memory and compile the shader
-slicer.util.delayDisplay("device")
-adapter = wgpu.request_adapter(canvas=None, power_preference="high-performance")
+# Create a device with max memory and compile the shaderCode
+adapters = wgpu.gpu.enumerate_adapters_sync()
+for a in adapters:
+    print(a.summary)
+adapter = adapters[0]
 required_limits={
-    'max_storage_buffer_binding_size': adapter.limits['max_storage_buffer_binding_size'],
-    'max_bind_groups': adapter.limits['max_bind_groups']
+    'max-storage-buffer-binding-size': adapter.limits['max-storage-buffer-binding-size']
 }
-device = adapter.request_device(required_limits=required_limits)
-cshader = device.create_shader_module(code=shader)
+device = adapter.request_device_sync(required_limits=required_limits)
+shaderModule = device.create_shader_module(code=shaderCode)
+
 
 # Create buffers
-slicer.util.delayDisplay("buffers 1")
+infoPrint("buffers 1")
 buffers = {}
 usage= wgpu.BufferUsage.STORAGE
 buffers[0] = device.create_buffer_with_data(data=volumeIntArray, usage=usage)
-slicer.util.delayDisplay("buffers 2")
+infoPrint("buffers 2")
 usage= wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
 buffers[1] = device.create_buffer(size=volumeIntArray.data.nbytes, usage=usage)
-slicer.util.delayDisplay("buffers 3")
+infoPrint("buffers 3")
 usage= wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
 buffers[2] = device.create_buffer(size=volumeIntArray.data.nbytes, usage=usage)
-slicer.util.delayDisplay("buffers 4")
+infoPrint("buffers 4")
 usage= wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
 buffers[3] = device.create_buffer(size=volumeIntArray.data.nbytes, usage=usage)
-slicer.util.delayDisplay("buffers 5")
+infoPrint("buffers 5")
 usage= wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC
 buffers[4] = device.create_buffer(size=volumeIntArray.data.nbytes, usage=usage)
 
-slicer.util.delayDisplay("buffers 6")
+infoPrint("buffers 6")
 uniform_data = numpy.array([51], dtype='uint32')
 usage= wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST
 buffers[5] = device.create_buffer_with_data(data=uniform_data, usage=usage)
@@ -222,10 +228,10 @@ pipeline_layout = device.create_pipeline_layout(
 bind_group = device.create_bind_group(layout=bind_group_layout, entries=bindings)
 
 # Create a pipeline and run it
-slicer.util.delayDisplay("pipeline")
+infoPrint("pipeline")
 compute_pipeline = device.create_compute_pipeline(
     layout=pipeline_layout,
-    compute={"module": cshader, "entry_point": "main"},
+    compute={"module": shaderModule, "entry_point": "main"},
 )
 command_encoder = device.create_command_encoder()
 compute_pass = command_encoder.begin_compute_pass()
@@ -236,17 +242,18 @@ compute_pass.end()
 device.queue.submit([command_encoder.finish()])
 
 # Read the current data of the output buffer
-slicer.util.delayDisplay("readback")
+infoPrint("readback")
 memory = device.queue.read_buffer(buffers[1])  # slow, can also be done async
 resultArray = numpy.array(memory.cast("i", volumeIntArray.shape))
 
 # assert resultArray.mean() == -1 * volumeArray.mean()
 
-slicer.util.delayDisplay("drawing")
+infoPrint("drawing")
 
 volumeArray[:] = resultArray.astype('int16').reshape(volumeArray.shape)
 slicer.util.arrayFromVolumeModified(volumeNode)
 volumeNode.GetDisplayNode().SetAutoWindowLevel(False)
 volumeNode.GetDisplayNode().SetAutoWindowLevel(True)
 slicer.app.processEvents()
-slicer.util.delayDisplay("done")
+infoPrint("done")
+qt.QTimer.singleShot(1000, lambda : infoPrint("done"))
