@@ -93,10 +93,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         for (var k : i32 = -1; k < 2; k += 1) {
             for (var j : i32 = -1; j < 2; j += 1) {
                 for (var i : i32 = -1; i < 2; i += 1) {
-                    if ((k != 0 && j != 0 && i != 0)
-                          && idi32.x + k > 0 && idi32.x + k < dimensions.x
-                          && idi32.y + j > 0 && idi32.y + j < dimensions.y
-                          && idi32.z + i > 0 && idi32.z + i < dimensions.z ) {
+                    if ((k != 0 || j != 0 || i != 0)
+                          && idi32.x + k >= 0 && idi32.x + k < dimensions.x
+                          && idi32.y + j >= 0 && idi32.y + j < dimensions.y
+                          && idi32.z + i >= 0 && idi32.z + i < dimensions.z ) {
                         let offset : i32 = k * @@SLICE_SIZE@@ + j * @@ROW_SIZE@@ + i;
                         let neighborBackground : i32 = background[index + offset];
                         var neighborLabel : i32;
@@ -244,9 +244,8 @@ device.queue.submit([command_encoder.finish()])
 # Read the current data of the output buffer
 infoPrint("readback")
 memory = device.queue.read_buffer(buffers[1])  # slow, can also be done async
+infoPrint("cast")
 resultArray = numpy.array(memory.cast("i", volumeIntArray.shape))
-
-# assert resultArray.mean() == -1 * volumeArray.mean()
 
 infoPrint("drawing")
 
