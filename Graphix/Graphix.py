@@ -465,6 +465,9 @@ class GraphixTest(ScriptedLoadableModuleTest):
     def test_GraphixTotalSeg(self):
         """
         Create a pygfx geometry using a vtkPolyData
+
+
+        This require the patched version of wgpu-py (https://github.com/pieper/wgpu-py/tree/main)
         """
 
         self.delayDisplay("Starting the test", 100)
@@ -553,6 +556,7 @@ class GraphixTest(ScriptedLoadableModuleTest):
         scene.add(light3)
         """
 
+        # TODO: this should be event driven, i.e. with a displayable manager
         def animate():
             for mesh,node in meshesNodes:
                 mesh.visible = node.GetDisplayNode().GetVisibility()
@@ -561,18 +565,22 @@ class GraphixTest(ScriptedLoadableModuleTest):
 
         canvas.request_draw(animate)
 
-
+        slicer.modules.canvas = canvas
 
         self.delayDisplay('Test passed', 100)
 
 
 """
+# This replaces the Slicer threeD window with the wgpu one
 lm = slicer.app.layoutManager()
 tdw = lm.threeDWidget(0)
 tdw.threeDView().hide()
 tdw.threeDController().hide()
 canvas = slicer.modules._wgpuwidgets[1]
-qwindow = qt.QWindow.fromWinId(canvas.get_window_id())
-qwidget = qt.QWidget.createWindowContainer(qwindow)
+if hasattr(canvas, "get_window_id")
+    qwindow = qt.QWindow.fromWinId(canvas.get_window_id())
+    qwidget = qt.QWidget.createWindowContainer(qwindow)
+else:
+    qwindow = canvas
 tdw.layout().addWidget(qwidget)
 """
