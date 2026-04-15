@@ -222,11 +222,20 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             self.delayDisplay("pip-installing pygfx", 100)
             slicer.util.pip_install("pygfx")
 
+        # Detect the PythonQt-capable rendercanvas fork by reading
+        # rendercanvas/qt.py from disk rather than `import rendercanvas.qt`,
+        # because the upstream module raises at import time unless
+        # PySide6/PySide2/PyQt6/PyQt5 has already been imported -- which
+        # would make us mistakenly think the fork is missing.
         needs_rendercanvas_fork = True
         try:
-            import rendercanvas.qt as _rcqt
+            import rendercanvas
+            import os as _os
+            qt_path = _os.path.join(_os.path.dirname(rendercanvas.__file__),
+                                    "qt.py")
             try:
-                src = open(_rcqt.__file__).read()
+                with open(qt_path) as f:
+                    src = f.read()
             except Exception:
                 src = ""
             if src and "is_pythonqt" in src:
@@ -235,7 +244,13 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             pass
         if needs_rendercanvas_fork:
             self.delayDisplay("Installing pieper/rendercanvas (PythonQt)", 100)
+            # --force-reinstall is essential: the fork's pyproject declares
+            # itself as rendercanvas==<upstream version>, so pip would
+            # otherwise decide the upstream install "already satisfies"
+            # and skip the replacement. --no-deps avoids dragging in
+            # upstream rendercanvas again via transitive requirements.
             slicer.util.pip_install(
+                "--force-reinstall --no-deps "
                 "https://github.com/pieper/rendercanvas/"
                 "archive/refs/heads/pythonqt-support.zip"
             )
