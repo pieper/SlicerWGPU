@@ -75,7 +75,7 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
         ("Volume + Fiducials",         "test_VolumeAndFiducials"),
         ("Transformable Volume",       "test_TransformableVolume"),
         ("Bouncing Head",              "test_BouncingHead"),
-        ("Multi-Volume (stub)",        "test_MultiVolume"),
+        ("Multi-Volume",               "test_MultiVolume"),
         ("Deformable Volume (stub)",   "test_DeformableVolume"),
         ("Cinematic Rendering (stub)", "test_CinematicRendering"),
     ]
@@ -281,24 +281,36 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             )
             # pip overwrote rendercanvas on disk but Python's sys.modules
             # still holds the pre-install (upstream) rendercanvas
-            # objects. Without this pop, `from rendercanvas.qt import ...`
-            # inside slicer_wgpu returns the cached upstream module and
-            # the fork's PythonQt branch never runs.
+            # objects. Without this pop, `from rendercanvas.qt import
+            # ...` inside slicer_wgpu returns the cached upstream
+            # module and the fork's PythonQt branch never runs.
+            for mod_name in [
+                m for m in list(sys.modules)
+                if m == "rendercanvas" or m.startswith("rendercanvas.")
+            ]:
+                sys.modules.pop(mod_name, None)
+
+            # If pygfx was already imported, it cached a reference to
+            # the OLD rendercanvas.BaseRenderCanvas. Its isinstance()
+            # checks in WgpuRenderer would then reject the new
+            # QRenderWidget ("Render target must be a Canvas or
+            # Texture, not QRenderWidget"). Rebind the captured
+            # reference in place to match the freshly-reimported class.
             #
-            # Also pop pygfx: pygfx caches a reference to
-            # rendercanvas.base.BaseRenderCanvas at pygfx import time.
-            # After we pop rendercanvas, the freshly-reimported
-            # BaseRenderCanvas is a different class object from the one
-            # pygfx is holding, so `isinstance(QRenderWidget(),
-            # pygfx.<cached>.BaseRenderCanvas)` returns False and
-            # WgpuRenderer rejects our canvas with "Render target must
-            # be a Canvas or Texture, not QRenderWidget".
-            for prefix in ("rendercanvas", "pygfx"):
-                for mod_name in [
-                    m for m in list(sys.modules)
-                    if m == prefix or m.startswith(prefix + ".")
-                ]:
-                    sys.modules.pop(mod_name, None)
+            # We CANNOT just pop pygfx and re-import it: pygfx calls
+            # wgpu.preconfigure_default_device("pygfx", ...) at module
+            # top level, and wgpu raises RuntimeError if a device has
+            # already been created in the process (which it has, any
+            # time a renderer existed earlier in this session).
+            if "pygfx" in sys.modules:
+                try:
+                    import importlib
+                    rc = importlib.import_module("rendercanvas")
+                    pgr = importlib.import_module(
+                        "pygfx.renderers.wgpu.engine.renderer")
+                    pgr.BaseRenderCanvas = rc.BaseRenderCanvas
+                except Exception as e:
+                    print(f"pygfx BaseRenderCanvas rebind failed: {e}")
 
         # slicer-wgpu's version is pinned at 0.1.0 and never bumps, so
         # pip considers any cached wheel of the GitHub main.zip URL to
@@ -880,12 +892,88 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
     # ----- Stubs for future stages -----
 
     def test_MultiVolume(self):
+        """Two independent volumes (CTACardio + CTAAbdomenPanoramix) with
+        distinct TFs, each centered at the world origin via its own
+        linear transform so the two occupy the same region of space.
+        Lets us inspect how the per-sample compositing looks when both
+        Fields contribute to the same ray.
+        """
+        from slicer_wgpu.fields import ImageField
+
         self.delayDisplay(
-            "Multi-volume test: not implemented yet. "
-            "Will composite two registered volumes (e.g. CT + PET) in "
-            "the same SceneRenderer at the per-sample loop.",
-            1500,
-        )
+            "Multi-Volume: loading CTACardio + CTAAbdomenPanoramix", 200)
+
+        import SampleData
+        sd = SampleData.SampleDataLogic()
+        cta = sd.downloadCTACardio()
+        self.assertIsNotNone(cta, "CTACardio failed to load")
+        pano = sd.downloadSample("CTAAbdomenPanoramix")
+        # downloadSample can return a single node or a list/tuple; coerce
+        # to a single scalar volume node for the test.
+        if isinstance(pano, (list, tuple)):
+            pano = next((n for n in pano
+                         if n is not None
+                         and n.IsA("vtkMRMLScalarVolumeNode")), None)
+        self.assertIsNotNone(pano, "Panoramix failed to load")
+
+        # Build default VR display nodes and apply a distinct preset to
+        # each so the two are easy to tell apart visually.
+        vrLogic = slicer.modules.volumerendering.logic()
+        specs = [
+            (cta,  "CT-Chest-Contrast-Enhanced"),
+            (pano, "CT-AAA"),
+        ]
+        disps = []
+        for vol, preset_name in specs:
+            d = vrLogic.CreateDefaultVolumeRenderingNodes(vol)
+            d.SetVisibility(True)
+            preset = vrLogic.GetPresetByName(preset_name)
+            if preset is not None:
+                d.GetVolumePropertyNode().Copy(preset)
+            disps.append(d)
+
+        # Each volume gets a translation that moves the centre of its
+        # bounds to the world origin. Done via a linear transform node
+        # so the Stage-3 world_from_local path carries the shift (the
+        # ImageField re-uses the same object -- no texture rebuild).
+        m_vtk = vtk.vtkMatrix4x4()
+        tforms = []
+        for name, vol in (("CtaCenter", cta), ("PanoCenter", pano)):
+            b = [0.0] * 6
+            vol.GetBounds(b)
+            cx = 0.5 * (b[0] + b[1])
+            cy = 0.5 * (b[2] + b[3])
+            cz = 0.5 * (b[4] + b[5])
+            m_vtk.Identity()
+            m_vtk.SetElement(0, 3, -cx)
+            m_vtk.SetElement(1, 3, -cy)
+            m_vtk.SetElement(2, 3, -cz)
+            t = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLLinearTransformNode", name)
+            t.SetMatrixTransformToParent(m_vtk)
+            vol.SetAndObserveTransformNodeID(t.GetID())
+            tforms.append(t)
+
+        slicer.app.processEvents()
+
+        dv = self._install_dualview()
+        self._frame_and_draw(dv)
+
+        scene_mgr = next(mm for mm in dv.managers
+                         if type(mm).__name__ == "SceneRendererManager")
+        img_fields = [f for f in scene_mgr.renderer.fields()
+                      if isinstance(f, ImageField)]
+        self.assertEqual(len(img_fields), 2,
+            f"expected 2 ImageFields, got {len(img_fields)}")
+
+        _, _, mx, _ = self._snapshot_stats(dv.view, "multivol-overlap")
+        self.assertGreater(max(mx), 60,
+            f"no volumes visible in overlap pose -- max_rgb={mx}")
+
+        self._stash(dualView=dv, volumes=[cta, pano], transforms=tforms)
+        self.delayDisplay(
+            "Multi-Volume loaded: both volumes centered at origin",
+            400)
 
     def test_DeformableVolume(self):
         self.delayDisplay(
