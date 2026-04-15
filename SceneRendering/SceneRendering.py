@@ -1,45 +1,46 @@
-"""SceneRendering -- a Slicer module that exposes the slicer_wgpu
-SceneRenderer (Field-compositing ray tracer) and runs end-to-end
+"""SceneRendering -- a Slicer module that exercises the slicer_wgpu
+SceneRenderer (Field-compositing ray tracer) via a set of named
 self-tests.
 
-Self-tests progress from the simplest verifiable pipeline upward, so
-that a failure at any step pin-points which layer of the stack is
-broken:
+The module's UI is a vertical stack of buttons, one per self-test. Each
+button reloads the module and runs exactly one test so edits made
+during iteration take effect without restarting Slicer.
 
-    Step A  bare PygfxView + pygfx.Mesh cube
-            -- confirms WgpuRenderer + QRenderWidget plumbing works.
-    Step B  SceneRenderer with a single giant FiducialField sphere
-            -- confirms dynamic WGSL codegen + material-class minting +
-               geometryless fullscreen-triangle pipeline.
-    Step C  SceneRenderer with 4 coloured spheres at distinct positions
-            -- confirms per-sphere uniform indexing and per-sphere
-               colouring in the shader.
-    Step D  pick_at() + drag_continue() directly on the SceneRenderer
-            -- confirms the picking/drag math round-trips without any
-               MRML involvement.
-    Step E  mrml_bridge.install() DualView with 4 Markups nodes only
-            (no volume) -- confirms the side-by-side pygfx/VTK layout,
-            the Displayer -> Field machinery, and pick+drag round-trip
-            from pygfx back into MRML.
-    Step F  DualView + CTACardio volume rendering + the same 4 Markups
-            nodes -- confirms ImageField + FiducialField co-exist in
-            the same SceneRenderer, compositing works, and pick+drag
-            still lands on a sphere when the volume is in front.
+Working tests (happy paths that end with interactive DualView state
+stashed on `slicer.modules.*` for inspection):
 
-Running test_SceneRenderingFiducials executes all six in order.
+    test_SingleVolume           CTACardio + DualView (volume only)
+    test_VolumeAndFiducials     CTACardio + 4 markup lists (100 points)
+    test_TransformableVolume    CTACardio under a linear transform
+                                (rotation + non-uniform stretch); also
+                                exercises the in-place transform-update
+                                fast path so Phong shading tracks the
+                                deformation per frame.
+
+Stubs (Slice-level placeholders; fill in when those stages land):
+
+    test_MultiVolume            two registered volumes composited in
+                                the same SceneRenderer
+    test_DeformableVolume       a vtkMRMLGridTransformNode under which
+                                the volume is warped
+    test_CinematicRendering     cinematic-render-ish look (multi-
+                                scatter, HDR env map, etc.)
 """
 
 import logging
-import os
 
-import vtk
+import qt
 import slicer
+import vtk
 from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModule,
     ScriptedLoadableModuleWidget,
     ScriptedLoadableModuleLogic,
     ScriptedLoadableModuleTest,
 )
+
+
+MODULE_NAME = "SceneRendering"
 
 
 #
@@ -54,10 +55,8 @@ class SceneRendering(ScriptedLoadableModule):
         self.parent.dependencies = []
         self.parent.contributors = ["Steve Pieper (Isomics, Inc.)"]
         self.parent.helpText = """
-Field-compositing Scene Renderer (slicer_wgpu): one pygfx ray tracer
-draws every contributing MRML node (volumes, markups, ...) by sampling
-each Field at every ray step and compositing per-sample. The self-test
-exercises the fiducial path in isolation.
+Field-compositing Scene Renderer (slicer_wgpu) driver module. Use the
+buttons in this panel to reload the module and run a single self-test.
 """
         self.parent.acknowledgementText = """
 Built on slicer-wgpu (https://github.com/pieper/slicer-wgpu) and pygfx.
@@ -65,32 +64,78 @@ Built on slicer-wgpu (https://github.com/pieper/slicer-wgpu) and pygfx.
 
 
 #
-# SceneRenderingWidget
+# SceneRenderingWidget -- VBox of "reload + run test" buttons
 #
 
 class SceneRenderingWidget(ScriptedLoadableModuleWidget):
+
+    # (button label, test method name). Order here defines UI order.
+    TESTS = [
+        ("Single Volume",              "test_SingleVolume"),
+        ("Volume + Fiducials",         "test_VolumeAndFiducials"),
+        ("Transformable Volume",       "test_TransformableVolume"),
+        ("Bouncing Head",              "test_BouncingHead"),
+        ("Multi-Volume (stub)",        "test_MultiVolume"),
+        ("Deformable Volume (stub)",   "test_DeformableVolume"),
+        ("Cinematic Rendering (stub)", "test_CinematicRendering"),
+    ]
+
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
 
-        uiWidget = slicer.util.loadUI(self.resourcePath('UI/SceneRendering.ui'))
-        self.layout.addWidget(uiWidget)
-        self.ui = slicer.util.childWidgetVariables(uiWidget)
-        uiWidget.setMRMLScene(slicer.mrmlScene)
+        container = qt.QGroupBox("Self-tests")
+        vbox = qt.QVBoxLayout(container)
 
-        self.logic = SceneRenderingLogic()
+        header = qt.QLabel(
+            "Click a button to reload this module and run that self-test.")
+        header.setWordWrap(True)
+        vbox.addWidget(header)
 
-        self.ui.installButton.connect('clicked(bool)', self.onInstall)
-        self.ui.uninstallButton.connect('clicked(bool)', self.onUninstall)
+        for label, method_name in self.TESTS:
+            btn = qt.QPushButton(label)
+            btn.setToolTip(f"Reload SceneRendering and run {method_name}()")
+            # Capture method_name by default-arg to avoid late-binding on
+            # the loop variable.
+            btn.clicked.connect(
+                lambda _checked=False, m=method_name: self.onRunTest(m))
+            vbox.addWidget(btn)
 
-    def onInstall(self):
-        self.logic.install()
+        self.layout.addWidget(container)
+        self.layout.addStretch(1)
 
-    def onUninstall(self):
-        self.logic.uninstall()
+    def onRunTest(self, test_method_name):
+        """Reload this module and run the named self-test. Mirrors the
+        built-in `Reload and Test` mechanism: reload first so on-disk
+        edits take effect, then instantiate the test class from the
+        freshly-imported module and invoke the requested method.
+
+        Errors are surfaced via `slicer.util.errorDisplay` so a failing
+        test is visible in the UI and not only in the log."""
+        import sys
+
+        try:
+            slicer.util.reloadScriptedModule(self.moduleName)
+        except Exception as e:
+            logging.exception("Module reload failed")
+            slicer.util.errorDisplay(f"Module reload failed: {e}")
+            return
+
+        mod = sys.modules.get(self.moduleName)
+        if mod is None:
+            slicer.util.errorDisplay(
+                f"After reload, {self.moduleName!r} not found in sys.modules")
+            return
+
+        try:
+            tester = mod.SceneRenderingTest()
+            tester.runTestByName(test_method_name)
+        except Exception as e:
+            logging.exception(f"{test_method_name} failed")
+            slicer.util.errorDisplay(f"{test_method_name} failed: {e}")
 
 
 #
-# SceneRenderingLogic
+# SceneRenderingLogic (kept minimal; tests drive install/uninstall)
 #
 
 class SceneRenderingLogic(ScriptedLoadableModuleLogic):
@@ -109,30 +154,73 @@ class SceneRenderingLogic(ScriptedLoadableModuleLogic):
 
 class SceneRenderingTest(ScriptedLoadableModuleTest):
 
-    # Subwindow held alive across steps so the user can interactively
-    # inspect the state left by the test.
-    _view = None
+    # ----- Lifecycle -----
 
     def setUp(self):
-        slicer.mrmlScene.Clear()
+        # Clear scene data but KEEP singletons (layout node, selection,
+        # interaction, view/camera nodes, etc). The default Clear()
+        # also rips out singletons, which can cascade into side effects
+        # in modules that re-register singleton observers, so we stick
+        # to the data-only flavor for test resets.
+        slicer.mrmlScene.Clear(0)
+        # Bootstrap deps (and reimport slicer_wgpu from disk) FIRST, so
+        # test-method-level `from slicer_wgpu.fields import FiducialField`
+        # imports bind to the same class instances the DualView will
+        # create below. Doing this after a top-level import would leave
+        # the test with a stale class reference and every `isinstance`
+        # check would silently return False.
+        self._ensure_dependencies()
+        # Tear down any previously-installed DualView so each test starts
+        # from a clean 3D-view layout.
+        try:
+            from slicer_wgpu import mrml_bridge
+            mrml_bridge.uninstall()
+        except Exception:
+            pass
+        slicer.app.processEvents()
 
     def runTest(self):
+        """Slicer's standard entry: run every implemented test in
+        sequence. Invoked by the built-in `Reload & Test` button."""
+        for name in (
+            "test_SingleVolume",
+            "test_VolumeAndFiducials",
+            "test_TransformableVolume",
+        ):
+            self.setUp()
+            getattr(self, name)()
+
+    def runTestByName(self, test_method_name: str) -> None:
+        """Run a single test by name. Used by the module UI buttons."""
         self.setUp()
-        self.test_SceneRenderingFiducials()
+        getattr(self, test_method_name)()
 
     # ----- Dependency bootstrap -----
 
     def _ensure_dependencies(self):
-        """Install/refresh wgpu, pygfx, rendercanvas (PythonQt patch),
-        and slicer_wgpu from source archives."""
-        import importlib, sys
+        """Make sure numpy / wgpu / pygfx / rendercanvas (PythonQt branch)
+        / slicer_wgpu are importable. pip-install is only invoked when
+        an import actually fails, so a live-development workflow that
+        pushes files via the MCP /file endpoint isn't clobbered."""
+        import importlib
+        import sys
 
-        for pkg in ("numpy", "wgpu", "pygfx"):
+        for pkg in ("numpy", "wgpu"):
             try:
                 importlib.import_module(pkg)
             except ImportError:
                 self.delayDisplay(f"pip-installing {pkg}", 100)
                 slicer.util.pip_install(pkg)
+
+        try:
+            import pygfx
+            # Require a real install, not a namespace-package shadow (e.g. a
+            # stray pygfx/ git clone sitting on sys.path earlier than
+            # site-packages). A namespace package has no __version__.
+            _ = pygfx.__version__
+        except (ImportError, AttributeError):
+            self.delayDisplay("pip-installing pygfx", 100)
+            slicer.util.pip_install("pygfx")
 
         needs_rendercanvas_fork = True
         try:
@@ -146,45 +234,32 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         except ImportError:
             pass
         if needs_rendercanvas_fork:
-            self.delayDisplay("Installing pieper/rendercanvas (PythonQt patch)", 100)
+            self.delayDisplay("Installing pieper/rendercanvas (PythonQt)", 100)
             slicer.util.pip_install(
-                "https://github.com/pieper/rendercanvas/archive/refs/heads/pythonqt-support.zip"
+                "https://github.com/pieper/rendercanvas/"
+                "archive/refs/heads/pythonqt-support.zip"
             )
 
-        self.delayDisplay("Installing pieper/slicer-wgpu", 100)
-        slicer.util.pip_install(
-            "https://github.com/pieper/slicer-wgpu/archive/refs/heads/main.zip"
-        )
+        try:
+            importlib.import_module("slicer_wgpu")
+        except ImportError:
+            self.delayDisplay("Installing pieper/slicer-wgpu", 100)
+            slicer.util.pip_install(
+                "https://github.com/pieper/slicer-wgpu/"
+                "archive/refs/heads/main.zip"
+            )
 
-        # Reload slicer_wgpu only. Popping rendercanvas.* here would leave
-        # pygfx holding a stale reference to the old rendercanvas.base
-        # BaseRenderCanvas (imported at module-load time), which then fails
-        # isinstance() against the freshly-imported widget class.
-        for mod_name in [m for m in list(sys.modules)
-                         if m == "slicer_wgpu" or m.startswith("slicer_wgpu.")]:
+        # Force a fresh import so any on-disk edits (pushed via the
+        # MCP /file endpoint during iteration) take effect.
+        for mod_name in [
+            m for m in list(sys.modules)
+            if m == "slicer_wgpu" or m.startswith("slicer_wgpu.")
+        ]:
             sys.modules.pop(mod_name, None)
 
-    # ----- Helpers -----
-
-    def _enable_debug_logging(self):
-        """Turn on pygfx + wgpu logs at INFO so compilation errors and
-        validation warnings are visible in the Slicer console. Returns the
-        list of (logger, prev_level) pairs so the caller can restore."""
-        import logging
-        prev = []
-        for name in ("pygfx", "wgpu"):
-            lg = logging.getLogger(name)
-            prev.append((lg, lg.level))
-            lg.setLevel(logging.INFO)
-            if not lg.handlers:
-                h = logging.StreamHandler()
-                h.setFormatter(logging.Formatter("[%(name)s:%(levelname)s] %(message)s"))
-                lg.addHandler(h)
-        return prev
+    # ----- Shared helpers -----
 
     def _force_draw(self, view, n=3):
-        """Pump the event loop and request multiple draws so pygfx/wgpu
-        has definitely rendered before we snapshot."""
         slicer.app.processEvents()
         for _ in range(n):
             view.request_redraw()
@@ -195,222 +270,44 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             slicer.app.processEvents()
 
     def _snapshot_stats(self, view, label=""):
-        """Snapshot the current frame and return (rgba_array, min_rgb,
-        max_rgb, mean_rgb). Also log them."""
         import numpy as np
         img = view.renderer.snapshot()
         rgb = np.asarray(img[..., :3])
         mn = tuple(int(x) for x in rgb.min(axis=(0, 1)))
         mx = tuple(int(x) for x in rgb.max(axis=(0, 1)))
-        me = tuple(float(x) for x in rgb.mean(axis=(0, 1)))
-        logging.info(f"[SceneRendering:{label}] "
-                     f"shape={img.shape} min={mn} max={mx} mean={me}")
+        me = tuple(float(round(float(x), 1)) for x in rgb.mean(axis=(0, 1)))
+        logging.info(f"[SceneRendering:{label}] shape={img.shape} "
+                     f"min={mn} max={mx} mean={me}")
         return img, mn, mx, me
 
-    def _new_view(self, width=480, height=360):
-        """Build a bare PygfxView (no DualView, no managers) sized for
-        snapshots. Left as self._view for interactive inspection."""
-        from slicer_wgpu.mrml_bridge import PygfxView
-        if self._view is not None:
-            try:
-                self._view.close()
-            except Exception:
-                pass
-            try:
-                self._view.widget.deleteLater()
-            except Exception:
-                pass
-            self._view = None
-        view = PygfxView()
-        view.widget.resize(width, height)
-        view.widget.show()
+    def _load_ctacardio(self, apply_preset=True):
+        """Load the CTACardio sample volume and build default volume-
+        rendering nodes (optionally overriding the preset)."""
+        import SampleData
+        self.delayDisplay("Downloading CTACardio", 100)
+        vol = SampleData.SampleDataLogic().downloadCTACardio()
+        self.assertIsNotNone(vol, "CTACardio failed to load")
+
+        vrLogic = slicer.modules.volumerendering.logic()
+        disp = vrLogic.CreateDefaultVolumeRenderingNodes(vol)
+        disp.SetVisibility(True)
+        if apply_preset:
+            preset = vrLogic.GetPresetByName("CT-Chest-Contrast-Enhanced")
+            if preset is not None:
+                disp.GetVolumePropertyNode().Copy(preset)
         slicer.app.processEvents()
-        self._view = view
-        return view
-
-    def _log_adapter_info(self):
-        try:
-            import wgpu
-            try:
-                adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
-            except Exception:
-                adapter = wgpu.gpu.request_adapter(power_preference="high-performance")
-            info = adapter.info if hasattr(adapter, "info") else {}
-            logging.info(f"[SceneRendering] wgpu adapter info: {info}")
-        except Exception as e:
-            logging.info(f"[SceneRendering] adapter-info lookup failed: {e}")
-
-    # ----- Steps -----
-
-    def _step_a_mesh_baseline(self):
-        """Confirm that a plain pygfx.Mesh renders into the snapshot
-        texture at all. If this fails, the renderer itself is broken
-        and subsequent steps can't diagnose SceneRenderer issues."""
-        import numpy as np
-        import pygfx
-
-        self.delayDisplay("Step A: pygfx.Mesh baseline", 200)
-        view = self._new_view()
-
-        mesh = pygfx.Mesh(
-            pygfx.box_geometry(80, 80, 80),
-            pygfx.MeshPhongMaterial(color="#ff8000"),
-        )
-        view.scene.add(mesh)
-        view.camera.local.position = (0, 200, 0)
-        view.camera.look_at((0, 0, 0))
-        self._force_draw(view)
-
-        img, mn, mx, me = self._snapshot_stats(view, "step-A mesh")
-        # The orange cube should push at least one channel above the
-        # background (~13 on the default 0.05 clear colour).
-        self.assertGreater(max(mx), 60,
-            f"Step A: pygfx.Mesh didn't render -- max_rgb={mx}")
-
-        view.scene.remove(mesh)
-        self._force_draw(view)
-        return view
-
-    def _step_b_single_sphere(self, view):
-        """Build a SceneRenderer with one huge FiducialField sphere and
-        confirm it paints pixels. This is the narrowest test of the
-        Field-compositing pipeline."""
-        import numpy as np
-        import pygfx
-
-        from slicer_wgpu.fields import FiducialField
-        from slicer_wgpu.scene_renderer import SceneRenderer
-
-        self.delayDisplay("Step B: SceneRenderer + 1 giant sphere", 200)
-
-        fid = FiducialField(
-            centers=np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
-            radii=np.array([40.0], dtype=np.float32),
-            colors=np.array([[1.0, 0.2, 0.2, 1.0]], dtype=np.float32),
-        )
-        renderer = SceneRenderer.build_for_fields([fid])
-        # Useful diagnostics:
-        logging.info(f"[SceneRendering] SceneRenderer class={type(renderer).__name__} "
-                     f"material={type(renderer.material).__name__}")
-        logging.info(f"[SceneRendering] bounds_min={renderer.material.scene_bounds_min} "
-                     f"bounds_max={renderer.material.scene_bounds_max} "
-                     f"sample_step={renderer.material.sample_step}")
-        wgsl = renderer._shader_wgsl
-        logging.info(f"[SceneRendering] generated WGSL length={len(wgsl)} "
-                     f"contains sample_field_fid0={'sample_field_fid0' in wgsl}")
-
-        view.scene.add(renderer)
-        view.camera.local.position = (0, 180, 0)
-        view.camera.look_at((0, 0, 0))
-        self._force_draw(view)
-
-        img, mn, mx, me = self._snapshot_stats(view, "step-B single-sphere")
-        self.assertGreater(max(mx), 60,
-            f"Step B: FiducialField sphere didn't render -- max_rgb={mx}\n"
-            f"First 400 chars of generated WGSL:\n{wgsl[:400]}")
-        # Red sphere: R channel should dominate.
-        self.assertGreater(mx[0], mx[1],
-            f"Step B: red channel didn't dominate -- max_rgb={mx}")
-        self.assertGreater(mx[0], mx[2],
-            f"Step B: red channel didn't dominate blue -- max_rgb={mx}")
-
-        view.scene.remove(renderer)
-        self._force_draw(view)
-        return renderer
-
-    def _step_c_multi_sphere(self, view):
-        """Multiple spheres with distinct colours -- verifies per-sphere
-        uniform indexing."""
-        import numpy as np
-
-        from slicer_wgpu.fields import FiducialField
-        from slicer_wgpu.scene_renderer import SceneRenderer
-
-        self.delayDisplay("Step C: SceneRenderer + 4 coloured spheres", 200)
-
-        centers = np.array([
-            [-60.0,   0.0,   0.0],  # red
-            [ 60.0,   0.0,   0.0],  # green
-            [  0.0,   0.0, -60.0],  # blue
-            [  0.0,   0.0,  60.0],  # yellow
-        ], dtype=np.float32)
-        radii = np.array([20.0, 20.0, 20.0, 20.0], dtype=np.float32)
-        colors = np.array([
-            [1.0, 0.15, 0.15, 1.0],
-            [0.15, 1.0, 0.15, 1.0],
-            [0.15, 0.25, 1.0, 1.0],
-            [1.0, 0.85, 0.15, 1.0],
-        ], dtype=np.float32)
-
-        fid = FiducialField(centers=centers, radii=radii, colors=colors)
-        renderer = SceneRenderer.build_for_fields([fid])
-        view.scene.add(renderer)
-
-        # Frame the scene from above.
-        view.camera.local.position = (0, 280, 30)
-        view.camera.look_at((0, 0, 0))
-        self._force_draw(view)
-
-        img, mn, mx, me = self._snapshot_stats(view, "step-C multi-sphere")
-        # All 3 channels should have been pushed above background by at
-        # least one of the spheres.
-        for ch, name in enumerate("RGB"):
-            self.assertGreater(mx[ch], 80,
-                f"Step C: channel {name} never exceeded 80 -- max_rgb={mx}")
-
-        # Keep state for step D.
-        return renderer, fid
-
-    def _step_d_pick_and_drag(self, view, renderer, fid):
-        """Pick the first sphere at its known NDC location, then drag
-        it 0.2 NDC units in X and confirm the FiducialField state
-        advances."""
-        import numpy as np
-
-        self.delayDisplay("Step D: pick + drag", 200)
-
-        cam = view.camera
-        sz = view.widget.get_logical_size()
-        self.assertGreater(sz[0], 0)
-
-        # Project sphere 0 (at x=-60) to NDC.
-        proj = np.asarray(cam.projection_matrix, dtype=np.float64)
-        vm = np.asarray(cam.world.inverse_matrix, dtype=np.float64)
-        p_world = np.array([-60.0, 0.0, 0.0, 1.0], dtype=np.float64)
-        clip = proj @ vm @ p_world
-        ndc = clip[:3] / clip[3]
-
-        hit = renderer.pick_at(float(ndc[0]), float(ndc[1]), cam, sz)
-        self.assertIsNotNone(hit, f"Step D: pick_at missed sphere 0 at NDC={ndc}")
-        self.assertIs(hit.field, fid, "Step D: pick_at hit the wrong field")
-        self.assertEqual(hit.item_index, 0, "Step D: pick_at hit the wrong sphere")
-
-        before = fid.get_center(0).copy()
-        moved = renderer.drag_continue(hit, float(ndc[0]) + 0.2, float(ndc[1]),
-                                       cam, sz)
-        self.assertTrue(moved, "Step D: drag_continue reported no change")
-        after = fid.get_center(0)
-        delta = float(np.linalg.norm(after - before))
-        self.assertGreater(delta, 1.0,
-            f"Step D: sphere barely moved (delta={delta:.3f}mm)")
-        logging.info(f"[SceneRendering] Step D drag delta={delta:.2f}mm "
-                     f"({before.tolist()} -> {after.tolist()})")
-
-    # ----- MRML / DualView helpers -----
+        return vol
 
     def _build_markup_nodes(self, volume_node=None):
-        """Create 4 markup fiducial nodes with 25 random control points
-        each (100 total). If `volume_node` is given, points are sampled
-        from its bounding box so they sit in/around the volume; otherwise
-        they span a fixed world cube. Returns (list_specs, markup_nodes).
-        """
+        """Create 4 markup fiducial nodes (25 control points each). If
+        `volume_node` is given, points are scattered inside its bounds."""
         import numpy as np
 
         list_specs = [
-            ("MarkupsRed",    (0.95, 0.20, 0.20),  5.0),
-            ("MarkupsGreen",  (0.20, 0.85, 0.30),  3.5),
-            ("MarkupsBlue",   (0.20, 0.45, 0.95),  7.0),
-            ("MarkupsYellow", (0.95, 0.85, 0.10),  2.5),
+            ("MarkupsRed",    (0.95, 0.20, 0.20), 5.0),
+            ("MarkupsGreen",  (0.20, 0.85, 0.30), 3.5),
+            ("MarkupsBlue",   (0.20, 0.45, 0.95), 7.0),
+            ("MarkupsYellow", (0.95, 0.85, 0.10), 2.5),
         ]
         rng = np.random.default_rng(seed=20260415)
         if volume_node is not None:
@@ -433,12 +330,20 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             markup_nodes.append(mn)
         return list_specs, markup_nodes
 
-    def _dualview_pygfx_view(self, dv):
-        """Return the underlying PygfxView from an installed DualView."""
-        return dv.view
+    def _install_dualview(self):
+        """Install the DualView and let it auto-sync cameras to MRML."""
+        from slicer_wgpu import mrml_bridge
+        dv = mrml_bridge.install()
+        self.assertIsNotNone(dv.view, "DualView didn't instantiate PygfxView")
+        slicer.app.processEvents()
+        return dv
+
+    def _frame_and_draw(self, dv):
+        dv.view.reset_camera()
+        dv._sync_camera_to_mrml()
+        self._force_draw(dv.view, n=5)
 
     def _set_dualview_radii(self, dv, list_specs, markup_nodes):
-        from slicer_wgpu.displayers.fiducial import FiducialDisplayer
         scene_mgr = next(m for m in dv.managers
                          if type(m).__name__ == "SceneRendererManager")
         fid_disp = next(d for d in scene_mgr._displayers
@@ -448,9 +353,8 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         return scene_mgr, fid_disp
 
     def _pick_drag_roundtrip(self, dv, markup_node, fid_disp, label):
-        """Pick the first control point of `markup_node`, drag it 0.1 NDC
-        units, commit back to MRML, and assert the MRML position moved.
-        Reuses DualView's camera/view -- this is the integration test."""
+        """Pick the first control point of `markup_node`, drag it 0.1
+        NDC units, commit back to MRML, assert the MRML position moved."""
         import numpy as np
         from slicer_wgpu.fields import FiducialField
 
@@ -465,16 +369,11 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             if isinstance(f, FiducialField)
             and f.mrml_node_id == markup_node.GetID()
         )
-
         before = [0.0, 0.0, 0.0]
         markup_node.GetNthControlPointPosition(0, before)
         before = np.array(before)
 
-        # Rely on DualView's install-time framing (which now also pushes
-        # the pygfx camera back to MRML so both panes agree). Just make
-        # sure a frame has rendered with the current uniform state.
         self._force_draw(view)
-
         cam = view.camera
         proj = np.asarray(cam.projection_matrix, dtype=np.float64)
         vm = np.asarray(cam.world.inverse_matrix, dtype=np.float64)
@@ -485,8 +384,8 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
 
         hit = r.pick_at(float(ndc[0]), float(ndc[1]), cam, sz)
         self.assertIsNotNone(hit,
-            f"{label}: pick missed control point 0 of {markup_node.GetName()} "
-            f"at NDC={ndc.tolist()}")
+            f"{label}: pick missed control point 0 of "
+            f"{markup_node.GetName()} at NDC={ndc.tolist()}")
         self.assertIs(hit.field, matching_field,
             f"{label}: pick hit a different field")
         self.assertEqual(hit.item_index, 0,
@@ -506,159 +405,424 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             f"{label}: MRML point barely moved (delta={delta:.3f}mm)")
         logging.info(f"[SceneRendering] {label} MRML drag delta={delta:.2f}mm")
 
-    # ----- DualView steps -----
+    def _stash(self, **kwargs):
+        """Park results on slicer.modules.* for interactive inspection
+        after the test returns. Keeps test_SingleVolume's dv alive, etc."""
+        for k, v in kwargs.items():
+            setattr(slicer.modules, f"sceneRenderingTest_{k}", v)
 
-    def _step_e_dualview_fiducials(self):
-        """Install the DualView (pygfx + VTK side-by-side), add 4 markup
-        nodes with 100 total points, assert the SceneRenderer ends up
-        with 4 FiducialFields, and exercise pick+drag through the
-        manager. No volume rendering yet."""
-        import numpy as np
+    # ----- Working tests -----
 
-        from slicer_wgpu import mrml_bridge
-        from slicer_wgpu.fields import FiducialField
+    def test_SingleVolume(self):
+        """DualView + CTACardio only (no fiducials, no transform).
+        Confirms ImageField rendering, camera sync, and that both panes
+        agree on the composited volume."""
+        self.delayDisplay("Single Volume: loading CTACardio", 200)
 
-        self.delayDisplay("Step E: DualView with fiducials (no volume)", 200)
+        vol = self._load_ctacardio()
+        dv = self._install_dualview()
+        self._frame_and_draw(dv)
 
-        # Tear down the standalone view from earlier steps so the
-        # DualView install gets a clean Qt layout.
-        if self._view is not None:
-            try: self._view.close()
-            except Exception: pass
-            try: self._view.widget.deleteLater()
-            except Exception: pass
-            self._view = None
-
-        slicer.mrmlScene.Clear(0)
-        slicer.app.processEvents()
-
-        list_specs, markup_nodes = self._build_markup_nodes()
-
-        dv = mrml_bridge.install()
-        self.assertIsNotNone(dv.view, "Step E: DualView didn't instantiate PygfxView")
-        slicer.app.processEvents()
-
-        scene_mgr, fid_disp = self._set_dualview_radii(
-            dv, list_specs, markup_nodes)
-
-        # Radii changed after install, so AABB did too -- reframe and
-        # resync both cameras, then let the scene redraw.
-        dv.view.reset_camera()
-        dv._sync_camera_to_mrml()
-        self._force_draw(dv.view)
-
+        scene_mgr = next(m for m in dv.managers
+                         if type(m).__name__ == "SceneRendererManager")
         r = scene_mgr.renderer
         kinds = sorted(f.field_kind for f in r.fields())
-        n_img = kinds.count("img")
-        n_fid = kinds.count("fid")
-        self.assertEqual(n_img, 0,
-            f"Step E: expected 0 ImageFields (no volume loaded), got {n_img}")
-        self.assertEqual(n_fid, 4,
-            f"Step E: expected 4 FiducialFields, got {n_fid}")
+        self.assertEqual(kinds.count("img"), 1,
+            f"expected 1 ImageField, got kinds={kinds}")
+        self.assertEqual(kinds.count("fid"), 0,
+            f"expected 0 FiducialFields, got kinds={kinds}")
+
+        _, _, mx, _ = self._snapshot_stats(dv.view, "single-volume")
+        self.assertGreater(max(mx), 60,
+            f"no volume visible in pygfx pane -- max_rgb={mx}")
+
+        self._stash(dualView=dv, volume=vol)
+        self.delayDisplay("Single Volume test PASSED", 400)
+
+    def test_VolumeAndFiducials(self):
+        """DualView + CTACardio + 4 markup lists (100 control points).
+        Asserts 1 ImageField + 4 FiducialFields coexist and pick+drag
+        still round-trips through MRML."""
+        import numpy as np
+        from slicer_wgpu.fields import FiducialField
+
+        self.delayDisplay("Volume + Fiducials: loading scene", 200)
+
+        vol = self._load_ctacardio()
+        list_specs, markup_nodes = self._build_markup_nodes(volume_node=vol)
+        dv = self._install_dualview()
+        _, fid_disp = self._set_dualview_radii(dv, list_specs, markup_nodes)
+        self._frame_and_draw(dv)
+
+        scene_mgr = next(m for m in dv.managers
+                         if type(m).__name__ == "SceneRendererManager")
+        r = scene_mgr.renderer
+        kinds = sorted(f.field_kind for f in r.fields())
+        self.assertEqual(kinds.count("img"), 1,
+            f"expected 1 ImageField, got kinds={kinds}")
+        self.assertEqual(kinds.count("fid"), 4,
+            f"expected 4 FiducialFields, got kinds={kinds}")
         total = sum(f.n_spheres for f in r.fields()
                     if isinstance(f, FiducialField))
         self.assertEqual(total, 100,
-            f"Step E: expected 100 spheres, got {total}")
+            f"expected 100 spheres, got {total}")
 
-        img, mn, mx, me = self._snapshot_stats(dv.view, "step-E dualview-fid")
+        _, _, mx, _ = self._snapshot_stats(dv.view, "volume+fiducials")
         self.assertGreater(max(mx), 60,
-            f"Step E: no fiducials visible -- max_rgb={mx}")
+            f"nothing visible in composite -- max_rgb={mx}")
 
-        # Pick+drag round-trip on the red list.
-        self._pick_drag_roundtrip(dv, markup_nodes[0], fid_disp, "Step E")
+        self._pick_drag_roundtrip(
+            dv, markup_nodes[0], fid_disp, "Volume+Fiducials")
 
-        slicer.modules.sceneRenderingTestDualView = dv
+        self._stash(dualView=dv, volume=vol, markupNodes=markup_nodes)
+        self.delayDisplay("Volume + Fiducials test PASSED", 400)
 
-    def _step_f_dualview_with_volume(self):
-        """Reinstall the DualView after loading CTACardio + volume
-        rendering, then drop in the same 4 Markups nodes. Assert the
-        SceneRenderer ends up with 1 ImageField + 4 FiducialFields,
-        and pick+drag still resolves a sphere with the volume composed
-        underneath."""
+    def test_TransformableVolume(self):
+        """DualView + CTACardio under a linear transform (rotation +
+        non-uniform stretch). Verifies that world_from_local is folded
+        into the sampling matrix, that the scene-AABB expands to cover
+        the deformed bounds, and that in-place matrix mutation takes
+        the fast path (same Field instance, no LUT/texture rebuild)."""
+        import math
         import numpy as np
-        import SampleData
+        from slicer_wgpu.fields import ImageField
 
-        from slicer_wgpu import mrml_bridge
-        from slicer_wgpu.fields import FiducialField
+        self.delayDisplay("Transformable Volume: loading scene", 200)
 
-        self.delayDisplay("Step F: DualView + volume + fiducials", 200)
+        vol = self._load_ctacardio()
+        dv = self._install_dualview()
 
-        # Start from a clean DualView and a clean scene.
-        try:
-            mrml_bridge.uninstall()
-        except Exception:
-            pass
-        slicer.mrmlScene.Clear(0)
+        # 45-degree rotation about z + 1.5x stretch along the rotated X.
+        tform = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLinearTransformNode", "StretchRot")
+        m = vtk.vtkMatrix4x4()
+        c, s = math.cos(math.radians(45.0)), math.sin(math.radians(45.0))
+        sx = 1.5
+        M = [
+            [c * sx, -s * sx, 0.0, 0.0],
+            [s,       c,      0.0, 0.0],
+            [0.0,     0.0,    1.0, 0.0],
+            [0.0,     0.0,    0.0, 1.0],
+        ]
+        for i in range(4):
+            for j in range(4):
+                m.SetElement(i, j, float(M[i][j]))
+        tform.SetMatrixTransformToParent(m)
+        vol.SetAndObserveTransformNodeID(tform.GetID())
         slicer.app.processEvents()
 
-        self.delayDisplay("Step F: downloading CTACardio", 100)
-        vol = SampleData.SampleDataLogic().downloadCTACardio()
-        self.assertIsNotNone(vol, "Step F: CTACardio sample data failed to load")
+        self._frame_and_draw(dv)
 
+        scene_mgr = next(mm for mm in dv.managers
+                         if type(mm).__name__ == "SceneRendererManager")
+        img_field = next(f for f in scene_mgr.renderer.fields()
+                         if isinstance(f, ImageField))
+        self.assertFalse(
+            np.allclose(img_field.world_from_local, np.eye(4)),
+            "Transform didn't reach ImageField.world_from_local")
+
+        _, _, mx, _ = self._snapshot_stats(dv.view, "transformable")
+        self.assertGreater(max(mx), 60,
+            f"no deformed volume visible -- max_rgb={mx}")
+
+        # Fast-path: mutate the transform matrix in place and confirm
+        # the same Field object is reused (no full rebuild).
+        obj_id_before = id(img_field)
+        c2, s2 = math.cos(math.radians(90.0)), math.sin(math.radians(90.0))
+        sx2, sy2 = 2.0, 0.7
+        M2 = [
+            [c2 * sx2, -s2 * sx2, 0.0, 0.0],
+            [s2 * sy2,  c2 * sy2, 0.0, 0.0],
+            [0.0,       0.0,      1.0, 0.0],
+            [0.0,       0.0,      0.0, 1.0],
+        ]
+        for i in range(4):
+            for j in range(4):
+                m.SetElement(i, j, float(M2[i][j]))
+        tform.SetMatrixTransformToParent(m)
+        slicer.app.processEvents()
+        self._force_draw(dv.view, n=5)
+
+        img_field2 = next(f for f in scene_mgr.renderer.fields()
+                          if isinstance(f, ImageField))
+        self.assertIs(img_field2, img_field,
+            "fast-path broke: field was rebuilt on transform mutation")
+        self.assertEqual(id(img_field2), obj_id_before,
+            "fast-path broke: different object id")
+
+        self._stash(dualView=dv, volume=vol, transform=tform)
+        self.delayDisplay("Transformable Volume test PASSED", 400)
+
+    def test_BouncingHead(self):
+        """MRHead rendered with a gradient-emphasizing transfer function
+        while a mass-spring simulation drives its parent linear
+        transform. Four masses sit at the bottom corners of the volume
+        bounding box and hang from fixed anchors at the top corners via
+        vertical springs; six additional springs couple the bottom
+        masses (four along the bottom edges plus two diagonals). The
+        loop runs the ODE, fits a least-squares affine through the 8
+        corner positions each frame, and pushes it into the transform
+        node. Slicer's TransformModifiedEvent fans out to the Stage-3
+        fast path, so Phong shading reacts per-frame to the stretch and
+        shear as the head wobbles.
+
+        The exact deformation produced by this configuration is not a
+        single affine, but the least-squares fit is a reasonable visual
+        approximation. Bottom-edge / bottom-diagonal stiffnesses are
+        tuned so a vertical stretch couples into lateral contraction
+        (and vice versa), giving an effective Poisson-ratio-ish
+        response around 0.4."""
+        import math
+        import numpy as np
+        import time
+
+        from slicer_wgpu.fields import ImageField
+
+        self.delayDisplay("Bouncing Head: loading MRHead", 200)
+
+        import SampleData
+        vol = SampleData.SampleDataLogic().downloadMRHead()
+        self.assertIsNotNone(vol, "MRHead failed to load")
+
+        # Build a transfer function that emphasises gradients: modest
+        # scalar opacity across the whole range so internal voxels
+        # contribute, but gradient-opacity ramps up sharply so the
+        # composite pops at tissue boundaries (skin, sinuses, bone,
+        # white/grey matter). Shading on, ambient low, diffuse high.
         vrLogic = slicer.modules.volumerendering.logic()
         disp = vrLogic.CreateDefaultVolumeRenderingNodes(vol)
         disp.SetVisibility(True)
-        preset = vrLogic.GetPresetByName("CT-Chest-Contrast-Enhanced")
-        if preset is not None:
-            disp.GetVolumePropertyNode().Copy(preset)
+        vp = disp.GetVolumePropertyNode().GetVolumeProperty()
+
+        # Detect the actual scalar range so these TF points aren't off
+        # if MRHead gets re-encoded some day.
+        arr = slicer.util.arrayFromVolume(vol)
+        s_lo = float(arr.min())
+        s_hi = float(arr.max())
+        s_mid = 0.25 * (s_hi - s_lo) + s_lo
+
+        op = vtk.vtkPiecewiseFunction()
+        op.AddPoint(s_lo,          0.0)
+        op.AddPoint(s_lo + 1.0,    0.02)
+        op.AddPoint(s_mid,         0.18)
+        op.AddPoint(s_hi,          0.25)
+        vp.SetScalarOpacity(0, op)
+
+        color = vtk.vtkColorTransferFunction()
+        color.AddRGBPoint(s_lo,    0.02, 0.02, 0.05)
+        color.AddRGBPoint(s_mid,   0.60, 0.52, 0.42)
+        color.AddRGBPoint(s_hi,    1.00, 0.95, 0.90)
+        vp.SetColor(0, color)
+
+        g_lut = vtk.vtkPiecewiseFunction()
+        g_lut.AddPoint(0.0,   0.0)
+        g_lut.AddPoint(3.0,   0.05)
+        g_lut.AddPoint(15.0,  0.90)
+        g_lut.AddPoint(80.0,  1.00)
+        vp.SetGradientOpacity(0, g_lut)
+
+        vp.ShadeOn()
+        vp.SetAmbient(0.20)
+        vp.SetDiffuse(0.85)
+        vp.SetSpecular(0.45)
+        vp.SetSpecularPower(24)
+
+        tform = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLinearTransformNode", "BouncingHead")
+        vol.SetAndObserveTransformNodeID(tform.GetID())
         slicer.app.processEvents()
 
-        list_specs, markup_nodes = self._build_markup_nodes(volume_node=vol)
+        # --- Mass-spring system ---
+        bounds = [0.0] * 6
+        vol.GetBounds(bounds)
+        xm, xM, ym, yM, zm, zM = bounds
+        # 8 corner particles: indices 0-3 are top (fixed), 4-7 are
+        # bottom (free). Matching pairs (0,4), (1,5), (2,6), (3,7) are
+        # directly above each other.
+        rest = np.array([
+            [xm, ym, zM], [xM, ym, zM], [xM, yM, zM], [xm, yM, zM],  # top
+            [xm, ym, zm], [xM, ym, zm], [xM, yM, zm], [xm, yM, zm],  # bot
+        ], dtype=np.float64)
+        particles = rest.copy()
+        velocities = np.zeros((8, 3), dtype=np.float64)
+        is_fixed = np.array([True] * 4 + [False] * 4)
+        masses = np.ones(8, dtype=np.float64)
 
-        dv = mrml_bridge.install()
-        self.assertIsNotNone(dv.view, "Step F: DualView didn't instantiate PygfxView")
+        # ---- Cartoony (but stable) initial pose ----
+        # Pull the bottom face down so the overall vertical extent is
+        # ~1.4x the rest length, and squeeze x/y toward the centerline
+        # by 1/sqrt(stretch) so the volume is approximately preserved
+        # (Poisson's-ratio-ish silly-putty response). Smaller than a
+        # literal "double length" because with real MRHead bounds
+        # (~150 mm) a 2x stretch gives the springs enough stored
+        # energy to launch the system into divergence before damping
+        # catches up.
+        stretch_z  = 1.4
+        squeeze_xy = 1.0 / math.sqrt(stretch_z)    # ≈ 0.845
+        cx, cy = 0.5 * (xm + xM), 0.5 * (ym + yM)
+        bot_z0 = zm - (zM - zm) * (stretch_z - 1.0)
+
+        def _sq_xy(x, y):
+            return (cx + (x - cx) * squeeze_xy,
+                    cy + (y - cy) * squeeze_xy)
+
+        for k, (bx, by) in enumerate([(xm, ym), (xM, ym), (xM, yM), (xm, yM)]):
+            sx, sy = _sq_xy(bx, by)
+            particles[4 + k] = np.array([sx, sy, bot_z0])
+
+        # Modest upward return velocities + a little lateral asymmetry
+        # so the bottom face swings rather than pistoning straight up.
+        velocities[4] = np.array([  40.0,   10.0,   80.0])
+        velocities[5] = np.array([ -30.0,   40.0,   70.0])
+        velocities[6] = np.array([   5.0,  -45.0,   80.0])
+        velocities[7] = np.array([  35.0,   25.0,   60.0])
+
+        # Geometry-derived rest lengths.
+        L_vert = np.linalg.norm(rest[0] - rest[4])   # 4 vertical (all equal)
+        L_edge = [                                   # 4 bottom edges
+            np.linalg.norm(rest[4] - rest[5]),       # -y edge, along x
+            np.linalg.norm(rest[5] - rest[6]),       # +x edge, along y
+            np.linalg.norm(rest[6] - rest[7]),       # +y edge, along x
+            np.linalg.norm(rest[7] - rest[4]),       # -x edge, along y
+        ]
+        L_diag = [                                   # 2 bottom diagonals
+            np.linalg.norm(rest[4] - rest[6]),
+            np.linalg.norm(rest[5] - rest[7]),
+        ]
+
+        # Stiffnesses: stiff enough that the pre-stretched pose can't
+        # launch the system past its rest length by a huge overshoot,
+        # soft enough that the first recovery is a visible wobble.
+        k_v = 28.0
+        k_e = 42.0
+        k_d = 24.0
+
+        springs = (
+            [(i, i + 4, L_vert, k_v) for i in range(4)]
+            + [(4, 5, L_edge[0], k_e), (5, 6, L_edge[1], k_e),
+               (6, 7, L_edge[2], k_e), (7, 4, L_edge[3], k_e)]
+            + [(4, 6, L_diag[0], k_d), (5, 7, L_diag[1], k_d)]
+        )
+
+        gravity = np.array([0.0, 0.0, -180.0])  # mm/s^2, tuned for visuals
+        damping = 0.55                          # firmer decay for stability
+        dt_sub = 0.004
+        substeps = 4
+        n_frames = 720                          # ~12 s at 60 fps
+
+        # Periodically inject a modest impulse on a random bottom mass
+        # so the head keeps wobbling for the full 12 s instead of
+        # damping all the way back to rest. Kept well below what the
+        # springs can restore in one cycle.
+        rng = np.random.default_rng(seed=20260415)
+        kick_frames = set(range(180, n_frames, 160))
+        kick_impulse = 55.0
+
+        P_rest_hom = np.hstack([rest, np.ones((8, 1))])  # (8, 4)
+
+        def fit_affine():
+            """Least-squares 4x4 affine M s.t. M @ P_rest ≈ particles."""
+            Mt, *_ = np.linalg.lstsq(P_rest_hom, particles, rcond=None)
+            M = np.vstack([Mt.T, [0.0, 0.0, 0.0, 1.0]])
+            return M
+
+        m_vtk = vtk.vtkMatrix4x4()
+
+        def push_transform(M):
+            for i in range(4):
+                for j in range(4):
+                    m_vtk.SetElement(i, j, float(M[i, j]))
+            tform.SetMatrixTransformToParent(m_vtk)
+
+        # Seed the transform with the stretched initial affine BEFORE
+        # installing the DualView so the ImageField's world_from_local
+        # AABB already reflects the dramatic pose. That lets
+        # reset_camera frame the full stretched head on frame 1.
+        push_transform(fit_affine())
         slicer.app.processEvents()
 
-        scene_mgr, fid_disp = self._set_dualview_radii(
-            dv, list_specs, markup_nodes)
+        dv = self._install_dualview()
+        self._frame_and_draw(dv)
 
-        # Reframe after radii change so both panes see the scene, and
-        # push back to MRML so the side-by-side VTK view matches.
-        dv.view.reset_camera()
-        dv._sync_camera_to_mrml()
-        self._force_draw(dv.view, n=5)
+        # Periodically nudge a random bottom mass so the sim stays
+        # lively instead of slowly damping toward equilibrium. A handful
+        # of mid-run kicks keeps things wobbly without looking erratic.
+        rng = np.random.default_rng(seed=20260415)
+        kick_frames = set(range(120, n_frames, 140))   # every ~2.3 s
+        kick_impulse = 120.0                           # mm/s added instantly
 
-        r = scene_mgr.renderer
-        kinds = sorted(f.field_kind for f in r.fields())
-        n_img = kinds.count("img")
-        n_fid = kinds.count("fid")
-        self.assertEqual(n_img, 1,
-            f"Step F: expected 1 ImageField, got {n_img}")
-        self.assertEqual(n_fid, 4,
-            f"Step F: expected 4 FiducialFields, got {n_fid}")
-        total = sum(f.n_spheres for f in r.fields()
-                    if isinstance(f, FiducialField))
-        self.assertEqual(total, 100,
-            f"Step F: expected 100 spheres, got {total}")
+        def sim_step(dt):
+            forces = np.zeros_like(particles)
+            forces[~is_fixed] += gravity * masses[~is_fixed, None]
+            for i, j, L0, k in springs:
+                d = particles[j] - particles[i]
+                L = float(np.linalg.norm(d))
+                if L < 1e-6:
+                    continue
+                f = (k * (L - L0) / L) * d
+                forces[i] += f
+                forces[j] -= f
+            velocities[~is_fixed] += (
+                forces[~is_fixed] / masses[~is_fixed, None]) * dt
+            velocities[~is_fixed] *= (1.0 - damping * dt)
+            particles[~is_fixed] += velocities[~is_fixed] * dt
 
-        img, mn, mx, me = self._snapshot_stats(dv.view, "step-F dualview-vol-fid")
-        self.assertGreater(max(mx), 60,
-            f"Step F: no content visible in composite snapshot -- max_rgb={mx}")
+        max_seen = (0, 0, 0)
+        for frame in range(n_frames):
+            if frame in kick_frames:
+                which = int(rng.integers(4, 8))
+                direction = rng.normal(size=3)
+                direction[2] *= 0.3  # bias mostly lateral kicks
+                direction /= max(np.linalg.norm(direction), 1e-6)
+                velocities[which] += kick_impulse * direction
+            for _ in range(substeps):
+                sim_step(dt_sub)
+            push_transform(fit_affine())
+            slicer.app.processEvents()
+            if frame == n_frames // 3:
+                _, _, mx, _ = self._snapshot_stats(dv.view, "bouncing-head-mid")
+                max_seen = tuple(max(a, b) for a, b in zip(max_seen, mx))
 
-        # Pick+drag round-trip. Even with the volume in the scene, the
-        # FiducialField's SDF pass should still register a sphere hit in
-        # front of any volume contribution on the same ray.
-        self._pick_drag_roundtrip(dv, markup_nodes[0], fid_disp, "Step F")
+        _, _, mx, _ = self._snapshot_stats(dv.view, "bouncing-head-final")
+        max_seen = tuple(max(a, b) for a, b in zip(max_seen, mx))
+        self.assertGreater(max(max_seen), 60,
+            f"no head visible during simulation -- max_rgb={max_seen}")
 
-        slicer.modules.sceneRenderingTestDualView = dv
+        # Sanity: the final transform should differ from identity
+        # (i.e. the simulation actually moved the masses).
+        final_M = np.array([
+            [m_vtk.GetElement(i, j) for j in range(4)] for i in range(4)
+        ])
+        delta_from_I = float(np.linalg.norm(final_M - np.eye(4)))
+        self.assertGreater(delta_from_I, 1e-3,
+            f"transform never left identity (delta={delta_from_I:.4f})")
 
-    # ----- Entry points -----
+        self._stash(dualView=dv, volume=vol, transform=tform)
+        self.delayDisplay("Bouncing Head test PASSED", 400)
 
-    def test_SceneRenderingFiducials(self):
-        """Run all six diagnostic steps."""
-        self.delayDisplay("Starting SceneRendering fiducial diagnostic", 100)
-        self._ensure_dependencies()
-        self._enable_debug_logging()
-        self._log_adapter_info()
+    # ----- Stubs for future stages -----
 
-        slicer.mrmlScene.Clear(0)
-        slicer.app.processEvents()
+    def test_MultiVolume(self):
+        self.delayDisplay(
+            "Multi-volume test: not implemented yet. "
+            "Will composite two registered volumes (e.g. CT + PET) in "
+            "the same SceneRenderer at the per-sample loop.",
+            1500,
+        )
 
-        view = self._step_a_mesh_baseline()
-        renderer = self._step_b_single_sphere(view)
-        renderer, fid = self._step_c_multi_sphere(view)
-        self._step_d_pick_and_drag(view, renderer, fid)
-        self._step_e_dualview_fiducials()
-        self._step_f_dualview_with_volume()
+    def test_DeformableVolume(self):
+        self.delayDisplay(
+            "Deformable volume test: not implemented yet. "
+            "Will attach a vtkMRMLGridTransformNode (displacement field) "
+            "to the volume via a TransformField and verify the rendered "
+            "shape warps.",
+            1500,
+        )
 
-        self.delayDisplay("SceneRendering fiducial test PASSED", 500)
+    def test_CinematicRendering(self):
+        self.delayDisplay(
+            "Cinematic rendering test: not implemented yet. "
+            "Placeholder for a cinematic-style path (multi-scatter, "
+            "environment lighting, HDR tone-map).",
+            1500,
+        )
