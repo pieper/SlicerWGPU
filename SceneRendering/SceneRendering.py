@@ -100,6 +100,20 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
                 lambda _checked=False, m=method_name: self.onRunTest(m))
             vbox.addWidget(btn)
 
+        # Opt-in force-reinstall: by default _ensure_dependencies only
+        # pip-installs when a dep isn't importable, because the github
+        # zip URLs cache and re-downloading every run is slow. Toggle
+        # this when you want the next test button press to pull a
+        # fresh build of pieper/rendercanvas or pieper/slicer-wgpu.
+        self._forceReinstallCheck = qt.QCheckBox(
+            "Force-reinstall deps from GitHub on next test")
+        self._forceReinstallCheck.setToolTip(
+            "When checked, the next Self-test run will pass "
+            "--force-reinstall --no-cache-dir to pip for "
+            "pieper/rendercanvas and pieper/slicer-wgpu. The box "
+            "unchecks itself automatically after the run.")
+        vbox.addWidget(self._forceReinstallCheck)
+
         self.layout.addWidget(container)
         self.layout.addStretch(1)
 
@@ -128,10 +142,15 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
 
         try:
             tester = mod.SceneRenderingTest()
+            tester._force_reinstall = self._forceReinstallCheck.isChecked()
             tester.runTestByName(test_method_name)
         except Exception as e:
             logging.exception(f"{test_method_name} failed")
             slicer.util.errorDisplay(f"{test_method_name} failed: {e}")
+        finally:
+            # One-shot: unchecking avoids re-running the slow path
+            # on the next button press unless the user opts in again.
+            self._forceReinstallCheck.setChecked(False)
 
 
 #
@@ -242,25 +261,48 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
                 needs_rendercanvas_fork = False
         except ImportError:
             pass
-        if needs_rendercanvas_fork:
-            self.delayDisplay("Installing pieper/rendercanvas (PythonQt)", 100)
+        if needs_rendercanvas_fork or getattr(self, "_force_reinstall", False):
+            msg = ("Force-reinstalling pieper/rendercanvas (PythonQt)"
+                   if not needs_rendercanvas_fork
+                   else "Installing pieper/rendercanvas (PythonQt)")
+            self.delayDisplay(msg, 100)
             # --force-reinstall is essential: the fork's pyproject declares
             # itself as rendercanvas==<upstream version>, so pip would
             # otherwise decide the upstream install "already satisfies"
             # and skip the replacement. --no-deps avoids dragging in
             # upstream rendercanvas again via transitive requirements.
+            # --no-cache-dir when force-reinstalling guarantees we pull
+            # the current pythonqt-support branch, not a stale cached zip.
+            cache = "--no-cache-dir " if getattr(self, "_force_reinstall", False) else ""
             slicer.util.pip_install(
-                "--force-reinstall --no-deps "
+                f"--force-reinstall --no-deps {cache}"
                 "https://github.com/pieper/rendercanvas/"
                 "archive/refs/heads/pythonqt-support.zip"
             )
 
+        # slicer-wgpu's version is pinned at 0.1.0 and never bumps, so
+        # pip considers any cached wheel of the GitHub main.zip URL to
+        # satisfy the requirement. By default we only install if the
+        # package isn't importable at all; use the "Force Reinstall
+        # Dependencies" button in the module UI to pull a fresh build
+        # when you want to pick up new commits from main.
+        force = getattr(self, "_force_reinstall", False)
         try:
             importlib.import_module("slicer_wgpu")
+            needs_install = False
         except ImportError:
-            self.delayDisplay("Installing pieper/slicer-wgpu", 100)
+            needs_install = True
+        if needs_install or force:
+            msg = ("Force-reinstalling pieper/slicer-wgpu"
+                   if force else "Installing pieper/slicer-wgpu")
+            self.delayDisplay(msg, 100)
+            args = (
+                "--force-reinstall --no-deps --no-cache-dir "
+                if force else ""
+            )
             slicer.util.pip_install(
-                "https://github.com/pieper/slicer-wgpu/"
+                args
+                + "https://github.com/pieper/slicer-wgpu/"
                 "archive/refs/heads/main.zip"
             )
 
