@@ -284,11 +284,21 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             # objects. Without this pop, `from rendercanvas.qt import ...`
             # inside slicer_wgpu returns the cached upstream module and
             # the fork's PythonQt branch never runs.
-            for mod_name in [
-                m for m in list(sys.modules)
-                if m == "rendercanvas" or m.startswith("rendercanvas.")
-            ]:
-                sys.modules.pop(mod_name, None)
+            #
+            # Also pop pygfx: pygfx caches a reference to
+            # rendercanvas.base.BaseRenderCanvas at pygfx import time.
+            # After we pop rendercanvas, the freshly-reimported
+            # BaseRenderCanvas is a different class object from the one
+            # pygfx is holding, so `isinstance(QRenderWidget(),
+            # pygfx.<cached>.BaseRenderCanvas)` returns False and
+            # WgpuRenderer rejects our canvas with "Render target must
+            # be a Canvas or Texture, not QRenderWidget".
+            for prefix in ("rendercanvas", "pygfx"):
+                for mod_name in [
+                    m for m in list(sys.modules)
+                    if m == prefix or m.startswith(prefix + ".")
+                ]:
+                    sys.modules.pop(mod_name, None)
 
         # slicer-wgpu's version is pinned at 0.1.0 and never bumps, so
         # pip considers any cached wheel of the GitHub main.zip URL to
