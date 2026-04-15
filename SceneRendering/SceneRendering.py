@@ -279,6 +279,16 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
                 "https://github.com/pieper/rendercanvas/"
                 "archive/refs/heads/pythonqt-support.zip"
             )
+            # pip overwrote rendercanvas on disk but Python's sys.modules
+            # still holds the pre-install (upstream) rendercanvas
+            # objects. Without this pop, `from rendercanvas.qt import ...`
+            # inside slicer_wgpu returns the cached upstream module and
+            # the fork's PythonQt branch never runs.
+            for mod_name in [
+                m for m in list(sys.modules)
+                if m == "rendercanvas" or m.startswith("rendercanvas.")
+            ]:
+                sys.modules.pop(mod_name, None)
 
         # slicer-wgpu's version is pinned at 0.1.0 and never bumps, so
         # pip considers any cached wheel of the GitHub main.zip URL to
