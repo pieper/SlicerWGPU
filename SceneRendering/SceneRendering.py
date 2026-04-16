@@ -1012,9 +1012,63 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         )
 
     def test_CinematicRendering(self):
-        self.delayDisplay(
-            "Cinematic rendering test: not implemented yet. "
-            "Placeholder for a cinematic-style path (multi-scatter, "
-            "environment lighting, HDR tone-map).",
-            1500,
-        )
+        """CTACardio rendered with a shadow-casting directional light.
+        Stage 1: one directional light placed above-and-off-axis from the
+        initial camera, ImageField-only shadow volume, 128 resolution for
+        test speed. We verify the shadow pass darkens the image
+        meaningfully vs the headlight baseline, then orbit through a few
+        poses and snapshot each for eye-checking in the dual pane.
+        """
+        import math
+        import numpy as np
+
+        vol = self._load_ctacardio()
+        dv = self._install_dualview()
+        self._frame_and_draw(dv)
+
+        # Headlight baseline snapshot (no light_direction, no shadows).
+        _, _, _, me_base = self._snapshot_stats(dv.view, "cinematic-base")
+
+        scene_mgr = next(mm for mm in dv.managers
+                         if type(mm).__name__ == "SceneRendererManager")
+
+        # Key light: up and slightly off-axis from the initial camera so
+        # orbiting clearly exposes shadow terminators on the heart.
+        cam_pos = np.asarray(dv.view.camera.local.position, dtype=np.float64)
+        fwd = -cam_pos / max(np.linalg.norm(cam_pos), 1e-6)
+        up = np.array([0.0, 0.0, 1.0])
+        right = np.cross(fwd, up)
+        rn = np.linalg.norm(right)
+        if rn > 1e-6:
+            right = right / rn
+        light_dir = up * 1.0 - right * 0.5
+        light_dir /= np.linalg.norm(light_dir)
+
+        scene_mgr.enable_shadows(
+            light_direction=tuple(light_dir), resolution=128)
+        slicer.app.processEvents()
+        self._force_draw(dv.view, n=5)
+        _, _, _, me_shad = self._snapshot_stats(dv.view, "cinematic-shad")
+
+        # Shadowed render should be meaningfully darker than baseline --
+        # the directional light plus shadow attenuation drops the mean
+        # luminance substantially on a bright CT preset.
+        base_peak = max(me_base)
+        shad_peak = max(me_shad)
+        self.assertGreater(base_peak, 5.0,
+            f"baseline never lit the scene: mean={me_base}")
+        self.assertLess(shad_peak, base_peak * 0.9,
+            f"shadows didn't darken the scene enough: "
+            f"base mean={me_base}, shadowed mean={me_shad}")
+
+        # Orbit through four azimuths so the shadow pattern is visible
+        # from multiple angles (each reuses the same baked shadow volume
+        # -- camera motion alone doesn't rebuild it).
+        for az in (30, 90, 150, 210):
+            dv.view.controller.rotate((math.radians(az), 0.0), (0, 0, 800, 600))
+            slicer.app.processEvents()
+            self._force_draw(dv.view, n=3)
+            self._snapshot_stats(dv.view, f"cinematic-az{az}")
+
+        self._stash(dualView=dv, volume=vol)
+        self.delayDisplay("Cinematic Rendering test PASSED", 400)
