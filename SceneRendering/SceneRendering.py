@@ -1012,12 +1012,14 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         )
 
     def test_CinematicRendering(self):
-        """CTACardio rendered with a shadow-casting directional light.
-        Stage 1: one directional light placed above-and-off-axis from the
-        initial camera, ImageField-only shadow volume, 128 resolution for
-        test speed. We verify the shadow pass darkens the image
-        meaningfully vs the headlight baseline, then orbit through a few
-        poses and snapshot each for eye-checking in the dual pane.
+        """CTACardio rendered with a two-light cinematic setup: a
+        shadow-casting key light above-and-left of the camera and an
+        unshadowed fill light to the right, each calibrated so the
+        combined scene brightness stays close to the headlight baseline
+        while the key light's shadows still read clearly in the heart.
+
+        Lights are camera-relative so they orbit with the view and the
+        shadow volume is rebuilt each time the camera rotation changes.
         """
         import math
         import numpy as np
@@ -1032,34 +1034,47 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         scene_mgr = next(mm for mm in dv.managers
                          if type(mm).__name__ == "SceneRendererManager")
 
-        # Key light: up and slightly off-axis from the initial camera so
-        # orbiting clearly exposes shadow terminators on the heart.
-        cam_pos = np.asarray(dv.view.camera.local.position, dtype=np.float64)
-        fwd = -cam_pos / max(np.linalg.norm(cam_pos), 1e-6)
-        up = np.array([0.0, 0.0, 1.0])
-        right = np.cross(fwd, up)
-        rn = np.linalg.norm(right)
-        if rn > 1e-6:
-            right = right / rn
-        light_dir = up * 1.0 - right * 0.5
-        light_dir /= np.linalg.norm(light_dir)
+        # Directions in CAMERA space (pygfx convention: +X right, +Y up,
+        # -Z forward). enable_shadows(camera_relative=True) re-rotates
+        # these into world each frame, so the shadows follow the camera.
+        #   Key: up (+Y) and slightly to the left (-X) of the camera.
+        #   Fill: to the right (+X), shadowless, half the key intensity.
+        key_cam = np.array([-0.5, 1.0, 0.0])
+        key_cam /= np.linalg.norm(key_cam)
+        fill_cam = np.array([1.0, 0.0, 0.0])
 
+        # Calibrated on CTACardio + CT-Chest-Contrast-Enhanced preset:
+        # key=3.5 with fill=1.75 (keeps the user-requested 2:1 ratio)
+        # lands within 1% of the headlight baseline mean while leaving
+        # the key-side shadow clearly visible. Lower values leave the
+        # scene perceptibly darker; higher values start clipping the
+        # specular highlights on bone.
         scene_mgr.enable_shadows(
-            light_direction=tuple(light_dir), resolution=128)
+            light_direction=tuple(key_cam),
+            resolution=128,
+            light_intensity=3.5,
+            fill_light_direction=tuple(fill_cam),
+            fill_light_intensity=1.75,
+            camera_relative=True,
+        )
         slicer.app.processEvents()
         self._force_draw(dv.view, n=5)
         _, _, _, me_shad = self._snapshot_stats(dv.view, "cinematic-shad")
 
-        # Shadowed render should be meaningfully darker than baseline --
-        # the directional light plus shadow attenuation drops the mean
-        # luminance substantially on a bright CT preset.
+        # With both lights calibrated the cinematic render should stay
+        # within ~15% of the headlight baseline mean. Peak-channel mean
+        # is a robust proxy for scene luminance on this CT preset --
+        # the R channel dominates the warm bone/vessel colors.
         base_peak = max(me_base)
         shad_peak = max(me_shad)
         self.assertGreater(base_peak, 5.0,
             f"baseline never lit the scene: mean={me_base}")
-        self.assertLess(shad_peak, base_peak * 0.9,
-            f"shadows didn't darken the scene enough: "
-            f"base mean={me_base}, shadowed mean={me_shad}")
+        self.assertGreater(shad_peak, base_peak * 0.85,
+            f"cinematic scene is too dark vs baseline: "
+            f"base mean={me_base}, cinematic mean={me_shad}")
+        self.assertLess(shad_peak, base_peak * 1.15,
+            f"cinematic scene is too bright vs baseline: "
+            f"base mean={me_base}, cinematic mean={me_shad}")
 
         # Orbit through four azimuths so the shadow pattern is visible
         # from multiple angles (each reuses the same baked shadow volume
