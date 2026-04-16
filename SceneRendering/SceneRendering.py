@@ -856,8 +856,27 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             velocities[~is_fixed] *= (1.0 - damping * dt)
             particles[~is_fixed] += velocities[~is_fixed] * dt
 
-        max_seen = (0, 0, 0)
-        for frame in range(n_frames):
+        # Drive the animation off a self-triggering QTimer.singleShot
+        # chain rather than a tight Python `for` loop with
+        # processEvents() inside. The old pattern starved Qt's event
+        # loop -- input events, Ctrl-C, and other module updates were
+        # all blocked until the 720-frame loop finished. A QTimer
+        # chain runs one frame per tick, yields between frames, and
+        # lets Qt handle interrupts and input normally.
+        #
+        # We block the *test method* itself on a local QEventLoop so
+        # the test still completes synchronously from the caller's
+        # point of view; QEventLoop.exec_() pumps Qt events while
+        # waiting.
+        max_seen = [0, 0, 0]
+        frame_state = {"i": 0}
+        event_loop = qt.QEventLoop()
+
+        def tick():
+            frame = frame_state["i"]
+            if frame >= n_frames:
+                event_loop.quit()
+                return
             if frame in kick_frames:
                 which = int(rng.integers(4, 8))
                 direction = rng.normal(size=3)
@@ -867,15 +886,23 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             for _ in range(substeps):
                 sim_step(dt_sub)
             push_transform(fit_affine())
-            slicer.app.processEvents()
             if frame == n_frames // 3:
                 _, _, mx, _ = self._snapshot_stats(dv.view, "bouncing-head-mid")
-                max_seen = tuple(max(a, b) for a, b in zip(max_seen, mx))
+                for k in range(3):
+                    max_seen[k] = max(max_seen[k], mx[k])
+            frame_state["i"] = frame + 1
+            # 0-delay singleShot: runs after the current Qt tick
+            # finishes (render, input dispatch, etc). No busy loop.
+            qt.QTimer.singleShot(0, tick)
+
+        qt.QTimer.singleShot(0, tick)
+        event_loop.exec_()
 
         _, _, mx, _ = self._snapshot_stats(dv.view, "bouncing-head-final")
-        max_seen = tuple(max(a, b) for a, b in zip(max_seen, mx))
+        for k in range(3):
+            max_seen[k] = max(max_seen[k], mx[k])
         self.assertGreater(max(max_seen), 60,
-            f"no head visible during simulation -- max_rgb={max_seen}")
+            f"no head visible during simulation -- max_rgb={tuple(max_seen)}")
 
         # Sanity: the final transform should differ from identity
         # (i.e. the simulation actually moved the masses).
