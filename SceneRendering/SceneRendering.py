@@ -17,14 +17,17 @@ stashed on `slicer.modules.*` for inspection):
                                 fast path so Phong shading tracks the
                                 deformation per frame.
 
-Stubs (Slice-level placeholders; fill in when those stages land):
+Further stages:
 
     test_MultiVolume            two registered volumes composited in
                                 the same SceneRenderer
-    test_DeformableVolume       a vtkMRMLGridTransformNode under which
-                                the volume is warped
-    test_CinematicRendering     cinematic-render-ish look (multi-
-                                scatter, HDR env map, etc.)
+    test_DeformableVolume       a vtkMRMLGridTransformNode whose
+                                animated sinewave displacement deforms
+                                the volume each frame via the
+                                TransformField path
+    test_CinematicRendering     two-light (shadow-casting key + fill)
+                                cinematic render with camera-relative
+                                lights
 """
 
 import logging
@@ -76,8 +79,8 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
         ("Transformable Volume",       "test_TransformableVolume"),
         ("Bouncing Head",              "test_BouncingHead"),
         ("Multi-Volume",               "test_MultiVolume"),
-        ("Deformable Volume (stub)",   "test_DeformableVolume"),
-        ("Cinematic Rendering (stub)", "test_CinematicRendering"),
+        ("Deformable Volume",          "test_DeformableVolume"),
+        ("Cinematic Rendering",        "test_CinematicRendering"),
     ]
 
     def setup(self):
@@ -337,6 +340,31 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
                 + "https://github.com/pieper/slicer-wgpu/"
                 "archive/refs/heads/main.zip"
             )
+
+        # Tear down any still-installed DualView before we drop
+        # slicer_wgpu from sys.modules. Match by class NAME (not
+        # isinstance), because after the upcoming module pop the OLD
+        # DualView class and the NEW one will be distinct class objects:
+        # an isinstance filter against the re-imported module would miss
+        # leftover instances and leave their ImageField volume textures
+        # (~337 MB each for CTACardio) pinned across the reload. Also
+        # release any test-stashed DualViews from slicer.modules so GC
+        # can actually collect the torn-down objects.
+        import gc as _gc
+        for _o in list(_gc.get_objects()):
+            if type(_o).__name__ == "DualView":
+                try:
+                    if hasattr(_o, "uninstall"):
+                        _o.uninstall()
+                except Exception:
+                    pass
+        for _a in list(vars(slicer.modules)):
+            if _a.startswith("sceneRenderingTest_"):
+                try:
+                    delattr(slicer.modules, _a)
+                except Exception:
+                    pass
+        _gc.collect()
 
         # Force a fresh import so any on-disk edits (pushed via the
         # MCP /file endpoint during iteration) take effect.
@@ -916,7 +944,7 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         self._stash(dualView=dv, volume=vol, transform=tform)
         self.delayDisplay("Bouncing Head test PASSED", 400)
 
-    # ----- Stubs for future stages -----
+    # ----- Further stages -----
 
     def test_MultiVolume(self):
         """Two independent volumes (CTACardio + CTAAbdomenPanoramix) with
@@ -1003,13 +1031,140 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             400)
 
     def test_DeformableVolume(self):
-        self.delayDisplay(
-            "Deformable volume test: not implemented yet. "
-            "Will attach a vtkMRMLGridTransformNode (displacement field) "
-            "to the volume via a TransformField and verify the rendered "
-            "shape warps.",
-            1500,
-        )
+        """CTACardio under a vtkMRMLGridTransformNode whose displacement
+        field is an animated traveling sinewave along +X that moves up
+        and down through the body over 10 seconds. 20 cm wavelength,
+        20 mm amplitude (visible; max dx/dz ~= 0.63), one wave period
+        every 2 seconds.
+
+        Displacement grid is 128^3 (~3.75 mm cell spacing over the
+        ~480 mm volume, ~53 samples per wavelength). A coarser 32^3
+        grid makes vtkGridTransform's iterative Newton inverse (used by
+        the 2D reslicers) oscillate near the dx(z) zero-crossings and
+        fire "singularity" warnings; at 128^3 the trilinear gradient
+        tracks the true A*k*cos(kz) slope accurately enough for the
+        Newton iteration to converge even at the larger amplitude.
+        The forward Jacobian det is identically 1 for this displacement
+        so the inverse is analytically well-defined everywhere; the
+        problem was always numerical conditioning, not a singularity.
+
+        Only the wgpu (pygfx) pane renders the warp; VTK's volume
+        mapper ignores a grid transform in its render path, so the VTK
+        pane's volume stays rigid (only its ROI frame follows). The
+        slice views do honor the grid transform via vtkImageReslice's
+        inverse path.
+
+        Driven by a QTimer.singleShot chain blocked on a local
+        QEventLoop, same pattern as test_BouncingHead -- Qt keeps
+        processing events between frames so input + timers stay live.
+        """
+        import math
+        import numpy as np
+        import vtk.util.numpy_support as vnp
+
+        vol = self._load_ctacardio()
+        dv = self._install_dualview()
+        self._frame_and_draw(dv)
+
+        _, _, mx_base, _ = self._snapshot_stats(dv.view, "deformable-base")
+        img_base = np.asarray(dv.view.renderer.snapshot()[..., :3]).astype(np.int32)
+
+        bounds = [0.0] * 6
+        vol.GetBounds(bounds)
+        bmin = np.array([bounds[0], bounds[2], bounds[4]], dtype=np.float64)
+        bmax = np.array([bounds[1], bounds[3], bounds[5]], dtype=np.float64)
+        extent = bmax - bmin
+
+        N = 128
+        grid = vtk.vtkImageData()
+        grid.SetDimensions(N, N, N)
+        grid.SetOrigin(*bmin.tolist())
+        grid.SetSpacing(*(extent / (N - 1)).tolist())
+        grid.AllocateScalars(vtk.VTK_FLOAT, 3)
+
+        z_world = np.linspace(bmin[2], bmax[2], N, dtype=np.float32)
+        WAVELENGTH_MM = 200.0
+        AMPLITUDE_MM = 20.0
+        K = 2.0 * math.pi / WAVELENGTH_MM
+
+        def set_displacement_phase(phase):
+            pd = grid.GetPointData().GetScalars()
+            arr = vnp.vtk_to_numpy(pd).reshape(N, N, N, 3)  # K, J, I, comp
+            dx_per_slice = AMPLITUDE_MM * np.sin(K * z_world + phase)
+            arr[..., 0] = dx_per_slice[:, None, None]
+            pd.Modified(); grid.Modified()
+            grid_tf.Modified(); gt.TransformModified()
+
+        gt = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLGridTransformNode", "SineWaveDeformation")
+        grid_tf = vtk.vtkGridTransform()
+        grid_tf.SetDisplacementGridData(grid)
+        grid_tf.SetInterpolationModeToLinear()
+        gt.SetAndObserveTransformFromParent(grid_tf)
+        set_displacement_phase(0.0)
+        vol.SetAndObserveTransformNodeID(gt.GetID())
+        slicer.app.processEvents()
+        self._force_draw(dv.view, n=3)
+
+        _, _, mx_warp, _ = self._snapshot_stats(dv.view, "deformable-phase0")
+        img_phase0 = np.asarray(dv.view.renderer.snapshot()[..., :3]).astype(np.int32)
+
+        diff0 = np.abs(img_base - img_phase0)
+        changed0 = int((diff0.max(axis=2) > 20).sum())
+        self.assertGreater(max(mx_base), 60,
+            f"baseline never lit the scene: max={mx_base}")
+        self.assertGreater(changed0, 2000,
+            f"grid transform had no visible effect: "
+            f"changed-px={changed0}, base_max={mx_base}, warp_max={mx_warp}")
+
+        DURATION_S = 10.0
+        FPS = 30
+        N_FRAMES = int(DURATION_S * FPS)
+        event_loop = qt.QEventLoop()
+        state = {"frame": 0}
+        mid_img = [None]
+
+        def tick():
+            frame = state["frame"]
+            if frame >= N_FRAMES:
+                event_loop.quit()
+                return
+            t = frame / FPS
+            # One wave period every 2 seconds; the wave travels in -z
+            # through the body over the 10 second run.
+            set_displacement_phase(math.pi * t)
+            slicer.app.processEvents()
+            if frame == N_FRAMES // 2:
+                self._force_draw(dv.view, n=1)
+                mid_img[0] = np.asarray(
+                    dv.view.renderer.snapshot()[..., :3]).astype(np.int32)
+            state["frame"] = frame + 1
+            qt.QTimer.singleShot(int(1000.0 / FPS), tick)
+
+        qt.QTimer.singleShot(0, tick)
+        event_loop.exec_()
+
+        self.assertIsNotNone(mid_img[0],
+            "mid-animation snapshot never taken -- timer loop didn't run")
+        # The snapshot resolution can change between frames if Slicer
+        # reshuffles the view after a HiDPI / layout flip, which would
+        # make a straight element-wise subtract throw. Resize mid_img
+        # down to img_phase0's shape if they differ so the diff stays
+        # apples-to-apples.
+        a, b = img_phase0, mid_img[0]
+        if a.shape != b.shape:
+            from PIL import Image
+            b = np.asarray(
+                Image.fromarray(b.astype(np.uint8)).resize((a.shape[1], a.shape[0]))
+            ).astype(np.int32)
+        diff_anim = np.abs(a - b)
+        anim_changed = int((diff_anim.max(axis=2) > 20).sum())
+        self.assertGreater(anim_changed, 500,
+            f"sinewave animation did not change the render over time: "
+            f"changed-px={anim_changed}")
+
+        self._stash(dualView=dv, volume=vol, transform=gt)
+        self.delayDisplay("Deformable Volume test PASSED", 400)
 
     def test_CinematicRendering(self):
         """CTACardio rendered with a two-light cinematic setup: a
