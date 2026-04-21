@@ -72,7 +72,18 @@ Built on slicer-wgpu (https://github.com/pieper/slicer-wgpu) and pygfx.
 
 class SceneRenderingWidget(ScriptedLoadableModuleWidget):
 
-    # (button label, test method name). Order here defines UI order.
+    # VTK-injection tests (wgpu rendered directly into Slicer's 3D view
+    # via a vtkCommand::EndEvent hook -- no DualView, no second pane).
+    # Listed first because this is the path we're actively developing.
+    VTK_TESTS = [
+        ("Injection: Single Volume",           "test_vtk_SingleVolume"),
+        ("Injection: Volume + Fiducials",      "test_vtk_VolumeAndFiducials"),
+        ("Injection: Multi-Volume (demo)",     "test_vtk_MultiVolume"),
+        ("Injection: Landmark Deform (TPS)",   "test_vtk_LandmarkDeform"),
+        ("Injection: Segmentation (paint)",    "test_vtk_Segmentation"),
+        ("Injection: Colorize (RGBA)",         "test_vtk_ColorizeRGBA"),
+    ]
+    # Legacy DualView/pygfx tests.
     TESTS = [
         ("Single Volume",              "test_SingleVolume"),
         ("Volume + Fiducials",         "test_VolumeAndFiducials"),
@@ -94,6 +105,19 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
         header.setWordWrap(True)
         vbox.addWidget(header)
 
+        # --- VTK-injection self-tests (new path, runs in default 3D view) ---
+        vtk_label = qt.QLabel("<b>VTK injection (new)</b>")
+        vbox.addWidget(vtk_label)
+        for label, method_name in self.VTK_TESTS:
+            btn = qt.QPushButton(label)
+            btn.setToolTip(f"Reload SceneRendering and run {method_name}()")
+            btn.clicked.connect(
+                lambda _checked=False, m=method_name: self.onRunTest(m))
+            vbox.addWidget(btn)
+
+        # --- Legacy DualView/pygfx self-tests ---
+        legacy_label = qt.QLabel("<b>DualView / pygfx (legacy)</b>")
+        vbox.addWidget(legacy_label)
         for label, method_name in self.TESTS:
             btn = qt.QPushButton(label)
             btn.setToolTip(f"Reload SceneRendering and run {method_name}()")
@@ -179,26 +203,31 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
     # ----- Lifecycle -----
 
     def setUp(self):
+        # Tear down any previously-installed renderers BEFORE clearing the
+        # scene. Otherwise the bridge's MRML displayer gets flooded with
+        # NodeRemoved events while the wgpu pipeline is still live, which
+        # makes reloads crawl as each removal triggers a pointless
+        # pipeline rebuild.
+        self._ensure_dependencies()
+        try:
+            from slicer_wgpu import mrml_bridge
+            mrml_bridge.uninstall()
+        except Exception:
+            pass
+        prev = getattr(slicer.modules, "wgpuVtkBridge", None)
+        if prev is not None:
+            try:
+                prev.uninstall()
+            except Exception:
+                pass
+            slicer.modules.wgpuVtkBridge = None
+        slicer.app.processEvents()
         # Clear scene data but KEEP singletons (layout node, selection,
         # interaction, view/camera nodes, etc). The default Clear()
         # also rips out singletons, which can cascade into side effects
         # in modules that re-register singleton observers, so we stick
         # to the data-only flavor for test resets.
         slicer.mrmlScene.Clear(0)
-        # Bootstrap deps (and reimport slicer_wgpu from disk) FIRST, so
-        # test-method-level `from slicer_wgpu.fields import FiducialField`
-        # imports bind to the same class instances the DualView will
-        # create below. Doing this after a top-level import would leave
-        # the test with a stale class reference and every `isinstance`
-        # check would silently return False.
-        self._ensure_dependencies()
-        # Tear down any previously-installed DualView so each test starts
-        # from a clean 3D-view layout.
-        try:
-            from slicer_wgpu import mrml_bridge
-            mrml_bridge.uninstall()
-        except Exception:
-            pass
         slicer.app.processEvents()
 
     def runTest(self):
@@ -529,6 +558,642 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             setattr(slicer.modules, f"sceneRenderingTest_{k}", v)
 
     # ----- Working tests -----
+
+    # ------------------------------------------------------------------
+    # Sample-data cache.
+    #
+    # A scene Clear() (triggered between test runs in setUp) removes MRML
+    # nodes, which means SampleData.downloadSample() re-parses the 278 MB
+    # compressed NRRD into a 685 MB float32 ImageData on every click --
+    # ~9 s on the MCP box. Holding a Python reference to the
+    # vtkImageData / vtkSegmentation keeps them alive across the Clear;
+    # a new MRML node then wraps the cached data in milliseconds.
+    #
+    # Keyed by sample name. Survives for the Slicer session.
+    # ------------------------------------------------------------------
+    _VOLUME_CACHE: dict = {}   # name -> {'image', 'ijk_to_ras', 'wl', 'range'}
+    _SEG_CACHE:    dict = {}   # name -> {'segmentation'}
+
+    def _load_cached_volume(self, name):
+        """downloadSample(name) with a Python-level cache of the VTK data.
+        Skips the NRRD parse on all runs after the first this session."""
+        import SampleData
+        entry = SceneRenderingTest._VOLUME_CACHE.get(name)
+        if entry is not None:
+            vol = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLScalarVolumeNode", name)
+            vol.SetAndObserveImageData(entry["image"])
+            m = vtk.vtkMatrix4x4()
+            m.DeepCopy(entry["ijk_to_ras"])
+            vol.SetIJKToRASMatrix(m)
+            vol.CreateDefaultDisplayNodes()
+            d = vol.GetScalarVolumeDisplayNode()
+            if d is not None and entry.get("wl") is not None:
+                window, level = entry["wl"]
+                d.SetWindow(window)
+                d.SetLevel(level)
+                d.SetAutoWindowLevel(False)
+            return vol
+        vol = SampleData.downloadSample(name)
+        if vol is None:
+            return None
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        vol.GetIJKToRASMatrix(ijk_to_ras)
+        d = vol.GetScalarVolumeDisplayNode()
+        wl = None
+        if d is not None:
+            try:
+                wl = (float(d.GetWindow()), float(d.GetLevel()))
+            except Exception:
+                wl = None
+        SceneRenderingTest._VOLUME_CACHE[name] = {
+            "image": vol.GetImageData(),
+            "ijk_to_ras": ijk_to_ras,
+            "wl": wl,
+        }
+        return vol
+
+    def _load_cached_segmentation(self, name):
+        """downloadSample(name) for a .seg.nrrd with Python-level caching.
+        Holds a reference to the vtkSegmentation object so subsequent
+        loads skip the parse + segment-reconstruction cost."""
+        import SampleData
+        entry = SceneRenderingTest._SEG_CACHE.get(name)
+        if entry is not None:
+            node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLSegmentationNode", name)
+            node.SetAndObserveSegmentation(entry["segmentation"])
+            node.CreateDefaultDisplayNodes()
+            return node
+        loaded = SampleData.downloadSample(name)
+        if isinstance(loaded, (list, tuple)):
+            loaded = next((n for n in loaded
+                           if n is not None
+                           and n.IsA("vtkMRMLSegmentationNode")), None)
+        if loaded is None:
+            return None
+        SceneRenderingTest._SEG_CACHE[name] = {
+            "segmentation": loaded.GetSegmentation(),
+        }
+        return loaded
+
+    # ------------------------------------------------------------------
+    # VTK-injection tests -- no DualView, wgpu renders directly into
+    # Slicer's native 3D view via a vtkCommand::EndEvent hook.
+    # ------------------------------------------------------------------
+
+    def _install_vtk_bridge(self, layout=None):
+        """Install the VTK-injection bridge on the active 3D view.
+        Uses the module file shipped alongside this script
+        (`wgpu_vtk_inject.py`) so we can iterate without reinstalling
+        the slicer-wgpu pip package.
+
+        `layout` may be any vtkMRMLLayoutNode layout constant; defaults
+        to single-up 3D. Four-up is useful when the test also wants the
+        slice views (e.g. segmentation painting demos).
+        """
+        target = layout if layout is not None else (
+            slicer.vtkMRMLLayoutNode.SlicerLayoutOneUp3DView)
+        slicer.app.layoutManager().setLayout(target)
+        slicer.app.processEvents()
+
+        # Import the bridge from the sibling SceneRenderingLib package.
+        # Force-reload so edits to the helper pick up without re-launching
+        # Slicer.
+        import os, sys
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        for mod in ("SceneRenderingLib.wgpu_vtk_inject", "SceneRenderingLib"):
+            if mod in sys.modules:
+                del sys.modules[mod]
+        from SceneRenderingLib import wgpu_vtk_inject as wvi
+        bridge = wvi.install_default_bridge()
+        slicer.modules.wgpuVtkBridge = bridge
+        slicer.app.processEvents()
+        return bridge
+
+    def _vtk_render_and_snapshot(self):
+        """Force a render on the 3D view and return the RGB snapshot."""
+        import numpy as np
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        view.forceRender()
+        slicer.app.processEvents()
+        # WindowToImage grab of the view
+        wti = vtk.vtkWindowToImageFilter()
+        wti.SetInput(view.renderWindow())
+        wti.SetInputBufferTypeToRGB()
+        wti.Update()
+        img = wti.GetOutput()
+        dims = img.GetDimensions()
+        from vtk.util.numpy_support import vtk_to_numpy
+        arr = vtk_to_numpy(img.GetPointData().GetScalars())
+        arr = arr.reshape(dims[1], dims[0], -1)
+        return arr[::-1]  # flip to top-down
+
+    def test_vtk_SingleVolume(self):
+        """VTK injection: CTACardio rendered via wgpu inside the default
+        3D view. Our bridge claims the VR display node (Visibility=0) so
+        Slicer's native ray-caster stays idle."""
+        import numpy as np
+        self.delayDisplay("VTK: Single Volume loading", 150)
+        vol = self._load_ctacardio()
+        bridge = self._install_vtk_bridge()
+        self.assertEqual(len(bridge.images_by_vrdn), 1,
+            f"expected 1 claimed VRDN, got {list(bridge.images_by_vrdn.keys())}")
+
+        # Frame the volume
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        renderer = view.renderWindow().GetRenderers().GetFirstRenderer()
+        renderer.ResetCamera()
+        view.forceRender()
+        slicer.app.processEvents()
+
+        rgb = self._vtk_render_and_snapshot()
+        mx = tuple(int(x) for x in rgb.max(axis=(0, 1)))
+        self.assertGreater(max(mx), 60,
+            f"no volume visible via VTK injection -- max_rgb={mx}")
+
+        self._stash(vtkBridge=bridge, volume=vol)
+        self.delayDisplay("VTK: Single Volume PASSED", 300)
+
+    def test_vtk_VolumeAndFiducials(self):
+        """VTK injection + fiducials. The wgpu volume renders via our
+        bridge; VTK's native Markups displayable manager handles the
+        fiducial glyphs. Compositor blends wgpu on top of VTK's output,
+        so background + fiducials stay visible around the volume."""
+        import numpy as np
+        self.delayDisplay("VTK: Volume + Fiducials loading", 150)
+
+        vol = self._load_ctacardio()
+        # Reuse the helper that builds 4 fiducial lists
+        list_specs, markup_nodes = self._build_markup_nodes(volume_node=vol)
+
+        bridge = self._install_vtk_bridge()
+        self.assertEqual(len(bridge.images_by_vrdn), 1,
+            f"expected 1 claimed VRDN, got {list(bridge.images_by_vrdn.keys())}")
+
+        # Tune fiducial glyph sizes so they're easy to see
+        for n in markup_nodes:
+            dn = n.GetDisplayNode()
+            if dn is not None:
+                dn.SetGlyphScale(3.5)
+                dn.SetTextScale(2.5)
+
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        renderer = view.renderWindow().GetRenderers().GetFirstRenderer()
+        renderer.ResetCamera()
+        view.forceRender()
+        slicer.app.processEvents()
+
+        rgb = self._vtk_render_and_snapshot()
+        mx = tuple(int(x) for x in rgb.max(axis=(0, 1)))
+        self.assertGreater(max(mx), 60,
+            f"no composited output visible -- max_rgb={mx}")
+
+        self._stash(vtkBridge=bridge, volume=vol, markupNodes=markup_nodes)
+        self.delayDisplay("VTK: Volume + Fiducials PASSED", 300)
+
+    def test_vtk_MultiVolume(self):
+        """VTK injection with two volumes. The second volume is placed
+        under an INTERACTIVE linear transform (with visible transform
+        handles in the 3D view) so the user can drag it around live
+        and watch our wgpu renderer track the change through the
+        TransformModifiedEvent observer.
+        """
+        import numpy as np
+        self.delayDisplay("VTK: Multi-Volume loading", 200)
+
+        import SampleData
+        sd = SampleData.SampleDataLogic()
+        cta = sd.downloadCTACardio()
+        self.assertIsNotNone(cta, "CTACardio failed to load")
+        pano = sd.downloadSample("CTAAbdomenPanoramix")
+        if isinstance(pano, (list, tuple)):
+            pano = next((n for n in pano
+                         if n is not None
+                         and n.IsA("vtkMRMLScalarVolumeNode")), None)
+        self.assertIsNotNone(pano, "Panoramix failed to load")
+
+        # Distinct presets so the two are easy to tell apart.
+        vrLogic = slicer.modules.volumerendering.logic()
+        for vol, preset_name in ((cta, "CT-Chest-Contrast-Enhanced"),
+                                 (pano, "CT-AAA")):
+            d = vrLogic.CreateDefaultVolumeRenderingNodes(vol)
+            d.SetVisibility(True)
+            preset = vrLogic.GetPresetByName(preset_name)
+            if preset is not None:
+                d.GetVolumePropertyNode().Copy(preset)
+
+        # --- Interactive transform for pano ---
+        # Translate pano up and to the side so it doesn't overlap cta
+        # initially, then expose interactive handles so the user can
+        # drag it around at demo time.
+        tf = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLinearTransformNode", "PanoInteractiveTransform")
+        M = vtk.vtkMatrix4x4()
+        b = [0.0] * 6
+        pano.GetBounds(b)
+        # Initial offset: translate pano by +200mm along R so it's next to cta
+        M.SetElement(0, 3, 200.0)
+        tf.SetMatrixTransformToParent(M)
+        pano.SetAndObserveTransformNodeID(tf.GetID())
+
+        # Expose interactive handles on the transform node
+        tdn = tf.GetDisplayNode()
+        if tdn is None:
+            tf.CreateDefaultDisplayNodes()
+            tdn = tf.GetDisplayNode()
+        if tdn is not None:
+            tdn.SetEditorVisibility(True)
+            tdn.SetEditorVisibility3D(True)
+            tdn.SetEditorTranslationEnabled(True)
+            tdn.SetEditorRotationEnabled(True)
+            tdn.SetEditorScalingEnabled(False)
+
+        # Now install the bridge -- both VRDNs will be claimed.
+        bridge = self._install_vtk_bridge()
+        self.assertEqual(len(bridge.images_by_vrdn), 2,
+            f"expected 2 claimed VRDNs, got {list(bridge.images_by_vrdn.keys())}")
+
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        renderer = view.renderWindow().GetRenderers().GetFirstRenderer()
+        renderer.ResetCamera()
+        view.forceRender()
+        slicer.app.processEvents()
+
+        rgb = self._vtk_render_and_snapshot()
+        mx = tuple(int(x) for x in rgb.max(axis=(0, 1)))
+        self.assertGreater(max(mx), 60,
+            f"no multi-volume output visible -- max_rgb={mx}")
+
+        # Stash so the user can inspect / further manipulate in the console
+        self._stash(vtkBridge=bridge, cta=cta, pano=pano, panoTransform=tf)
+        self.delayDisplay(
+            "VTK: Multi-Volume PASSED -- drag the Pano handles to move it "
+            "and see the wgpu render update live", 600)
+
+    def test_vtk_LandmarkDeform(self):
+        """VTK injection + thin-plate-spline grid transform driven by
+        fiducial landmarks. Places 8 source landmarks at MRHead's
+        bounding-box corners. Adding or moving a fiducial rebuilds the
+        TPS + bakes it to a grid transform, which the bridge observes
+        and uploads as a 3D displacement texture. Volume deforms live.
+        """
+        import numpy as np
+        self.delayDisplay("VTK: Landmark Deform loading", 150)
+
+        import SampleData
+        vol = SampleData.SampleDataLogic().downloadMRHead()
+        self.assertIsNotNone(vol, "MRHead failed to load")
+
+        vrLogic = slicer.modules.volumerendering.logic()
+        disp = vrLogic.CreateDefaultVolumeRenderingNodes(vol)
+        disp.SetVisibility(True)
+        preset = vrLogic.GetPresetByName("MR-Default")
+        if preset is not None:
+            disp.GetVolumePropertyNode().Copy(preset)
+
+        b = [0.0] * 6
+        vol.GetBounds(b)
+        corners = np.array([
+            [b[0], b[2], b[4]], [b[1], b[2], b[4]],
+            [b[0], b[3], b[4]], [b[1], b[3], b[4]],
+            [b[0], b[2], b[5]], [b[1], b[2], b[5]],
+            [b[0], b[3], b[5]], [b[1], b[3], b[5]],
+        ], dtype=np.float64)
+
+        # Fiducial list: initial 8 corner landmarks are the TPS sources.
+        # Any further points the user adds extend the source set. Moving
+        # any existing point defines its target (source stays fixed).
+        fnode = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLMarkupsFiducialNode", "TPSLandmarks")
+        fdisp = fnode.GetDisplayNode()
+        if fdisp is not None:
+            fdisp.SetGlyphScale(3.0)
+            fdisp.SetTextScale(2.0)
+            fdisp.SetSelectedColor(1.0, 0.85, 0.0)
+        for i, c in enumerate(corners):
+            fnode.AddControlPoint(*c, f"L{i}")
+
+        # Per-point source/target in a side list. Keyed by control-point
+        # Slicer-generated ID so points survive reordering.
+        sources = {}  # cpid -> np.array(3) RAS
+        for i in range(fnode.GetNumberOfControlPoints()):
+            cpid = fnode.GetNthControlPointID(i)
+            sources[cpid] = np.array(corners[i], dtype=np.float64)
+
+        # Grid transform node we drive from the TPS.
+        tfnode = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLGridTransformNode", "TPSGrid")
+
+        grid_dims = (24, 24, 24)
+        pad_mm = 40.0
+        grid_origin = [float(b[0] - pad_mm),
+                       float(b[2] - pad_mm),
+                       float(b[4] - pad_mm)]
+        grid_extent = [float(b[1] - b[0] + 2 * pad_mm),
+                       float(b[3] - b[2] + 2 * pad_mm),
+                       float(b[5] - b[4] + 2 * pad_mm)]
+        grid_spacing = [grid_extent[k] / max(grid_dims[k] - 1, 1)
+                        for k in range(3)]
+
+        def rebuild_tps():
+            """Rebuild the TPS displacement grid from current sources +
+            per-control-point positions (targets)."""
+            n = fnode.GetNumberOfControlPoints()
+            if n < 4:
+                return  # TPS needs at least 4 points to be meaningful
+            src = vtk.vtkPoints()
+            tgt = vtk.vtkPoints()
+            for i in range(n):
+                cpid = fnode.GetNthControlPointID(i)
+                if cpid not in sources:
+                    continue
+                pos = [0.0, 0.0, 0.0]
+                fnode.GetNthControlPointPosition(i, pos)
+                s = sources[cpid]
+                src.InsertNextPoint(float(s[0]), float(s[1]), float(s[2]))
+                tgt.InsertNextPoint(float(pos[0]), float(pos[1]), float(pos[2]))
+
+            if src.GetNumberOfPoints() < 4:
+                return
+            tps = vtk.vtkThinPlateSplineTransform()
+            tps.SetSourceLandmarks(src)
+            tps.SetTargetLandmarks(tgt)
+            tps.SetBasisToR()
+
+            # Bake to a grid: vtkTransformToGrid samples the analytic TPS
+            # on a regular lattice and produces a vtkImageData of
+            # displacements suitable for vtkGridTransform.
+            ttg = vtk.vtkTransformToGrid()
+            ttg.SetGridOrigin(*grid_origin)
+            ttg.SetGridSpacing(*grid_spacing)
+            ttg.SetGridExtent(0, grid_dims[0] - 1,
+                              0, grid_dims[1] - 1,
+                              0, grid_dims[2] - 1)
+            ttg.SetGridScalarTypeToFloat()
+            # TPS maps source->target; we want the inverse so the volume
+            # (in world space) warps toward the targets. Inversing the
+            # TPS is cheap because it's analytical.
+            inv = tps.GetInverse()
+            ttg.SetInput(inv)
+            ttg.Update()
+
+            vgrid = vtk.vtkGridTransform()
+            vgrid.SetDisplacementGridData(ttg.GetOutput())
+            vgrid.SetInterpolationModeToLinear()
+            tfnode.SetAndObserveTransformFromParent(vgrid)
+
+        # Seed the grid with an identity TPS (sources == current positions).
+        rebuild_tps()
+
+        # Install bridge, attach the grid transform.
+        bridge = self._install_vtk_bridge()
+        self.assertEqual(len(bridge.images_by_vrdn), 1,
+            f"expected 1 claimed VRDN, got {list(bridge.images_by_vrdn.keys())}")
+        bridge.set_grid_transform(tfnode)
+
+        # Keep sources in sync when the user adds NEW points (they become
+        # new source landmarks at their placement position).
+        def on_point_defined(caller, event):
+            try:
+                # PointPositionDefinedEvent fires with the cp index in
+                # caller's last-event data; scan for unknown cpids.
+                n = fnode.GetNumberOfControlPoints()
+                changed = False
+                for i in range(n):
+                    cpid = fnode.GetNthControlPointID(i)
+                    if cpid not in sources:
+                        pos = [0.0, 0.0, 0.0]
+                        fnode.GetNthControlPointPosition(i, pos)
+                        sources[cpid] = np.array(pos, dtype=np.float64)
+                        changed = True
+                if changed:
+                    rebuild_tps()
+            except Exception as e:
+                print(f"on_point_defined: {e}")
+
+        def on_point_modified(caller, event):
+            try:
+                rebuild_tps()
+            except Exception as e:
+                print(f"on_point_modified: {e}")
+
+        t1 = fnode.AddObserver(
+            slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
+            on_point_defined)
+        t2 = fnode.AddObserver(
+            slicer.vtkMRMLMarkupsNode.PointModifiedEvent,
+            on_point_modified)
+
+        # Nudge one corner to create a visible warp so the test image has
+        # content to measure against the initial identity render.
+        moved_i = 0
+        start = [0.0, 0.0, 0.0]
+        fnode.GetNthControlPointPosition(moved_i, start)
+        fnode.SetNthControlPointPosition(
+            moved_i, start[0] + 30.0, start[1] + 15.0, start[2] + 10.0)
+        slicer.app.processEvents()
+
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        renderer = view.renderWindow().GetRenderers().GetFirstRenderer()
+        renderer.ResetCamera()
+        view.forceRender()
+        slicer.app.processEvents()
+
+        rgb = self._vtk_render_and_snapshot()
+        mx = tuple(int(x) for x in rgb.max(axis=(0, 1)))
+        self.assertGreater(max(mx), 60,
+            f"no warped output visible -- max_rgb={mx}")
+
+        self._stash(vtkBridge=bridge, volume=vol, landmarks=fnode,
+                    gridTransform=tfnode, sources=sources,
+                    rebuildTPS=rebuild_tps, observerTags=(t1, t2))
+        self.delayDisplay(
+            "VTK: Landmark Deform PASSED -- drag the L# points to warp "
+            "the volume; place new points to extend the TPS reference set",
+            600)
+
+    def test_vtk_Segmentation(self):
+        """VTK injection + segmentation iso-surface rendering. Seeds two
+        segments in MRHead (a coarse brain mask + a threshold-based second
+        segment), hooks the bridge to watch the segmentation node, then
+        mutates a labelmap to exercise the live re-upload path. The shader
+        uses a local-DT approximation to render a clean, anti-aliased
+        iso-surface per segment with Phong shading.
+        """
+        import numpy as np
+        self.delayDisplay("VTK: Segmentation loading", 150)
+
+        import SampleData
+        vol = SampleData.SampleDataLogic().downloadMRHead()
+        self.assertIsNotNone(vol, "MRHead failed to load")
+        # No volume-rendering display node -- this demo is segments only.
+        # The user can always enable VR on MRHead interactively afterward.
+
+        # Build two segments from thresholded MRHead intensities.
+        seg_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode", "TestSeg")
+        seg_node.CreateDefaultDisplayNodes()
+        seg_node.SetReferenceImageGeometryParameterFromVolumeNode(vol)
+
+        vol_arr = slicer.util.arrayFromVolume(vol)   # (K, J, I)
+        # Brain-ish: mid range of MRHead intensities -> a connected blob.
+        mask_brain = ((vol_arr > 40) & (vol_arr < 120)).astype(np.uint8)
+        # Skull-ish: brighter/darker contrast -- just a second distinct region.
+        mask_high = (vol_arr > 120).astype(np.uint8)
+
+        seg_ids = []
+        for name, color, mask in [
+            ("Brain", (0.90, 0.20, 0.20), mask_brain),
+            ("High",  (0.20, 0.80, 0.50), mask_high),
+        ]:
+            sid = seg_node.GetSegmentation().AddEmptySegment(name, name)
+            seg_node.GetSegmentation().GetSegment(sid).SetColor(*color)
+            slicer.util.updateSegmentBinaryLabelmapFromArray(
+                mask, seg_node, sid, vol)
+            seg_ids.append(sid)
+
+        # 3D visibility on; give the display a bright opacity.
+        dn = seg_node.GetDisplayNode()
+        dn.SetVisibility3D(True)
+        for sid in seg_ids:
+            dn.SetSegmentOpacity3D(sid, 1.0)
+            dn.SetSegmentVisibility(sid, True)
+
+        # Install bridge in four-up so slice views are there for painting.
+        bridge = self._install_vtk_bridge(
+            layout=slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        bridge.set_segmentation_node(seg_node)
+        self.assertEqual(len(bridge._segments), 2,
+            f"expected 2 SegmentFields, got {len(bridge._segments)}")
+
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        renderer = view.renderWindow().GetRenderers().GetFirstRenderer()
+        renderer.ResetCamera()
+        view.forceRender()
+        slicer.app.processEvents()
+
+        rgb = self._vtk_render_and_snapshot()
+        mx = tuple(int(x) for x in rgb.max(axis=(0, 1)))
+        self.assertGreater(max(mx), 60,
+            f"no iso-surface visible -- max_rgb={mx}")
+
+        # Exercise the paint path: flip some voxels in the "Brain" labelmap
+        # and confirm the content-modified observer re-uploads. This mimics
+        # what the Segment Editor's brush does -- direct writes to the
+        # source rep with Modified() triggering the SourceRepresentationModified
+        # event chain.
+        oimg = seg_node.GetBinaryLabelmapInternalRepresentation(seg_ids[0])
+        self.assertIsNotNone(oimg, "brain labelmap unexpectedly None")
+        import vtk.util.numpy_support as vnp
+        ext = oimg.GetExtent()
+        dx = ext[1] - ext[0] + 1
+        dy = ext[3] - ext[2] + 1
+        dz = ext[5] - ext[4] + 1
+        scalars = oimg.GetPointData().GetScalars()
+        arr = vnp.vtk_to_numpy(scalars).reshape(dz, dy, dx)
+        # Carve a small cavity in the middle so the surface changes visibly.
+        cx, cy, cz = dx // 2, dy // 2, dz // 2
+        r = max(3, min(dx, dy, dz) // 8)
+        k, j, i = np.ogrid[:dz, :dy, :dx]
+        ball = (k - cz) ** 2 + (j - cy) ** 2 + (i - cx) ** 2 <= r * r
+        arr[ball] = 0
+        oimg.Modified()
+        seg_node.GetSegmentation().Modified()
+        slicer.app.processEvents()
+        view.forceRender()
+        slicer.app.processEvents()
+
+        rgb2 = self._vtk_render_and_snapshot()
+        # Weak check: just confirm the render still produced non-black pixels
+        # after the edit. The real check is visual.
+        mx2 = tuple(int(x) for x in rgb2.max(axis=(0, 1)))
+        self.assertGreater(max(mx2), 60,
+            f"no output after carving -- max_rgb={mx2}")
+
+        self._stash(vtkBridge=bridge, volume=vol, segmentation=seg_node,
+                    segmentIds=seg_ids)
+        self.delayDisplay(
+            "VTK: Segmentation PASSED -- switch to the Segment Editor and "
+            "paint into 'Brain' or 'High'; the 3D view updates as you paint",
+            600)
+
+    def test_vtk_ColorizeRGBA(self):
+        """GPU ColorizeVolume: bakes a single rgba16float 3D texture from
+        CT + segmentation on the GPU (label->palette, separable Gaussian
+        on alpha, multiply alpha by CT intensity) and renders it with a
+        plain RGBA-volume mode (RGB = color, A = opacity, Phong from
+        gradient of A). Separate from the paint/iso-surface demo -- no
+        per-segment textures at render time. Uses the same CTLiver +
+        CTLiverSegmentation data as SlicerSandbox/ColorizeVolume so the
+        two pipelines can be compared side by side.
+        """
+        self.delayDisplay("Injection: Colorize (RGBA) loading", 150)
+
+        # Use the same CTLiver + CTLiverSegmentation pair that
+        # SlicerSandbox/ColorizeVolume's self-test uses, but register the
+        # segmentation sample inline so we don't need the ColorizeVolume
+        # module (and therefore SlicerSandbox) to be installed.
+        import SampleData
+        try:
+            SampleData.SampleDataLogic.registerCustomSampleDataSource(
+                category="Sandbox",
+                sampleName="CTLiverSegmentation",
+                uris="https://github.com/PerkLab/SlicerSandbox/releases/download/TestingData/CTLiverSegmentation.seg.nrrd",
+                fileNames="CTLiverSegmentation.seg.nrrd",
+                checksums="SHA256:ce9a7182a666788a2556f6cf4f59ad5dadd944171cc279e80c164496729a7032",
+                nodeNames="CTLiverSegmentation")
+        except Exception:
+            pass  # already registered on a prior run
+
+        # Cached-across-scene-clears sample loads. See class-level
+        # _load_cached_volume / _load_cached_segmentation for details --
+        # they hold a Python reference to the vtkImageData / vtkSegmentation
+        # so subsequent test runs skip the ~9 s NRRD parse and just rewrap
+        # the cached data in a fresh MRML node.
+        vol = self._load_cached_volume("CTLiver")
+        self.assertIsNotNone(vol, "CTLiver failed to load")
+        seg = self._load_cached_segmentation("CTLiverSegmentation")
+        self.assertIsNotNone(seg, "CTLiverSegmentation failed to load")
+
+        # No VR display node on the source volume -- the bake is the full
+        # rendering pipeline.
+        bridge = self._install_vtk_bridge(
+            layout=slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        rgba = bridge.add_colorize_volume(vol, seg, sigma_voxels=1.5)
+        self.assertIsNotNone(rgba, "add_colorize_volume returned None")
+        self.assertEqual(len(bridge._rgba_volumes), 1,
+            f"expected 1 RGBA volume, got {len(bridge._rgba_volumes)}")
+
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        renderer = view.renderWindow().GetRenderers().GetFirstRenderer()
+        renderer.ResetCamera()
+        view.forceRender()
+        slicer.app.processEvents()
+
+        rgb = self._vtk_render_and_snapshot()
+        mx = tuple(int(x) for x in rgb.max(axis=(0, 1)))
+        self.assertGreater(max(mx), 60,
+            f"no RGBA-baked output visible -- max_rgb={mx}")
+
+        self._stash(vtkBridge=bridge, volume=vol, segmentation=seg,
+                    rgbaField=rgba)
+        self.delayDisplay(
+            "Injection: Colorize (RGBA) PASSED -- same bake that "
+            "ColorizeVolume does on CPU, now on the GPU.", 600)
+
+    # ------------------------------------------------------------------
+    # Legacy DualView / pygfx tests
+    # ------------------------------------------------------------------
 
     def test_SingleVolume(self):
         """DualView + CTACardio only (no fiducials, no transform).
