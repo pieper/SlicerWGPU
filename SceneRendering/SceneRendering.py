@@ -306,43 +306,59 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             # --no-cache-dir when force-reinstalling guarantees we pull
             # the current pythonqt-support branch, not a stale cached zip.
             cache = "--no-cache-dir " if getattr(self, "_force_reinstall", False) else ""
-            slicer.util.pip_install(
-                f"--force-reinstall --no-deps {cache}"
-                "https://github.com/pieper/rendercanvas/"
-                "archive/refs/heads/pythonqt-support.zip"
-            )
-            # pip overwrote rendercanvas on disk but Python's sys.modules
-            # still holds the pre-install (upstream) rendercanvas
-            # objects. Without this pop, `from rendercanvas.qt import
-            # ...` inside slicer_wgpu returns the cached upstream
-            # module and the fork's PythonQt branch never runs.
-            for mod_name in [
-                m for m in list(sys.modules)
-                if m == "rendercanvas" or m.startswith("rendercanvas.")
-            ]:
-                sys.modules.pop(mod_name, None)
+            rendercanvas_installed = False
+            try:
+                slicer.util.pip_install(
+                    f"--force-reinstall --no-deps {cache}"
+                    "https://github.com/pieper/rendercanvas/"
+                    "archive/refs/heads/pythonqt-support.zip"
+                )
+                rendercanvas_installed = True
+            except Exception as e:
+                # Only the DualView / pygfx-Qt-surface tests (the legacy
+                # "Single Volume", "Bouncing Head", etc. demos) actually
+                # need this fork. The "Injection:" tests use raw wgpu and
+                # are unaffected. Log and continue so those still run.
+                print(
+                    "Warning: could not install pieper/rendercanvas "
+                    f"PythonQt fork: {e}\n"
+                    "  The Injection: tests do not need it and will run "
+                    "normally. The legacy DualView tests (Single Volume, "
+                    "Bouncing Head, Multi-Volume, etc.) require it.")
 
-            # If pygfx was already imported, it cached a reference to
-            # the OLD rendercanvas.BaseRenderCanvas. Its isinstance()
-            # checks in WgpuRenderer would then reject the new
-            # QRenderWidget ("Render target must be a Canvas or
-            # Texture, not QRenderWidget"). Rebind the captured
-            # reference in place to match the freshly-reimported class.
-            #
-            # We CANNOT just pop pygfx and re-import it: pygfx calls
-            # wgpu.preconfigure_default_device("pygfx", ...) at module
-            # top level, and wgpu raises RuntimeError if a device has
-            # already been created in the process (which it has, any
-            # time a renderer existed earlier in this session).
-            if "pygfx" in sys.modules:
-                try:
-                    import importlib
-                    rc = importlib.import_module("rendercanvas")
-                    pgr = importlib.import_module(
-                        "pygfx.renderers.wgpu.engine.renderer")
-                    pgr.BaseRenderCanvas = rc.BaseRenderCanvas
-                except Exception as e:
-                    print(f"pygfx BaseRenderCanvas rebind failed: {e}")
+            if rendercanvas_installed:
+                # pip overwrote rendercanvas on disk but Python's sys.modules
+                # still holds the pre-install (upstream) rendercanvas
+                # objects. Without this pop, `from rendercanvas.qt import
+                # ...` inside slicer_wgpu returns the cached upstream
+                # module and the fork's PythonQt branch never runs.
+                for mod_name in [
+                    m for m in list(sys.modules)
+                    if m == "rendercanvas" or m.startswith("rendercanvas.")
+                ]:
+                    sys.modules.pop(mod_name, None)
+
+                # If pygfx was already imported, it cached a reference to
+                # the OLD rendercanvas.BaseRenderCanvas. Its isinstance()
+                # checks in WgpuRenderer would then reject the new
+                # QRenderWidget ("Render target must be a Canvas or
+                # Texture, not QRenderWidget"). Rebind the captured
+                # reference in place to match the freshly-reimported class.
+                #
+                # We CANNOT just pop pygfx and re-import it: pygfx calls
+                # wgpu.preconfigure_default_device("pygfx", ...) at module
+                # top level, and wgpu raises RuntimeError if a device has
+                # already been created in the process (which it has, any
+                # time a renderer existed earlier in this session).
+                if "pygfx" in sys.modules:
+                    try:
+                        import importlib
+                        rc = importlib.import_module("rendercanvas")
+                        pgr = importlib.import_module(
+                            "pygfx.renderers.wgpu.engine.renderer")
+                        pgr.BaseRenderCanvas = rc.BaseRenderCanvas
+                    except Exception as e:
+                        print(f"pygfx BaseRenderCanvas rebind failed: {e}")
 
         # slicer-wgpu's version is pinned at 0.1.0 and never bumps, so
         # pip considers any cached wheel of the GitHub main.zip URL to
