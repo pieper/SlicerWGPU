@@ -81,6 +81,7 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
         ("Injection: Multi-Volume (demo)",     "test_vtk_MultiVolume"),
         ("Injection: Landmark Deform (TPS)",   "test_vtk_LandmarkDeform"),
         ("Injection: Segmentation (paint)",    "test_vtk_Segmentation"),
+        ("Injection: Segment Surfaces",        "test_vtk_SegmentSurfaces"),
         ("Injection: Colorize (RGBA)",         "test_vtk_ColorizeRGBA"),
     ]
     # Legacy DualView/pygfx tests.
@@ -1206,6 +1207,82 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         self.delayDisplay(
             "Injection: Colorize (RGBA) PASSED -- same bake that "
             "ColorizeVolume does on CPU, now on the GPU.", 600)
+
+    def test_vtk_SegmentSurfaces(self):
+        """Gradient-opacity segment rendering: emulates Slicer's polydata
+        closed-surface look using volume-rendering compositing. Per ray
+        step the alpha contribution is |grad alpha| * step (alpha is the
+        palette-opacity-scaled Gaussian-smoothed presence from the bake).
+        Integrated across a 0->opacity transition that sums to the
+        segment's opacity regardless of how deep the ray travels through
+        the segment interior. Semi-transparent segments therefore add
+        their opacity once per front/back face crossing.
+
+        Uses the ColorizeVolume RGBA bake pipeline (single r8uint merged
+        labelmap + one rgba16float output + one scratch, ~2.7 GB total
+        regardless of segment count) instead of per-segment texture
+        buffers. The 73 segments in CTLiverSegmentation would otherwise
+        allocate ~210 GB of per-segment textures.
+
+        Visibility / opacity / color changes on the segmentation display
+        node trigger a cheap palette-only rebake through the existing
+        _on_rgba_display_modified observer. Scene-close auto-uninstalls.
+        """
+        self.delayDisplay("Injection: Segment Surfaces loading", 150)
+
+        import SampleData
+        try:
+            SampleData.SampleDataLogic.registerCustomSampleDataSource(
+                category="Sandbox",
+                sampleName="CTLiverSegmentation",
+                uris="https://github.com/PerkLab/SlicerSandbox/releases/download/TestingData/CTLiverSegmentation.seg.nrrd",
+                fileNames="CTLiverSegmentation.seg.nrrd",
+                checksums="SHA256:ce9a7182a666788a2556f6cf4f59ad5dadd944171cc279e80c164496729a7032",
+                nodeNames="CTLiverSegmentation")
+        except Exception:
+            pass
+
+        vol = self._load_cached_volume("CTLiver")
+        self.assertIsNotNone(vol, "CTLiver failed to load")
+        seg = self._load_cached_segmentation("CTLiverSegmentation")
+        self.assertIsNotNone(seg, "CTLiverSegmentation failed to load")
+
+        dn = seg.GetDisplayNode()
+        if dn is not None:
+            dn.SetVisibility3D(True)
+            dn.SetVisibility(True)
+
+        bridge = self._install_vtk_bridge(
+            layout=slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
+        # Bake the RGBA volume with modulate_by_ct=False: skips the CT
+        # upload (~685 MB saved) and the CT modulate pass. The resulting
+        # texture's alpha is the palette-opacity-scaled smoothed presence,
+        # rendered with surface-mode gradient opacity.
+        rgba = bridge.add_colorize_volume(vol, seg, sigma_voxels=1.5,
+                                          modulate_by_ct=False)
+        self.assertIsNotNone(rgba, "add_colorize_volume returned None")
+        self.assertEqual(rgba.render_mode, "surface",
+            f"expected surface render mode, got {rgba.render_mode}")
+
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        renderer = view.renderWindow().GetRenderers().GetFirstRenderer()
+        renderer.ResetCamera()
+        view.forceRender()
+        slicer.app.processEvents()
+
+        rgb = self._vtk_render_and_snapshot()
+        mx = tuple(int(x) for x in rgb.max(axis=(0, 1)))
+        self.assertGreater(max(mx), 60,
+            f"no surface-rendered output visible -- max_rgb={mx}")
+
+        self._stash(vtkBridge=bridge, volume=vol, segmentation=seg,
+                    rgbaField=rgba)
+        self.delayDisplay(
+            "Injection: Segment Surfaces PASSED -- drop any segment's "
+            "3D opacity slider and the apparent coverage stays flat "
+            "across thick vs thin structures, matching polydata surface "
+            "rendering.", 600)
 
     # ------------------------------------------------------------------
     # Legacy DualView / pygfx tests

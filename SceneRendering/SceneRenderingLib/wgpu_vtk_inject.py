@@ -627,17 +627,102 @@ fn sample_seg_{i}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
 """
 
 
-def _rgba_field_wgsl(slot, n, m):
+def _seg_surface_field_wgsl(slot, n):
+    """Per-segment bindings + gradient-opacity surface sampler. Same bind-
+    ing layout and sample_v_seg_{i} helper as the iso-surface variant; the
+    only difference is sample_seg_{i}'s alpha formula.
+
+    Emission rule:
+        dα/ds = opacity * |grad v|         (grad in per-mm)
+    The integral along a ray crossing the 0->1 presence transition once
+    equals opacity * total_variation(v) = opacity, *independent of how
+    thick the ray's path through the segment is*. This gives parity with
+    Slicer's polydata surface rendering: a 30%-opaque segment always
+    accumulates ~0.3 alpha per surface crossing, front + back face add
+    like two transparent shells.
+    """
+    i = slot
+    b0 = 2 + n * 4 + 4 + slot * 2
+    return f"""
+@group(0) @binding({b0+0}) var s_seg{i}: sampler;
+@group(0) @binding({b0+1}) var t_seg{i}: texture_3d<f32>;
+
+fn sample_v_seg_{i}(wp: vec3<f32>) -> f32 {{
+    let wpw = warp(wp);
+    let t4 = u_mat.seg{i}_p2t * vec4<f32>(wpw, 1.0);
+    let t = t4.xyz;
+    if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) {{ return 0.0; }}
+    return textureSampleLevel(t_seg{i}, s_seg{i}, t, 0.0).r;
+}}
+
+fn sample_seg_{i}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
+    if (u_mat.seg{i}_color.a <= 0.0) {{ return vec4<f32>(0.0); }}
+    let wpw = warp(wp);
+    let t4 = u_mat.seg{i}_p2t * vec4<f32>(wpw, 1.0);
+    if (any(t4.xyz < vec3<f32>(0.0)) || any(t4.xyz > vec3<f32>(1.0))) {{
+        return vec4<f32>(0.0);
+    }}
+    let v = sample_v_seg_{i}(wp);
+    // Fast-skip deep interior / exterior: |grad| ~ 0 and there's no
+    // surface to shade, so we'd emit nothing anyway.
+    if (v <= 0.02 || v >= 0.98) {{ return vec4<f32>(0.0); }}
+
+    let h = max(u_mat.scene_step, 1e-3);
+    let gx = sample_v_seg_{i}(wp+vec3<f32>(h,0,0)) - sample_v_seg_{i}(wp-vec3<f32>(h,0,0));
+    let gy = sample_v_seg_{i}(wp+vec3<f32>(0,h,0)) - sample_v_seg_{i}(wp-vec3<f32>(0,h,0));
+    let gz = sample_v_seg_{i}(wp+vec3<f32>(0,0,h)) - sample_v_seg_{i}(wp-vec3<f32>(0,0,h));
+    let grad = vec3<f32>(gx, gy, gz) / (2.0 * h);
+    let glen = length(grad);
+    if (glen < 1e-5) {{ return vec4<f32>(0.0); }}
+
+    // Gradient-opacity emission: α_step = opacity * |grad v| * step.
+    // Integrated over the 0->1 presence transition this sums to
+    // opacity * 1 = opacity, regardless of transition thickness.
+    let step = max(u_mat.scene_step, 1e-3);
+    let op = clamp(u_mat.seg{i}_color.a * glen * step, 0.0, 1.0);
+    if (op <= 0.0) {{ return vec4<f32>(0.0); }}
+
+    // Phong from the same gradient used for emission.
+    var n = grad / glen;
+    if (dot(n, -rd) < 0.0) {{ n = -n; }}
+    let ldn = max(dot(-rd, n), 0.0);
+    let r = normalize(2.0 * ldn * n + rd);
+    let rdv = max(dot(r, -rd), 0.0);
+    let color = u_mat.seg{i}_color.rgb;
+    let sh = u_mat.seg{i}_shade;
+    var lit = color * sh.x
+            + color * (sh.y * ldn)
+            + vec3<f32>(sh.z * pow(rdv, max(sh.w, 1.0)));
+    lit = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(lit * op, op);
+}}
+"""
+
+
+def _rgba_field_wgsl(slot, n, m, render_mode="density"):
     """A pre-baked RGBA 3D volume. RGB is emissive color, A is opacity
-    (already Gaussian-smoothed on the GPU during bake). No TF lookup,
-    no per-segment pickup at render time. Gradient for Phong is taken
-    from the alpha channel since that's where the iso-surface is.
+    (Gaussian-smoothed on the GPU during bake). Two alpha integration
+    modes:
+
+      density: dα/ds = alpha / unit  (current ColorizeVolume behavior,
+               accumulating; thicker path -> more opaque).
+
+      surface: dα/ds = |grad alpha|  (thickness-independent; integrated
+               across a 0->opacity presence transition sums to opacity
+               regardless of how deep the segment is along the ray).
+               Emulates Slicer's polydata closed-surface renderer.
 
     Bindings follow the existing (per-image, vtk-depth, grid, per-segment)
     tail: 2 per rgba slot starting at 2 + 4n + 4 + 2m.
     """
     q = slot
     b0 = 2 + n * 4 + 4 + m * 2 + slot * 2
+    if render_mode == "surface":
+        alpha_expr = "clamp(glen * step, 0.0, 1.0)"
+    else:
+        alpha_expr = ("clamp(alpha * "
+                      "(step / max(u_mat.rgba{q}_step_unit.y, 1e-3)), "
+                      "0.0, 1.0)").format(q=q)
     return f"""
 @group(0) @binding({b0+0}) var s_rgba{q}: sampler;
 @group(0) @binding({b0+1}) var t_rgba{q}: texture_3d<f32>;
@@ -658,7 +743,8 @@ fn sample_rgba_{q}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
     let alpha = v4.a;
     if (alpha <= 1e-3) {{ return vec4<f32>(0.0); }}
 
-    // Central differences on alpha for surface normal.
+    // Central differences on alpha: used both for Phong and (in surface
+    // mode) for the gradient-opacity alpha integral.
     let h = max(u_mat.scene_step, 1e-3);
     let gx = sample_rgba_v_{q}(wp+vec3<f32>(h,0,0)).a
            - sample_rgba_v_{q}(wp-vec3<f32>(h,0,0)).a;
@@ -684,8 +770,7 @@ fn sample_rgba_{q}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
     lit = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
 
     let step = max(u_mat.scene_step, 1e-3);
-    let unit = max(u_mat.rgba{q}_step_unit.y, 1e-3);
-    let op = clamp(alpha * (step / unit), 0.0, 1.0);
+    let op = {alpha_expr};
     return vec4<f32>(lit * op, op);
 }}
 """
@@ -758,7 +843,8 @@ fn fs_main(v: Varyings) -> FragmentOutput {{
 """
 
 
-def _build_wgsl(n, m, k):
+def _build_wgsl(n, m, k, segment_render_mode="iso",
+                rgba_render_modes=None):
     parts = [_HEADER, _mat_struct_wgsl(n, m, k)]
     # Grid transform needs to come BEFORE the per-field functions (they call
     # warp()); its bindings sit after the VTK depth bindings.
@@ -766,10 +852,17 @@ def _build_wgsl(n, m, k):
     parts.append(_grid_transform_wgsl(n))
     for i in range(n):
         parts.append(_field_wgsl(i))
+    seg_gen = (_seg_surface_field_wgsl
+               if segment_render_mode == "surface"
+               else _seg_field_wgsl)
     for j in range(m):
-        parts.append(_seg_field_wgsl(j, n))
+        parts.append(seg_gen(j, n))
+    if rgba_render_modes is None:
+        rgba_render_modes = ["density"] * k
     for q in range(k):
-        parts.append(_rgba_field_wgsl(q, n, m))
+        mode = (rgba_render_modes[q]
+                if q < len(rgba_render_modes) else "density")
+        parts.append(_rgba_field_wgsl(q, n, m, render_mode=mode))
     parts.append(_main_wgsl(n, m, k))
     return "\n".join(parts)
 
@@ -1091,6 +1184,11 @@ class RGBAVolumeField:
         self.k_specular = 0.30
         self.shininess = 32.0
         self.visible = True
+        # "density" (ColorizeVolume-style accumulating alpha * step / unit)
+        # or "surface" (gradient-opacity: α_step = |grad alpha| * step, so
+        # the total α per 0->opacity boundary crossing equals the baked-in
+        # opacity, independent of path length through the segment).
+        self.render_mode = "density"
         self._bounds = (np.array([-100, -100, -100], dtype=np.float32),
                         np.array([100, 100, 100], dtype=np.float32))
 
@@ -1184,6 +1282,9 @@ class WgpuVolumeBridge:
         self._segments: list[SegmentField] = []
         self._seg_node = None           # the currently attached vtkMRMLSegmentationNode
         self._seg_obs_tags = []         # (object, tag) pairs for teardown
+        # Segment render mode: "iso" (band-based iso-surface, paint demo) or
+        # "surface" (gradient-opacity, thickness-independent polydata-like).
+        self._segment_render_mode = "iso"
 
         # Pre-baked RGBA 3D volumes (ColorizeVolume-style). Each entry is an
         # RGBAVolumeField with a rgba16float 3D texture produced by a GPU
@@ -1365,7 +1466,11 @@ class WgpuVolumeBridge:
                 ensure_wgpu_object(tex)
                 update_resource(tex)
 
-        wgsl = _build_wgsl(n, m, k)
+        rgba_modes = [getattr(r, "render_mode", "density")
+                      for r in self._rgba_volumes]
+        wgsl = _build_wgsl(n, m, k,
+                           segment_render_mode=self._segment_render_mode,
+                           rgba_render_modes=rgba_modes)
         shader = self.device.create_shader_module(code=wgsl)
 
         self._mat_ubo = self.device.create_buffer(
@@ -1710,6 +1815,26 @@ class WgpuVolumeBridge:
             print(f"WgpuVolumeBridge grid-modified: {e}")
 
     # ---------------- Segmentation support ----------------
+
+    def set_segment_render_mode(self, mode):
+        """Switch between the two segment shaders:
+          - "iso"     : band-based isosurface. Paint demo default.
+          - "surface" : gradient-opacity. Thickness-independent alpha --
+                        emulates Slicer's polydata closed-surface
+                        rendering when a segment is semi-opaque.
+        Rebuilds the render pipeline immediately so the next frame picks
+        up the new shader. Safe to call before or after
+        set_segmentation_node().
+        """
+        mode = str(mode).lower()
+        if mode not in ("iso", "surface"):
+            raise ValueError(
+                f"segment_render_mode must be 'iso' or 'surface', got {mode!r}")
+        if mode == self._segment_render_mode:
+            return
+        self._segment_render_mode = mode
+        self._rebuild_pipeline()
+        self.rw.Render()
 
     def set_segmentation_node(self, seg_node):
         """Attach a vtkMRMLSegmentationNode. One SegmentField is created per
@@ -2171,17 +2296,33 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
     def _run_bake(self, rgba_field):
-        """Dispatch the full ColorizeVolume-style bake into rgba_field.tex.
-        Assumes rgba_field holds cached `_ct_tex`, `_label_tex`,
-        `_output_to_world` (4x4), `_world_to_label_tex` (4x4), `sigma_voxels`,
-        `window_min`, `window_max`, and that `_bake_palette_ubo` is already
-        up to date with the current palette.
+        """Dispatch the Colorize bake into rgba_field.tex.
+        Assumes rgba_field holds cached `_label_tex`, `_output_to_world`,
+        `_world_to_label_tex`, `sigma_voxels`, and that the palette UBO
+        is already up to date.
 
-        Passes: resample-init (label->RGBA), smooth X/Y/Z on alpha,
-        modulate alpha by CT."""
+        If `rgba_field._ct_tex is None` the CT modulate pass is skipped
+        (surface mode -- alpha stays as the palette-opacity-scaled smoothed
+        presence). Pass parity is flipped so the final result is always in
+        `rgba_field.tex`, regardless of whether modulate runs:
+
+            modulate=TRUE  (colorize, 4 GPU passes):
+                init tex <- label|palette
+                smooth X:  tex     -> scratch
+                smooth Y:  scratch -> tex
+                smooth Z:  tex     -> scratch
+                modulate:  scratch -> tex      (alpha *= ct_norm)
+
+            modulate=FALSE (surface, 3 GPU passes):
+                init scratch <- label|palette
+                smooth X:  scratch -> tex
+                smooth Y:  tex     -> scratch
+                smooth Z:  scratch -> tex
+        """
         self._ensure_bake_pipelines()
         import math, struct as _st
         dx, dy, dz = rgba_field.dims
+        modulate = rgba_field._ct_tex is not None
 
         # Resample params UBO: output_to_world then world_to_label_tex,
         # both column-major so the transpose matches WGSL.
@@ -2204,12 +2345,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             self.device.queue.write_buffer(
                 self._bake_smooth_ubos[axis], 0, bytes(sbuf))
 
-        # Modulate params
-        mbuf = bytearray(16)
-        _st.pack_into("<f", mbuf, 0, float(rgba_field.window_min))
-        _st.pack_into("<f", mbuf, 4,
-                      float(rgba_field.window_max - rgba_field.window_min))
-        self.device.queue.write_buffer(self._bake_mod_ubo, 0, bytes(mbuf))
+        # Modulate params (only used when modulate=True)
+        if modulate:
+            mbuf = bytearray(16)
+            _st.pack_into("<f", mbuf, 0, float(rgba_field.window_min))
+            _st.pack_into("<f", mbuf, 4,
+                          float(rgba_field.window_max - rgba_field.window_min))
+            self.device.queue.write_buffer(self._bake_mod_ubo, 0, bytes(mbuf))
 
         wg_x, wg_y, wg_z = 8, 8, 4
         groups = ((dx + wg_x - 1) // wg_x,
@@ -2218,11 +2360,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         encoder = self.device.create_command_encoder()
 
-        # Pass 1: resample labelmap + palette, writes rgba_field.tex
+        # Pick init target + smooth schedule so the final result ends in
+        # rgba_field.tex after the pass count we actually run (4 for
+        # colorize, 3 for surface).
+        if modulate:
+            init_dst = rgba_field.tex
+            smooth_steps = [
+                (rgba_field.tex,         rgba_field.scratch_tex, 0),
+                (rgba_field.scratch_tex, rgba_field.tex,         1),
+                (rgba_field.tex,         rgba_field.scratch_tex, 2),
+            ]
+        else:
+            init_dst = rgba_field.scratch_tex
+            smooth_steps = [
+                (rgba_field.scratch_tex, rgba_field.tex,         0),
+                (rgba_field.tex,         rgba_field.scratch_tex, 1),
+                (rgba_field.scratch_tex, rgba_field.tex,         2),
+            ]
+
+        # Pass 1: resample labelmap + palette
         bg = self.device.create_bind_group(
             layout=self._bake_init_bgl, entries=[
                 {"binding": 0, "resource": rgba_field._label_tex.create_view()},
-                {"binding": 1, "resource": rgba_field.tex.create_view()},
+                {"binding": 1, "resource": init_dst.create_view()},
                 {"binding": 2, "resource": {
                     "buffer": self._bake_palette_ubo, "offset": 0, "size": 4096}},
                 {"binding": 3, "resource": {
@@ -2234,12 +2394,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         p.dispatch_workgroups(*groups)
         p.end()
 
-        # Smooth X: tex -> scratch    Y: scratch -> tex    Z: tex -> scratch
-        smooth_steps = [
-            (rgba_field.tex,         rgba_field.scratch_tex, 0),
-            (rgba_field.scratch_tex, rgba_field.tex,         1),
-            (rgba_field.tex,         rgba_field.scratch_tex, 2),
-        ]
         for src_tex, dst_tex, axis in smooth_steps:
             bg = self.device.create_bind_group(
                 layout=self._bake_smooth_bgl, entries=[
@@ -2255,20 +2409,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             p.dispatch_workgroups(*groups)
             p.end()
 
-        # Modulate: scratch -> tex (final result lives in rgba_field.tex)
-        bg = self.device.create_bind_group(
-            layout=self._bake_modulate_bgl, entries=[
-                {"binding": 0, "resource": rgba_field.scratch_tex.create_view()},
-                {"binding": 1, "resource": rgba_field.tex.create_view()},
-                {"binding": 2, "resource": rgba_field._ct_tex.create_view()},
-                {"binding": 3, "resource": {
-                    "buffer": self._bake_mod_ubo, "offset": 0, "size": 16}},
-            ])
-        p = encoder.begin_compute_pass()
-        p.set_pipeline(self._bake_modulate_pipeline)
-        p.set_bind_group(0, bg, [], 0, 0)
-        p.dispatch_workgroups(*groups)
-        p.end()
+        if modulate:
+            # Final pass: scratch -> tex with alpha *= ct_norm
+            bg = self.device.create_bind_group(
+                layout=self._bake_modulate_bgl, entries=[
+                    {"binding": 0, "resource": rgba_field.scratch_tex.create_view()},
+                    {"binding": 1, "resource": rgba_field.tex.create_view()},
+                    {"binding": 2, "resource": rgba_field._ct_tex.create_view()},
+                    {"binding": 3, "resource": {
+                        "buffer": self._bake_mod_ubo, "offset": 0, "size": 16}},
+                ])
+            p = encoder.begin_compute_pass()
+            p.set_pipeline(self._bake_modulate_pipeline)
+            p.set_bind_group(0, bg, [], 0, 0)
+            p.dispatch_workgroups(*groups)
+            p.end()
 
         self.device.queue.submit([encoder.finish()])
 
@@ -2327,7 +2482,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return first
 
     def add_colorize_volume(self, volume_node, segmentation_node,
-                            sigma_voxels=1.5, window_level=None):
+                            sigma_voxels=1.5, window_level=None,
+                            modulate_by_ct=True):
         """Bake a ColorizeVolume-style RGBA 3D texture on the GPU and install
         it as a new RGBAVolumeField. All steps (labelmap resample + palette
         LUT, separable Gaussian on alpha, alpha * normalized-CT) run in
@@ -2470,16 +2626,21 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         # Upload CT + labelmap (cached on the field for re-bake). Pass the
         # numpy arrays in directly -- wgpu-py reads them via the buffer
         # protocol, so skipping a .tobytes() call saves a full copy of the
-        # volume on the way in.
-        ct_tex = self.device.create_texture(
-            size=(dx, dy, dz), dimension="3d",
-            format=wgpu.TextureFormat.r32float,
-            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
-        self.device.queue.write_texture(
-            {"texture": ct_tex, "mip_level": 0, "origin": (0, 0, 0)},
-            ct_f32,
-            {"offset": 0, "bytes_per_row": dx * 4, "rows_per_image": dy},
-            (dx, dy, dz))
+        # volume on the way in. For surface mode (modulate_by_ct=False) the
+        # CT is never needed -- skip its upload entirely to save ~685 MB of
+        # GPU memory and ~2 s of upload time.
+        if modulate_by_ct:
+            ct_tex = self.device.create_texture(
+                size=(dx, dy, dz), dimension="3d",
+                format=wgpu.TextureFormat.r32float,
+                usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+            self.device.queue.write_texture(
+                {"texture": ct_tex, "mip_level": 0, "origin": (0, 0, 0)},
+                ct_f32,
+                {"offset": 0, "bytes_per_row": dx * 4, "rows_per_image": dy},
+                (dx, dy, dz))
+        else:
+            ct_tex = None
         label_tex = self.device.create_texture(
             size=(lx, ly, lz), dimension="3d",
             format=wgpu.TextureFormat.r8uint,
@@ -2526,6 +2687,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         rgba_field.opacity_unit_distance = max(vox * 5.0, 1.0)
 
         # Cache on the field so rebakes don't re-upload CT + label.
+        # For surface mode _ct_tex is None -- _run_bake uses its presence
+        # as the switch between the 4-pass (colorize) and 3-pass (surface)
+        # schedules and leaves the result in rgba_field.tex either way.
         rgba_field._ct_tex = ct_tex
         rgba_field._label_tex = label_tex
         rgba_field._output_to_world = output_to_world
@@ -2535,6 +2699,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         rgba_field.window_max = ct_max
         rgba_field.volume_node_id = volume_node.GetID()
         rgba_field.segmentation_node_id = segmentation_node.GetID()
+        rgba_field.render_mode = "density" if modulate_by_ct else "surface"
 
         # Run the bake
         self._run_bake(rgba_field)
