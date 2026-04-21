@@ -365,6 +365,168 @@ class _GLCompositor:
 from pygfx.renderers.wgpu.engine.shared import get_shared
 from pygfx.renderers.wgpu.engine.update import ensure_wgpu_object, update_resource
 
+
+def diagnose_wgpu():
+    """Print adapter + device diagnostics for this machine. Call from the
+    Slicer Python console if the bridge fails to initialize:
+
+        from SceneRenderingLib import wgpu_vtk_inject
+        wgpu_vtk_inject.diagnose_wgpu()
+    """
+    import pygfx as _pgf
+    print(f"pygfx version: {_pgf.__version__}")
+    print(f"wgpu version:  {wgpu.__version__}")
+    try:
+        adapters = wgpu.gpu.enumerate_adapters_sync()
+    except Exception as e:
+        print(f"enumerate_adapters_sync FAILED: {e!r}")
+        return
+    if not adapters:
+        print("No wgpu adapters found!")
+        return
+    for i, a in enumerate(adapters):
+        print(f"\nadapter {i}: {a.summary}")
+        feats = sorted(a.features)
+        print(f"  features ({len(feats)}): {feats}")
+        print(f"  has float32-filterable: "
+              f"{'float32-filterable' in a.features}")
+    # Check pygfx Shared state
+    from pygfx.renderers.wgpu.engine.shared import Shared
+    inst = Shared._instance
+    print(f"\nShared._instance: {'None' if inst is None else 'set'}")
+    if inst is not None:
+        print(f"  has _device attr:  {hasattr(inst, '_device')}")
+        print(f"  has _adapter attr: {hasattr(inst, '_adapter')}")
+
+
+def _adapter_backend(adapter):
+    """Heuristic: read the backend from the adapter's summary string.
+    ('Vulkan', 'Metal', 'DX12', 'OpenGL', or 'Unknown')."""
+    s = getattr(adapter, "summary", "") or ""
+    for label in ("Vulkan", "Metal", "DX12", "OpenGL"):
+        if label in s:
+            return label
+    return "Unknown"
+
+
+def _shared_wgpu_device():
+    """Return pygfx's shared wgpu device, with fallback paths for partial
+    pygfx initialization and OpenGL-only systems.
+
+    Two failure modes are handled:
+
+    1. **Half-constructed Shared**. pygfx's Shared.__init__ sets
+       Shared._instance = self BEFORE calling wgpu.get_default_device().
+       If that device request raises, the exception propagates but the
+       singleton is left half-constructed; every subsequent
+       get_shared().device access then reports "'Shared' object has no
+       attribute '_device'". We clear the half-construct and retry.
+
+    2. **OpenGL-only systems**. wgpu's OpenGL backend doesn't expose the
+       COMPUTE_SHADER + storage-buffer features the bridge's compute
+       pipelines (segment smoothing, Colorize bake) depend on. If the
+       only adapter wgpu exposes is OpenGL, we can't make it work --
+       emit a RuntimeError with per-platform instructions for getting a
+       Vulkan / Metal / DX12 ICD installed.
+    """
+    from pygfx.renderers.wgpu.engine.shared import Shared
+    # Happy path
+    try:
+        return get_shared().device
+    except AttributeError:
+        pass
+    except Exception:
+        pass
+
+    # Clear a half-constructed Shared.
+    if Shared._instance is not None and not hasattr(Shared._instance, "_device"):
+        Shared._instance = None
+
+    try:
+        adapters = wgpu.gpu.enumerate_adapters_sync()
+    except Exception as e:
+        raise RuntimeError(
+            f"wgpu_vtk_inject: wgpu adapter enumeration failed: {e!r}")
+    if not adapters:
+        raise RuntimeError(
+            "wgpu_vtk_inject: no wgpu adapters available on this system.")
+
+    # Try preferred-backend adapters first (Vulkan / Metal / DX12 all
+    # expose compute + storage). Retry request_device with an empty
+    # required_features set in case pygfx's default features choked.
+    preferred = [a for a in adapters
+                 if _adapter_backend(a) in ("Vulkan", "Metal", "DX12")]
+    last_error = None
+    for adapter in preferred:
+        try:
+            wgpu.preconfigure_default_device(
+                "pygfx", adapter=adapter, required_features=set())
+            device = wgpu.get_default_device()
+            inst = Shared.__new__(Shared)
+            inst._device = device
+            inst._adapter = device.adapter
+            Shared._instance = inst
+            return device
+        except Exception as e:
+            last_error = e
+            continue
+
+    # No preferred backend (or all of them failed to produce a device).
+    # The OpenGL backend is not enough for compute + storage buffers,
+    # which our bridge needs, so we stop here with a specific message.
+    backends = sorted({_adapter_backend(a) for a in adapters})
+    lines = [
+        "wgpu_vtk_inject: this GPU / driver combination cannot run the bridge.",
+        "",
+        "The bridge uses WGPU compute shaders + storage-buffer bindings",
+        "(segment smoothing, ColorizeVolume bake). Those features are",
+        "available on WGPU's Vulkan / Metal / DX12 backends, but not on",
+        "the OpenGL backend.",
+        "",
+        f"Adapters detected ({len(adapters)}):"]
+    for a in adapters:
+        lines.append(f"  - {a.summary}")
+    lines.append("")
+    lines.append(f"Backends seen: {backends}")
+    if last_error is not None:
+        lines += ["", f"Last device-request error: {last_error!r}"]
+    lines.append("")
+    if sys.platform.startswith("linux"):
+        lines += [
+            "Linux: a Vulkan adapter is missing. For NVIDIA cards:",
+            "  Ubuntu/Debian:  sudo apt install libvulkan1",
+            "                  # also make sure nvidia-driver-<ver> exposes",
+            "                  # its Vulkan ICD under /usr/share/vulkan/icd.d",
+            "  Fedora:         sudo dnf install vulkan-loader",
+            "  Arch:           sudo pacman -S vulkan-icd-loader nvidia-utils",
+            "",
+            "Verify afterwards:",
+            "  ls /usr/share/vulkan/icd.d/ | grep -i nvidia   # nvidia_icd.json",
+            "  vulkaninfo --summary                           # lists device",
+            "",
+            "Any Maxwell-era or newer NVIDIA GPU (GTX 7xx/9xx/10xx/RTX)",
+            "supports Vulkan with driver version >= 450.",
+        ]
+    elif sys.platform == "win32":
+        lines += [
+            "Windows: WGPU normally auto-selects DX12. If only an OpenGL",
+            "adapter is visible, update your GPU driver from the vendor's",
+            "site (NVIDIA / AMD / Intel).",
+        ]
+    elif sys.platform == "darwin":
+        lines += [
+            "macOS: WGPU uses Metal. A Metal adapter is normally always",
+            "visible -- the fact that none shows up here likely means the",
+            "Metal backend crashed at enumeration time. Reinstall Slicer.",
+        ]
+    lines += [
+        "",
+        "Run `from SceneRenderingLib import wgpu_vtk_inject;"
+        " wgpu_vtk_inject.diagnose_wgpu()` in Slicer's Python console",
+        "for full adapter and feature details.",
+    ]
+    raise RuntimeError("\n".join(lines))
+
 from slicer_wgpu.fields import ImageField
 from slicer_wgpu.displayers.volume import VolumeRenderingDisplayer
 
@@ -1229,7 +1391,7 @@ class WgpuVolumeBridge:
     def __init__(self, vtk_renderer, vtk_render_window):
         self.vtk_renderer = vtk_renderer
         self.rw = vtk_render_window
-        self.device = get_shared().device
+        self.device = _shared_wgpu_device()
 
         self._displayer = None
         self._claimed_vrdn_ids: set[str] = set()
