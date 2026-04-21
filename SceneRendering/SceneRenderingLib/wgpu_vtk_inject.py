@@ -33,13 +33,14 @@ import wgpu
 
 
 def _load_gl_library():
-    """Load the platform's OpenGL library as a ctypes cdll.
+    """Return an object that looks like a ctypes DLL of libGL.
 
-    macOS : OpenGL framework (Core profile 3.2+ gives direct access to
+    macOS : OpenGL.framework (Core profile 3.2+ gives direct access to
             glBindFramebuffer / glReadPixels / glTexSubImage2D).
     Linux : libGL.so.1.
-    Windows: opengl32.dll -- extension entry points (glBindFramebuffer and
-            friends) require wglGetProcAddress resolution. Not implemented.
+    Windows: opengl32.dll wrapped by a thin shim that falls back to
+             wglGetProcAddress for anything the DLL doesn't export
+             directly (i.e. most of GL 1.2+).
     """
     if sys.platform == "darwin":
         return cdll.LoadLibrary(
@@ -47,10 +48,77 @@ def _load_gl_library():
     if sys.platform.startswith("linux"):
         return cdll.LoadLibrary("libGL.so.1")
     if sys.platform == "win32":
-        raise NotImplementedError(
-            "Windows support for wgpu_vtk_inject needs wglGetProcAddress "
-            "plumbing for glBindFramebuffer / glTexSubImage2D; not yet done.")
+        return _Win32GLShim()
     raise NotImplementedError(f"unsupported platform: {sys.platform}")
+
+
+class _Win32GLFunc:
+    """Lazily-bound Windows GL function. Supports argtypes/restype
+    assignment like a ctypes function object; the real WINFUNCTYPE
+    binding happens on first call, by which point a GL context must be
+    current (which is true inside VTK's EndEvent handler).
+    """
+    __slots__ = ("_shim", "_name", "argtypes", "restype", "_bound")
+
+    def __init__(self, shim, name):
+        self._shim = shim
+        self._name = name
+        self.argtypes = None
+        self.restype = ctypes.c_int  # ctypes default
+        self._bound = None
+
+    def __call__(self, *args):
+        if self._bound is None:
+            addr = self._shim._resolve(self._name)
+            at = list(self.argtypes or [])
+            proto = ctypes.WINFUNCTYPE(self.restype, *at)
+            self._bound = proto(addr)
+        return self._bound(*args)
+
+
+class _Win32GLShim:
+    """Adapter over opengl32.dll. On Windows, opengl32.dll only exports
+    GL 1.0 / 1.1 symbols; every framebuffer / shader / VAO / multitexture
+    entry point must be queried per-context via wglGetProcAddress. This
+    shim makes `shim.glBindFramebuffer(...)` etc. just work.
+
+    GL context must be current when an unknown function is first called
+    (not when argtypes/restype are assigned). VTK's EndEvent fires with
+    the render-window context current, and all bridge GL calls happen
+    inside that handler, so this is transparently satisfied.
+    """
+
+    def __init__(self):
+        # WinDLL -> __stdcall, which is what Windows GL uses (APIENTRY).
+        self._gl = ctypes.WinDLL("opengl32")
+        self._gl.wglGetProcAddress.argtypes = [ctypes.c_char_p]
+        self._gl.wglGetProcAddress.restype = ctypes.c_void_p
+        self._cache = {}
+
+    def __getattr__(self, name):
+        # Private attributes raise normally so __init__'s "self._gl = ..."
+        # etc. doesn't recurse into wglGetProcAddress.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        cached = self._cache.get(name)
+        if cached is not None:
+            return cached
+        try:
+            fn = getattr(self._gl, name)         # GL 1.0 / 1.1 direct export
+        except AttributeError:
+            fn = _Win32GLFunc(self, name)        # GL 1.2+ via wglGetProcAddress
+        self._cache[name] = fn
+        return fn
+
+    def _resolve(self, name):
+        addr = self._gl.wglGetProcAddress(name.encode("ascii"))
+        if not addr:
+            raise RuntimeError(
+                f"wglGetProcAddress({name}) returned NULL -- either no GL "
+                "context is current or this GL version doesn't support it. "
+                "All bridge GL calls must happen inside the EndEvent "
+                "callback where VTK has made its context current.")
+        return addr
 
 
 # ---------------------------------------------------------------------------
