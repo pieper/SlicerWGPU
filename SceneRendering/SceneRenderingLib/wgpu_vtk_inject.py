@@ -575,7 +575,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> Varyings {
 """
 
 
-def _mat_struct_wgsl(n, m, k):
+def _mat_struct_wgsl(n, m, k, f=0):
     lines = []
     for i in range(n):
         lines += [
@@ -594,8 +594,19 @@ def _mat_struct_wgsl(n, m, k):
     for q in range(k):
         lines += [
             f"    rgba{q}_p2t: mat4x4<f32>,",
-            f"    rgba{q}_step_unit: vec4<f32>,  // (step, unit, visible, _)",
+            f"    rgba{q}_step_unit: vec4<f32>,  // (step, unit, visible, grad_h_mm)",
             f"    rgba{q}_shade: vec4<f32>,     // (ka, kd, ks, shin)",
+            f"    rgba{q}_w2l: mat4x4<f32>,     // world -> label-tex coords",
+            f"    rgba{q}_carve_center: vec4<f32>,    // (cx, cy, cz, radius)",
+            f"    rgba{q}_carve_ids_lo: vec4<u32>,    // 4 label values, 0 = unused",
+            f"    rgba{q}_carve_ids_hi: vec4<u32>,    // 4 label values, 0 = unused",
+        ]
+    for p in range(f):
+        lines += [
+            f"    fiber{p}_p2t: mat4x4<f32>,",
+            f"    fiber{p}_step_unit: vec4<f32>,  // (step, pitch_mm, visible, voxel_mm)",
+            f"    fiber{p}_shade: vec4<f32>,      // (ka, kd, ks, shin)",
+            f"    fiber{p}_params: vec4<f32>,     // (rod_r_mm, opacity, dir_mix, net_mix)",
         ]
     body = "\n".join(lines)
     return f"""
@@ -607,6 +618,11 @@ struct Mat {{
 {body}
     grid_p2t: mat4x4<f32>,
     grid_enabled: vec4<f32>,  // (on, gain, _, _)
+    // Clip-plane tail. `clip_count` > 0 enables clipping; each active
+    // plane is (nx, ny, nz, offset) in world space and a ray sample is
+    // discarded when dot(wp, n) + offset < 0.
+    clip_planes: array<vec4<f32>, 8>,
+    clip_count: vec4<u32>,         // (count, _, _, _)
 }};
 @group(0) @binding(1) var<uniform> u_mat: Mat;
 """
@@ -862,59 +878,170 @@ fn sample_seg_{i}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
 
 
 def _rgba_field_wgsl(slot, n, m, render_mode="density"):
-    """A pre-baked RGBA 3D volume. RGB is emissive color, A is opacity
-    (Gaussian-smoothed on the GPU during bake). Two alpha integration
-    modes:
+    """A pre-baked RGBA 3D volume.
 
-      density: dα/ds = alpha / unit  (current ColorizeVolume behavior,
-               accumulating; thicker path -> more opaque).
+    Density mode (modulate_by_ct=True): RGB = palette color, A = smoothed
+    presence * palette opacity. Surface ramp lives in the alpha texture's
+    Gaussian-blurred boundary; the shader reads alpha directly and uses a
+    multi-tap gradient to suppress the residual voxel stair-step.
+        dα/ds = alpha / unit  (accumulating; thicker path -> more opaque).
 
-      surface: dα/ds = |grad alpha|  (thickness-independent; integrated
-               across a 0->opacity presence transition sums to opacity
-               regardless of how deep the segment is along the ray).
-               Emulates Slicer's polydata closed-surface renderer.
+    Surface mode (modulate_by_ct=False): RGB = grown palette color, A =
+    signed distance to the segment surface, in mm (negative inside,
+    positive outside). The ramp lives in the analytic SDF, so the
+    alpha gradient is mathematically smooth and a single central
+    difference is enough; per-step contribution is constant inside the
+    band.
+        alpha = clamp(0.5 - sdf/band, 0, 1)
+        dα/ds = step / band  (thickness-independent; integrates to 1
+                              across each surface crossing).
 
     Bindings follow the existing (per-image, vtk-depth, grid, per-segment)
-    tail: 2 per rgba slot starting at 2 + 4n + 4 + 2m.
+    tail: 3 per rgba slot. The third slot is the (uint) labelmap used for
+    segment-aware sphere carving (independent of the SDF/density choice).
     """
     q = slot
-    b0 = 2 + n * 4 + 4 + m * 2 + slot * 2
+    b0 = 2 + n * 4 + 4 + m * 2 + slot * 3
+    # Out-of-bounds sentinel for sample_rgba_v_q. Density mode wants
+    # alpha=0 (no presence), surface mode wants a large positive SDF (far
+    # outside any segment) so the band gate culls the sample.
     if render_mode == "surface":
-        alpha_expr = "clamp(glen * step, 0.0, 1.0)"
+        oob_sentinel = "vec4<f32>(0.0, 0.0, 0.0, 1e3)"
     else:
-        alpha_expr = ("clamp(alpha * "
-                      "(step / max(u_mat.rgba{q}_step_unit.y, 1e-3)), "
-                      "0.0, 1.0)").format(q=q)
-    return f"""
+        oob_sentinel = "vec4<f32>(0.0)"
+    head = f"""
 @group(0) @binding({b0+0}) var s_rgba{q}: sampler;
 @group(0) @binding({b0+1}) var t_rgba{q}: texture_3d<f32>;
+@group(0) @binding({b0+2}) var t_label{q}: texture_3d<u32>;
+
+fn carve_rgba_{q}(wp: vec3<f32>) -> bool {{
+    let r = u_mat.rgba{q}_carve_center.w;
+    if (r <= 0.0) {{ return false; }}
+    let d = wp - u_mat.rgba{q}_carve_center.xyz;
+    if (dot(d, d) >= r * r) {{ return false; }}
+    let lp4 = u_mat.rgba{q}_w2l * vec4<f32>(wp, 1.0);
+    let lp = lp4.xyz;
+    if (any(lp < vec3<f32>(0.0)) || any(lp > vec3<f32>(1.0))) {{ return false; }}
+    let dims = vec3<f32>(textureDimensions(t_label{q}));
+    let ijk = vec3<i32>(clamp(lp * dims,
+                              vec3<f32>(0.0),
+                              dims - vec3<f32>(1.0)));
+    let lv = textureLoad(t_label{q}, ijk, 0).r;
+    if (lv == 0u) {{ return false; }}
+    let lo = u_mat.rgba{q}_carve_ids_lo;
+    let hi = u_mat.rgba{q}_carve_ids_hi;
+    if (lv == lo.x || lv == lo.y || lv == lo.z || lv == lo.w) {{ return true; }}
+    if (lv == hi.x || lv == hi.y || lv == hi.z || lv == hi.w) {{ return true; }}
+    return false;
+}}
 
 fn sample_rgba_v_{q}(wp: vec3<f32>) -> vec4<f32> {{
     let wpw = warp(wp);
     let t4 = u_mat.rgba{q}_p2t * vec4<f32>(wpw, 1.0);
     let t = t4.xyz;
     if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) {{
-        return vec4<f32>(0.0);
+        return {oob_sentinel};
     }}
     return textureSampleLevel(t_rgba{q}, s_rgba{q}, t, 0.0);
 }}
+"""
 
+    if render_mode == "surface":
+        # SDF-in-alpha. RGB is grown palette color (median-filtered).
+        return head + f"""
 fn sample_rgba_{q}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
     if (u_mat.rgba{q}_step_unit.z < 0.5) {{ return vec4<f32>(0.0); }}
-    let v4 = sample_rgba_v_{q}(wp);
-    let alpha = v4.a;
-    if (alpha <= 1e-3) {{ return vec4<f32>(0.0); }}
+    if (carve_rgba_{q}(wp)) {{ return vec4<f32>(0.0); }}
 
-    // Central differences on alpha: used both for Phong and (in surface
-    // mode) for the gradient-opacity alpha integral.
-    let h = max(u_mat.scene_step, 1e-3);
+    let band = max(u_mat.rgba{q}_step_unit.w, 1e-3);
+    let v4 = sample_rgba_v_{q}(wp);
+    let sdf = v4.a;
+    // Outside the transition band (with margin) skip everything: no
+    // gradient samples, no shading. SDF magnitude > band/2 + scene_step
+    // guarantees the central-difference gradient stencil also lies
+    // outside the band.
+    let step = max(u_mat.scene_step, 1e-3);
+    if (sdf > 0.5 * band + step) {{ return vec4<f32>(0.0); }}
+
+    // Single central-difference gradient on the SDF. SDF is mathematically
+    // smooth so no multi-tap smoothing is needed. We still need to honor
+    // carving inside the gradient stencil so the cut surface gets a clean
+    // normal; sample_rgba_v_q is shared and the ray-march loop's outer
+    // carve-test covers the center sample.
+    let h = step;
     let gx = sample_rgba_v_{q}(wp+vec3<f32>(h,0,0)).a
            - sample_rgba_v_{q}(wp-vec3<f32>(h,0,0)).a;
     let gy = sample_rgba_v_{q}(wp+vec3<f32>(0,h,0)).a
            - sample_rgba_v_{q}(wp-vec3<f32>(0,h,0)).a;
     let gz = sample_rgba_v_{q}(wp+vec3<f32>(0,0,h)).a
            - sample_rgba_v_{q}(wp-vec3<f32>(0,0,h)).a;
-    let grad = vec3<f32>(gx, gy, gz) / (2.0 * h);
+    let grad_sdf = vec3<f32>(gx, gy, gz) / (2.0 * h);
+    let glen = length(grad_sdf);
+
+    // Phong using the inward-pointing normal (-grad SDF). Uses the same
+    // shade tuple semantics as density mode.
+    let color = v4.rgb;
+    let shade = u_mat.rgba{q}_shade;
+    var lit = color * shade.x;
+    if (glen > 1e-6) {{
+        var n = -grad_sdf / glen;
+        if (dot(n, -rd) < 0.0) {{ n = -n; }}
+        let ldn = max(dot(-rd, n), 0.0);
+        let r = normalize(2.0 * ldn * n + rd);
+        let rdv = max(dot(r, -rd), 0.0);
+        lit = lit + color * (shade.y * ldn)
+                  + vec3<f32>(shade.z * pow(rdv, max(shade.w, 1.0)));
+    }}
+    lit = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // Per-step opacity for surface-mode compositing. dα/ds = (1/band)
+    // along the SDF gradient direction; projected on the ray, it scales
+    // by |grad_sdf · rd| (≈ |cos(angle)| for a true distance field). The
+    // total alpha across a surface crossing therefore integrates to 1.0
+    // independent of the ray's angle to the surface. The band gate skips
+    // contributions outside the alpha ramp.
+    let in_band = step(abs(sdf), 0.5 * band);
+    let dalpha_ds = abs(dot(grad_sdf, rd)) / band;
+    let op = clamp(dalpha_ds * step, 0.0, 1.0) * in_band;
+    return vec4<f32>(lit * op, op);
+}}
+"""
+    else:
+        # Density mode (existing). RGB = palette color, A = smoothed
+        # presence * palette opacity. Multi-tap gradient smoothing in the
+        # screen plane suppresses voxel-axis stair-step.
+        return head + f"""
+fn grad_rgba_{q}(wp: vec3<f32>, h: f32) -> vec3<f32> {{
+    let gx = sample_rgba_v_{q}(wp+vec3<f32>(h,0,0)).a
+           - sample_rgba_v_{q}(wp-vec3<f32>(h,0,0)).a;
+    let gy = sample_rgba_v_{q}(wp+vec3<f32>(0,h,0)).a
+           - sample_rgba_v_{q}(wp-vec3<f32>(0,h,0)).a;
+    let gz = sample_rgba_v_{q}(wp+vec3<f32>(0,0,h)).a
+           - sample_rgba_v_{q}(wp-vec3<f32>(0,0,h)).a;
+    return vec3<f32>(gx, gy, gz) / (2.0 * h);
+}}
+
+fn sample_rgba_{q}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
+    if (u_mat.rgba{q}_step_unit.z < 0.5) {{ return vec4<f32>(0.0); }}
+    if (carve_rgba_{q}(wp)) {{ return vec4<f32>(0.0); }}
+    let v4 = sample_rgba_v_{q}(wp);
+    let alpha = v4.a;
+    if (alpha <= 1e-3) {{ return vec4<f32>(0.0); }}
+
+    let h = max(max(u_mat.rgba{q}_step_unit.w, u_mat.scene_step), 1e-3);
+
+    let g0 = grad_rgba_{q}(wp, h);
+    var u_axis = cross(rd, vec3<f32>(0.0, 1.0, 0.0));
+    if (dot(u_axis, u_axis) < 1e-6) {{
+        u_axis = cross(rd, vec3<f32>(1.0, 0.0, 0.0));
+    }}
+    u_axis = normalize(u_axis);
+    let v_axis = normalize(cross(rd, u_axis));
+    let g1 = grad_rgba_{q}(wp + u_axis * h, h);
+    let g2 = grad_rgba_{q}(wp - u_axis * h, h);
+    let g3 = grad_rgba_{q}(wp + v_axis * h, h);
+    let g4 = grad_rgba_{q}(wp - v_axis * h, h);
+    let grad = (g0 * 2.0 + g1 + g2 + g3 + g4) * (1.0 / 6.0);
     let glen = length(grad);
 
     let color = v4.rgb;
@@ -932,13 +1059,15 @@ fn sample_rgba_{q}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
     lit = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
 
     let step = max(u_mat.scene_step, 1e-3);
-    let op = {alpha_expr};
+    let op = clamp(alpha *
+                   (step / max(u_mat.rgba{q}_step_unit.y, 1e-3)),
+                   0.0, 1.0);
     return vec4<f32>(lit * op, op);
 }}
 """
 
 
-def _main_wgsl(n, m, k):
+def _main_wgsl(n, m, k, f=0):
     img_calls = "\n".join([
         f"        {{ let c = sample_field_{i}(wp, rd); "
         f"if (c.a > 0.0) {{ sum = sum + c; }} }}"
@@ -951,7 +1080,11 @@ def _main_wgsl(n, m, k):
         f"        {{ let c = sample_rgba_{q}(wp, rd); "
         f"if (c.a > 0.0) {{ sum = sum + c; }} }}"
         for q in range(k)])
-    calls_list = [c for c in (img_calls, seg_calls, rgba_calls) if c]
+    fiber_calls = "\n".join([
+        f"        {{ let c = sample_fiber_grain_{p}(wp, rd); "
+        f"if (c.a > 0.0) {{ sum = sum + c; }} }}"
+        for p in range(f)])
+    calls_list = [c for c in (img_calls, seg_calls, rgba_calls, fiber_calls) if c]
     calls = "\n".join(calls_list)
     return f"""
 @fragment
@@ -988,6 +1121,21 @@ fn fs_main(v: Varyings) -> FragmentOutput {{
         if (safety >= 2048) {{ break; }}
         if (integrated.a >= 0.99) {{ break; }}
         let wp = ro + rd * t;
+
+        // Clip-plane test: if any active plane says wp is on its
+        // negative side, skip this sample. The wp > n * offset check
+        // keeps the positive side of each plane.
+        var clipped = false;
+        let ccount = u_mat.clip_count.x;
+        for (var ci = 0u; ci < ccount; ci = ci + 1u) {{
+            let p = u_mat.clip_planes[ci];
+            if (dot(wp, p.xyz) + p.w < 0.0) {{
+                clipped = true;
+                break;
+            }}
+        }}
+        if (clipped) {{ t = t + step; safety = safety + 1; continue; }}
+
         var sum = vec4<f32>(0.0);
 {calls}
         if (sum.a > 0.0) {{
@@ -1005,9 +1153,185 @@ fn fs_main(v: Varyings) -> FragmentOutput {{
 """
 
 
+def _fiber_grain_field_wgsl(slot, n, m, k, num_peaks=4):
+    """Procedural fiber-grain rendering for a voxelized tractogram.
+
+    Bindings (9 for K=4): 1 sampler + K peak textures (rgba16float 3D,
+    .xyz = unit direction, .w = peak weight in [0,1]) + 1 bundle-id
+    texture (r8uint 3D, dominant bundle per voxel) + 1 bundle palette
+    (rgba8unorm 1D) + 1 category palette (rgba8unorm 1D) + 1
+    bundle->category LUT (r8uint 1D).
+
+    Binding offset within the bind group: after per-image (4n), vtk-depth
+    (2), grid (2), per-segment (2m), per-rgba (2k). Each fiber field
+    consumes K+5 = 9 slots with K=4.
+    """
+    p = slot
+    b0 = 2 + n * 4 + 4 + m * 2 + k * 2 + slot * (num_peaks + 5)
+    peak_bindings = []
+    for peak in range(num_peaks):
+        peak_bindings.append(
+            f"@group(0) @binding({b0 + 1 + peak}) "
+            f"var t_peak{peak}_f{p}: texture_3d<f32>;")
+    peak_bindings_str = "\n".join(peak_bindings)
+    # Inline peak-sample dispatch -- WGSL lacks dynamic texture indexing,
+    # so we generate an unrolled peak-index switch per fiber field.
+    peak_dispatch = []
+    for peak in range(num_peaks):
+        peak_dispatch.append(
+            f"        if (k == {peak}u) {{ return textureSampleLevel("
+            f"t_peak{peak}_f{p}, s_fiber{p}, t, 0.0); }}")
+    peak_dispatch_str = "\n".join(peak_dispatch)
+    bb = b0 + 1 + num_peaks        # bundle_id 3D
+    bp = bb + 1                    # bundle palette 1D
+    cp = bp + 1                    # category palette 1D
+    b2c = cp + 1                   # bundle->category 1D
+    return f"""
+@group(0) @binding({b0 + 0}) var s_fiber{p}: sampler;
+{peak_bindings_str}
+@group(0) @binding({bb}) var t_bundle_f{p}: texture_3d<u32>;
+@group(0) @binding({bp}) var t_bpalette_f{p}: texture_1d<f32>;
+@group(0) @binding({cp}) var t_cpalette_f{p}: texture_1d<f32>;
+@group(0) @binding({b2c}) var t_b2c_f{p}: texture_1d<u32>;
+
+fn fiber_sample_peak_{p}(wp: vec3<f32>, k: u32) -> vec4<f32> {{
+    let wpw = warp(wp);
+    let t4 = u_mat.fiber{p}_p2t * vec4<f32>(wpw, 1.0);
+    let t = t4.xyz;
+    if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) {{
+        return vec4<f32>(0.0);
+    }}
+{peak_dispatch_str}
+    return vec4<f32>(0.0);
+}}
+
+fn fiber_hash3_{p}(v: vec3<u32>) -> f32 {{
+    var h = v.x * 374761393u + v.y * 668265263u + v.z * 2147483647u;
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    return f32(h & 0xFFFFFFu) / 16777215.0;
+}}
+
+fn sample_fiber_grain_{p}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
+    if (u_mat.fiber{p}_step_unit.z < 0.5) {{ return vec4<f32>(0.0); }}
+
+    let wpw = warp(wp);
+    let t4 = u_mat.fiber{p}_p2t * vec4<f32>(wpw, 1.0);
+    let t_uvw = t4.xyz;
+    if (any(t_uvw < vec3<f32>(0.0)) || any(t_uvw >= vec3<f32>(1.0))) {{
+        return vec4<f32>(0.0);
+    }}
+    let dims_f = vec3<f32>(textureDimensions(t_peak0_f{p}));
+    let ijk_u = vec3<u32>(floor(t_uvw * dims_f));
+
+    let pitch = max(u_mat.fiber{p}_step_unit.y, 0.05);
+
+    // Bundle + category lookup for coloring.
+    let bid = textureLoad(t_bundle_f{p}, vec3<i32>(ijk_u), 0).r;
+    let cat = textureLoad(t_b2c_f{p}, i32(bid), 0).r;
+    let bundle_col = textureSampleLevel(
+        t_bpalette_f{p}, s_fiber{p},
+        (f32(bid) + 0.5) / 256.0, 0.0).rgb;
+    let cat_col = textureSampleLevel(
+        t_cpalette_f{p}, s_fiber{p},
+        (f32(cat) + 0.5) / 256.0, 0.0).rgb;
+    let net_mix = clamp(u_mat.fiber{p}_params.w, 0.0, 1.0);
+    let dir_mix = clamp(u_mat.fiber{p}_params.z, 0.0, 1.0);
+
+    let rod_r = max(u_mat.fiber{p}_params.x, 1e-3);
+    let op_mult = u_mat.fiber{p}_params.y;
+    let shade = u_mat.fiber{p}_shade;
+
+    var accum = vec4<f32>(0.0);
+    for (var k = 0u; k < {num_peaks}u; k = k + 1u) {{
+        let peak = fiber_sample_peak_{p}(wp, k);
+        let dir_raw = peak.xyz;
+        let w = peak.w;
+        if (w < 1e-3) {{ continue; }}
+        let dir = normalize(dir_raw);
+
+        // World-space rod lattice perpendicular to this peak's direction.
+        // Build an orthonormal basis (u, v) perpendicular to dir. Rods
+        // live on an infinite grid in this plane, pitched at `pitch` mm,
+        // so adjacent voxels sharing the same peak produce continuous
+        // long rods instead of disconnected per-voxel segments.
+        let uhelp = select(vec3<f32>(0.0, 1.0, 0.0),
+                           vec3<f32>(1.0, 0.0, 0.0),
+                           abs(dir.y) > 0.9);
+        let u_axis = normalize(cross(dir, uhelp));
+        let v_axis = cross(dir, u_axis);
+
+        let uu = dot(wp, u_axis);
+        let vv = dot(wp, v_axis);
+
+        // Nearest lattice cell (biased into positive ints for stable hashing).
+        let cu = i32(floor(uu / pitch)) + 1073741824;
+        let cv = i32(floor(vv / pitch)) + 1073741824;
+        let cell_key = vec3<u32>(u32(cu), u32(cv),
+                                 k * 2654435761u + 1u);
+        let jx = fiber_hash3_{p}(cell_key) - 0.5;
+        let jy = fiber_hash3_{p}(cell_key + vec3<u32>(17u, 31u, 13u)) - 0.5;
+
+        // Rod axis passes through this point in the (u,v) plane, running
+        // parallel to dir. Jitter is capped so rods from different cells
+        // don't cross.
+        let center_u = (floor(uu / pitch) + 0.5 + jx * 0.35) * pitch;
+        let center_v = (floor(vv / pitch) + 0.5 + jy * 0.35) * pitch;
+
+        let du = uu - center_u;
+        let dv = vv - center_v;
+        let d_perp = sqrt(du * du + dv * dv);
+
+        // Narrower rods for weaker peaks, but not proportional-to-w (that
+        // made sub-dominant peaks invisible). sqrt(w) keeps them present.
+        let this_r = rod_r * sqrt(max(w, 1e-3));
+        if (d_perp > this_r) {{ continue; }}
+
+        // Exponential "glass core" profile: bright center, sharp edge.
+        let xr = d_perp / this_r;
+        let rod_alpha = exp(-xr * xr * 3.2);
+
+        // Base color.
+        let fa_rgb = abs(dir);
+        var col = mix(bundle_col, cat_col, net_mix);
+        col = mix(col, fa_rgb, dir_mix);
+
+        // Kajiya-Kay anisotropic highlight, with chromatic dispersion on
+        // the specular lobe (different reflection directions per R, G, B
+        // channel = glass-like color fringing at the rod edges).
+        let ldn = sqrt(max(1.0 - pow(dot(dir, -rd), 2.0), 0.0));
+        let shin = max(shade.w, 1.0);
+        let disp = u_axis * 0.035;
+        let refl_r = reflect(rd, normalize(dir + disp));
+        let refl_g = reflect(rd, dir);
+        let refl_b = reflect(rd, normalize(dir - disp));
+        let spec = vec3<f32>(
+            pow(max(0.0, sqrt(1.0 - pow(dot(refl_r, dir), 2.0))), shin),
+            pow(max(0.0, sqrt(1.0 - pow(dot(refl_g, dir), 2.0))), shin),
+            pow(max(0.0, sqrt(1.0 - pow(dot(refl_b, dir), 2.0))), shin));
+
+        // Fresnel: bright at grazing angles so rod rims pop.
+        let fres = 1.0 - abs(dot(dir, -rd));
+        let rim = fres * fres;
+
+        var lit = col * shade.x
+                + col * (shade.y * ldn)
+                + spec * shade.z
+                + vec3<f32>(rim * 0.35);
+        lit = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
+
+        let a = clamp(rod_alpha * op_mult * (0.5 + 0.5 * rim), 0.0, 1.0);
+        accum = vec4<f32>(
+            accum.rgb + (1.0 - accum.a) * lit * a,
+            accum.a + (1.0 - accum.a) * a);
+    }}
+    return accum;
+}}
+"""
+
+
 def _build_wgsl(n, m, k, segment_render_mode="iso",
-                rgba_render_modes=None):
-    parts = [_HEADER, _mat_struct_wgsl(n, m, k)]
+                rgba_render_modes=None, f=0, num_peaks=4):
+    parts = [_HEADER, _mat_struct_wgsl(n, m, k, f)]
     # Grid transform needs to come BEFORE the per-field functions (they call
     # warp()); its bindings sit after the VTK depth bindings.
     parts.append(_vtk_depth_wgsl(n))
@@ -1025,7 +1349,9 @@ def _build_wgsl(n, m, k, segment_render_mode="iso",
         mode = (rgba_render_modes[q]
                 if q < len(rgba_render_modes) else "density")
         parts.append(_rgba_field_wgsl(q, n, m, render_mode=mode))
-    parts.append(_main_wgsl(n, m, k))
+    for p in range(f):
+        parts.append(_fiber_grain_field_wgsl(p, n, m, k, num_peaks=num_peaks))
+    parts.append(_main_wgsl(n, m, k, f=f))
     return "\n".join(parts)
 
 
@@ -1038,43 +1364,52 @@ def _build_wgsl(n, m, k, segment_render_mode="iso",
 _SCENE_BYTES = 64
 _PER_FIELD_BYTES = 112   # mat4(64) + 3 * vec4(48) per image field
 _PER_SEG_BYTES = 112     # mat4(64) + 3 * vec4(48) per segment
-_PER_RGBA_BYTES = 96     # mat4(64) + 2 * vec4(32) per rgba volume
+_PER_RGBA_BYTES = 208    # mat4(64) + 2 vec4(32) + carve: mat4(64) + 3 vec4(48)
+_PER_FIBER_BYTES = 112   # mat4(64) + 3 * vec4(48) per fiber-grain field
 # Grid transform tail: mat4x4 (64) + vec4 enabled (16) = 80 bytes
 _GRID_TAIL_BYTES = 80
+# Clip-plane tail: 8 * vec4 planes + vec4 count = 144 bytes
+_CLIP_TAIL_BYTES = 8 * 16 + 16
 
 
-def _mat_ubo_size(n, m, k):
+def _mat_ubo_size(n, m, k, f=0):
     total = (_SCENE_BYTES
              + n * _PER_FIELD_BYTES
              + m * _PER_SEG_BYTES
              + k * _PER_RGBA_BYTES
-             + _GRID_TAIL_BYTES)
+             + f * _PER_FIBER_BYTES
+             + _GRID_TAIL_BYTES
+             + _CLIP_TAIL_BYTES)
     return (total + 15) & ~15
 
 
 def _pack_material(fields, segments, rgba_volumes, bmin, bmax, step,
-                   grid_p2t=None, grid_gain=1.0):
+                   fiber_fields=None,
+                   grid_p2t=None, grid_gain=1.0,
+                   clip_planes=None):
     """Pack scene + per-field + per-segment + grid-transform tail.
     grid_p2t is the world->texture matrix for the displacement grid
     (None = no grid)."""
     n = len(fields)
     m = len(segments)
     k = len(rgba_volumes)
-    buf = bytearray(_mat_ubo_size(n, m, k))
+    fiber_fields = fiber_fields or []
+    f = len(fiber_fields)
+    buf = bytearray(_mat_ubo_size(n, m, k, f))
     arr = np.frombuffer(buf, dtype=np.float32)
     arr[0:3] = bmin
     arr[4:7] = bmax
     arr[8] = step
-    for i, f in enumerate(fields):
+    for i, fld in enumerate(fields):
         off = (_SCENE_BYTES // 4) + i * (_PER_FIELD_BYTES // 4)
-        p2t = _p2t_for_field(f)
+        p2t = _p2t_for_field(fld)
         arr[off:off+16] = p2t.T.ravel()
-        arr[off+16:off+18] = f.clim
-        arr[off+20:off+24] = [f.k_ambient, f.k_diffuse, f.k_specular,
-                              max(f.shininess, 1.0)]
+        arr[off+16:off+18] = fld.clim
+        arr[off+20:off+24] = [fld.k_ambient, fld.k_diffuse, fld.k_specular,
+                              max(fld.shininess, 1.0)]
         # Force visible=1 since the bridge hides the VRDN to silence
         # Slicer's native VR mapper; we always want to render our fields.
-        arr[off+24:off+28] = [f.sample_step_mm, f.opacity_unit_distance,
+        arr[off+24:off+28] = [fld.sample_step_mm, fld.opacity_unit_distance,
                               1.0, 0.0]
     for j, s in enumerate(segments):
         off = (_SCENE_BYTES // 4) + n * (_PER_FIELD_BYTES // 4) \
@@ -1092,21 +1427,91 @@ def _pack_material(fields, segments, rgba_volumes, bmin, bmax, step,
                + q * (_PER_RGBA_BYTES // 4))
         p2t = _p2t_for_field(r)
         arr[off:off+16] = p2t.T.ravel()
+        # .w double-duty: gradient_h_mm in density mode, band_mm in
+        # surface mode (the SDF -> alpha transition band).
+        if getattr(r, "render_mode", "density") == "surface":
+            param_w = float(getattr(r, "band_mm", 0.0))
+        else:
+            param_w = float(getattr(r, "gradient_h_mm", 0.0))
         arr[off+16:off+20] = [r.sample_step_mm, r.opacity_unit_distance,
-                              1.0 if r.visible else 0.0, 0.0]
+                              1.0 if r.visible else 0.0, param_w]
         arr[off+20:off+24] = [r.k_ambient, r.k_diffuse, r.k_specular,
                               max(r.shininess, 1.0)]
+        # Carve tail: world->label mat4, then center+radius and 8 packed
+        # label-value ids (4 per vec4, 0 = unused slot).
+        w2l_world = np.asarray(getattr(r, "_world_to_label_tex",
+                                       np.eye(4)), dtype=np.float64)
+        # _world_to_label_tex was computed against world (no per-volume
+        # parent transform applied). Compose w/ inverse world_from_local so
+        # the same wp -> texture chain works after a transform on the field.
+        w_from_l = np.asarray(r.world_from_local, dtype=np.float64)
+        try:
+            l_from_w = np.linalg.inv(w_from_l)
+        except np.linalg.LinAlgError:
+            l_from_w = np.eye(4, dtype=np.float64)
+        w2l = (w2l_world @ l_from_w).astype(np.float32)
+        arr[off+24:off+40] = w2l.T.ravel()
+        c = np.asarray(getattr(r, "carve_center_world",
+                               np.zeros(3)), dtype=np.float32)
+        radius = float(getattr(r, "carve_radius_mm", 0.0))
+        arr[off+40:off+44] = [float(c[0]), float(c[1]), float(c[2]), radius]
+        ids = list(getattr(r, "carve_segment_label_values", []) or [])[:8]
+        ids = ids + [0] * (8 - len(ids))
+        ids_u32 = np.asarray(ids, dtype=np.uint32).view(np.float32)
+        arr[off+44:off+48] = ids_u32[0:4]
+        arr[off+48:off+52] = ids_u32[4:8]
+    # Per-fiber-field blocks (112 bytes each: p2t + step_unit + shade + params)
+    for p, fib in enumerate(fiber_fields):
+        off = ((_SCENE_BYTES // 4)
+               + n * (_PER_FIELD_BYTES // 4)
+               + m * (_PER_SEG_BYTES // 4)
+               + k * (_PER_RGBA_BYTES // 4)
+               + p * (_PER_FIBER_BYTES // 4))
+        p2t = _p2t_for_field(fib)
+        arr[off:off+16] = p2t.T.ravel()
+        # voxel_mm isotropic proxy = min edge of the reference volume spacing
+        vox_mm = getattr(fib, "_voxel_mm", 1.0)
+        # step_unit.y = rod lattice pitch (world mm). Drives how far
+        # apart neighbouring rods sit in the plane perpendicular to the
+        # peak direction.
+        arr[off+16:off+20] = [fib.sample_step_mm, fib.rod_pitch_mm,
+                              1.0 if fib.visible else 0.0,
+                              float(vox_mm)]
+        arr[off+20:off+24] = [fib.k_ambient, fib.k_diffuse, fib.k_specular,
+                              max(fib.shininess, 1.0)]
+        arr[off+24:off+28] = [fib.rod_radius_mm, fib.opacity,
+                              fib.direction_mix, fib.network_mix]
+
     # Grid transform tail
     tail_off = ((_SCENE_BYTES // 4)
                 + n * (_PER_FIELD_BYTES // 4)
                 + m * (_PER_SEG_BYTES // 4)
-                + k * (_PER_RGBA_BYTES // 4))
+                + k * (_PER_RGBA_BYTES // 4)
+                + f * (_PER_FIBER_BYTES // 4))
     if grid_p2t is not None:
         arr[tail_off:tail_off+16] = np.asarray(grid_p2t, dtype=np.float32).T.ravel()
         arr[tail_off+16:tail_off+20] = [1.0, float(grid_gain), 0.0, 0.0]
     else:
         arr[tail_off:tail_off+16] = np.eye(4, dtype=np.float32).T.ravel()
         arr[tail_off+16:tail_off+20] = [0.0, 0.0, 0.0, 0.0]
+    # Clip-plane tail: 8 vec4 planes + 1 vec4 (count + pad)
+    clip_off = tail_off + 20
+    planes_arr = np.asarray(clip_planes, dtype=np.float32) if clip_planes else None
+    if planes_arr is None or len(planes_arr) == 0:
+        arr[clip_off:clip_off + 32] = 0.0
+        # count in the last vec4 (slots 32..36), stored as f32 for the single
+        # shared memory view; reinterpretation as u32 in WGSL works because
+        # 0.0f and 0u share the same bit pattern.
+        arr[clip_off + 32:clip_off + 36] = 0.0
+    else:
+        arr[clip_off:clip_off + 32] = 0.0
+        count = min(len(planes_arr), 8)
+        for i in range(count):
+            arr[clip_off + 4 * i: clip_off + 4 * i + 4] = planes_arr[i]
+        # Write count as u32 into the same float slot via a bit-cast.
+        count_bits = np.uint32(count).view(np.float32)
+        arr[clip_off + 32] = count_bits
+        arr[clip_off + 33: clip_off + 36] = 0.0
     return bytes(buf)
 
 
@@ -1346,6 +1751,21 @@ class RGBAVolumeField:
         self.k_specular = 0.30
         self.shininess = 32.0
         self.visible = True
+        # Width (in mm) of the central-difference stencil used to compute
+        # the alpha gradient at sample time. Used by density-mode rgba
+        # volumes (where alpha = smoothed presence). 0 falls back to
+        # scene_step.
+        self.gradient_h_mm = 0.0
+        # Surface-mode SDF -> alpha band width (in mm). The 0->1 alpha
+        # transition is centered on sdf=0 and spans this thickness; total
+        # alpha across one surface crossing is opacity_scale.
+        self.band_mm = 0.0
+        # Surface-mode: post-JFA Gaussian sigma (in voxels of the rgba
+        # grid) applied to the SDF channel. Knocks down the equidistant
+        # ridges where neighboring boundary seeds meet without spreading
+        # the surface. ~2.5 voxels approximates Slicer's default
+        # closed-surface smoothing on segmentations. 0 disables.
+        self.sdf_smooth_sigma_voxels = 2.5
         # "density" (ColorizeVolume-style accumulating alpha * step / unit)
         # or "surface" (gradient-opacity: α_step = |grad alpha| * step, so
         # the total α per 0->opacity boundary crossing equals the baked-in
@@ -1353,6 +1773,12 @@ class RGBAVolumeField:
         self.render_mode = "density"
         self._bounds = (np.array([-100, -100, -100], dtype=np.float32),
                         np.array([100, 100, 100], dtype=np.float32))
+        # Carving: at sample time, voxels whose label is in carve_segment_label_values
+        # AND whose world position is inside the sphere (carve_center_world,
+        # carve_radius_mm) are dropped from compositing. radius<=0 disables.
+        self.carve_segment_label_values: list[int] = []
+        self.carve_center_world = np.zeros(3, dtype=np.float32)
+        self.carve_radius_mm = 0.0
 
     def aabb(self):
         return self._bounds
@@ -1377,6 +1803,165 @@ class RGBAVolumeField:
                 address_mode_w=wgpu.AddressMode.clamp_to_edge,
             )
         self.dims = (dx, dy, dz)
+
+
+# ---------------------------------------------------------------------------
+# FiberGrainField: procedural streamline "grain" rendering driven by a
+# per-voxel orientation histogram packed into K=4 peak textures.
+#
+# Each of the K peak textures is rgba16float 3D. Per voxel in each texture:
+#   .xyz = unit direction of that peak (RAS mm)
+#   .w   = pack(weight, bundle_id)
+# Bundle palette (1D rgba8unorm, 256 entries) and category (network)
+# palette (same) plus a bundle->category u8 LUT (1D r8uint, 256 entries)
+# provide the colors. Rod radius, opacity, direction-vs-palette color
+# blend, and bundle-vs-category color blend all come from the Mat UBO.
+#
+# The shader evaluates a procedural rod profile at each sample point:
+# rods are oriented along peak directions, offset by a hash of voxel-
+# index + peak-index so rods in adjacent voxels don't all converge on
+# voxel centers. Shading: Kajiya-Kay anisotropic BRDF over tangent T,
+# plus a Fresnel-ish edge term for the glass-rod look. See
+# _fiber_grain_field_wgsl() for the generated sampling code.
+# ---------------------------------------------------------------------------
+
+class FiberGrainField:
+    def __init__(self, device, num_peaks=4):
+        if num_peaks not in (1, 2, 4):
+            raise ValueError(
+                f"num_peaks must be 1, 2, or 4, got {num_peaks}")
+        self.device = device
+        self.num_peaks = num_peaks
+        self.peak_texs = [None] * num_peaks
+        self.peak_views = [None] * num_peaks
+        self.bundle_id_tex = None      # r8uint 3D, dominant bundle per voxel
+        self.bundle_id_view = None
+        self.sampler = None
+        self.palette_tex = None        # rgba8unorm 1D, 256 entries
+        self.palette_view = None
+        self.category_palette_tex = None
+        self.category_palette_view = None
+        self.bundle_to_category_tex = None   # r8uint 1D, 256 entries
+        self.bundle_to_category_view = None
+        self.dims = (0, 0, 0)
+        # Same attribute names as ImageField/SegmentField so _p2t_for_field
+        # composes through unchanged.
+        self.patient_to_texture = np.eye(4, dtype=np.float32)
+        self.world_from_local = np.eye(4, dtype=np.float32)
+        self.sample_step_mm = 1.0
+        self.opacity_unit_distance = 5.0
+        self.visible = True
+        # Fiber-rendering-specific parameters.
+        self.rod_radius_mm = 0.15
+        self.rod_pitch_mm = 0.55   # lattice spacing perpendicular to tangent
+        self.opacity = 1.0
+        self.direction_mix = 0.0   # 0 = palette RGB, 1 = FA-RGB from tangent
+        self.network_mix = 0.0     # 0 = bundle color, 1 = network color
+        self.k_ambient = 0.10
+        self.k_diffuse = 0.55
+        self.k_specular = 1.10
+        self.shininess = 220.0
+        self._bounds = (np.array([-100, -100, -100], dtype=np.float32),
+                        np.array([100, 100, 100], dtype=np.float32))
+
+    def aabb(self):
+        return self._bounds
+
+    def allocate(self, dx, dy, dz):
+        """Allocate the K peak textures + palette + category textures.
+        Must be called with dims matching what the voxelizer will produce."""
+        def _peak():
+            t = self.device.create_texture(
+                size=(dx, dy, dz), dimension="3d",
+                format=wgpu.TextureFormat.rgba16float,
+                usage=(wgpu.TextureUsage.TEXTURE_BINDING
+                       | wgpu.TextureUsage.STORAGE_BINDING
+                       | wgpu.TextureUsage.COPY_DST))
+            return t, t.create_view()
+        for i in range(self.num_peaks):
+            self.peak_texs[i], self.peak_views[i] = _peak()
+        self.bundle_id_tex = self.device.create_texture(
+            size=(dx, dy, dz), dimension="3d",
+            format=wgpu.TextureFormat.r8uint,
+            usage=(wgpu.TextureUsage.TEXTURE_BINDING
+                   | wgpu.TextureUsage.STORAGE_BINDING
+                   | wgpu.TextureUsage.COPY_DST))
+        self.bundle_id_view = self.bundle_id_tex.create_view()
+        self.sampler = self.device.create_sampler(
+            mag_filter=wgpu.FilterMode.linear,
+            min_filter=wgpu.FilterMode.linear,
+            address_mode_u=wgpu.AddressMode.clamp_to_edge,
+            address_mode_v=wgpu.AddressMode.clamp_to_edge,
+            address_mode_w=wgpu.AddressMode.clamp_to_edge)
+        self.palette_tex = self.device.create_texture(
+            size=(256, 1, 1), dimension="1d",
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+        self.palette_view = self.palette_tex.create_view()
+        self.category_palette_tex = self.device.create_texture(
+            size=(256, 1, 1), dimension="1d",
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+        self.category_palette_view = self.category_palette_tex.create_view()
+        self.bundle_to_category_tex = self.device.create_texture(
+            size=(256, 1, 1), dimension="1d",
+            format=wgpu.TextureFormat.r8uint,
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+        self.bundle_to_category_view = self.bundle_to_category_tex.create_view()
+        self.dims = (dx, dy, dz)
+
+    # ---- Palette / category uploads ----
+    def write_palette(self, palette_rgba_u8):
+        """palette_rgba_u8: (256, 4) uint8. Index 0 reserved for background."""
+        arr = np.ascontiguousarray(
+            np.asarray(palette_rgba_u8, dtype=np.uint8).reshape(256, 4))
+        self.device.queue.write_texture(
+            {"texture": self.palette_tex, "mip_level": 0, "origin": (0, 0, 0)},
+            arr,
+            {"offset": 0, "bytes_per_row": 256 * 4, "rows_per_image": 1},
+            (256, 1, 1))
+
+    def write_category_palette(self, palette_rgba_u8):
+        arr = np.ascontiguousarray(
+            np.asarray(palette_rgba_u8, dtype=np.uint8).reshape(256, 4))
+        self.device.queue.write_texture(
+            {"texture": self.category_palette_tex, "mip_level": 0, "origin": (0, 0, 0)},
+            arr,
+            {"offset": 0, "bytes_per_row": 256 * 4, "rows_per_image": 1},
+            (256, 1, 1))
+
+    def write_bundle_to_category(self, bundle_to_category_u8):
+        """bundle_to_category_u8: (256,) uint8. bundle_id -> category_id."""
+        arr = np.ascontiguousarray(
+            np.asarray(bundle_to_category_u8, dtype=np.uint8).reshape(256))
+        self.device.queue.write_texture(
+            {"texture": self.bundle_to_category_tex, "mip_level": 0, "origin": (0, 0, 0)},
+            arr,
+            {"offset": 0, "bytes_per_row": 256, "rows_per_image": 1},
+            (256, 1, 1))
+
+    def write_peak(self, k, rgba16float_array):
+        """rgba16float_array: (D, H, W, 4) float16. Writes peak[k]."""
+        dx, dy, dz = self.dims
+        a = np.ascontiguousarray(
+            np.asarray(rgba16float_array, dtype=np.float16)
+            .reshape(dz, dy, dx, 4))
+        self.device.queue.write_texture(
+            {"texture": self.peak_texs[k], "mip_level": 0, "origin": (0, 0, 0)},
+            a,
+            {"offset": 0, "bytes_per_row": dx * 8, "rows_per_image": dy},
+            (dx, dy, dz))
+
+    def write_bundle_id_volume(self, bundle_id_array):
+        """bundle_id_array: (D, H, W) uint8. Dominant bundle per voxel."""
+        dx, dy, dz = self.dims
+        a = np.ascontiguousarray(
+            np.asarray(bundle_id_array, dtype=np.uint8).reshape(dz, dy, dx))
+        self.device.queue.write_texture(
+            {"texture": self.bundle_id_tex, "mip_level": 0, "origin": (0, 0, 0)},
+            a,
+            {"offset": 0, "bytes_per_row": dx, "rows_per_image": dy},
+            (dx, dy, dz))
 
 
 # ---------------------------------------------------------------------------
@@ -1457,6 +2042,15 @@ class WgpuVolumeBridge:
         # nodes driving RGBA volumes. On display change we rebuild the
         # palette UBO and rerun the bake using cached textures.
         self._rgba_obs_tags: list = []
+
+        # Fiber-rendering (DMRI / tractography "grain" field). List kept
+        # short (typically one), but multiple are supported so multiple
+        # tractograms can co-render.
+        self._fiber_fields: list = []
+        # Active clip planes in world space: list of (nx, ny, nz, offset).
+        # Observed from vtkMRMLClipModelsNode(s) via set_clip_nodes().
+        self._clip_planes: list = []
+        self._clip_obs_tags: list = []
 
         # Segment-smoothing compute pipeline (lazy). Separable 1D Gaussian
         # dispatched three times (X, Y, Z) per segment on paint -- turns the
@@ -1557,6 +2151,12 @@ class WgpuVolumeBridge:
             except Exception: pass
         self._rgba_obs_tags = []
         self._rgba_volumes = []
+        self._fiber_fields = []
+        for obj, tag in self._clip_obs_tags:
+            try: obj.RemoveObserver(tag)
+            except Exception: pass
+        self._clip_obs_tags = []
+        self._clip_planes = []
         self._fields = []
         # Drop wgpu resources so the Python GC can reclaim GPU memory
         # immediately rather than waiting for the bridge object itself
@@ -1614,13 +2214,16 @@ class WgpuVolumeBridge:
         n = len(self._fields)
         m = len(self._segments)
         k = len(self._rgba_volumes)
-        if n == 0 and m == 0 and k == 0:
+        f = len(self._fiber_fields)
+        num_peaks = (self._fiber_fields[0].num_peaks
+                     if self._fiber_fields else 4)
+        if n == 0 and m == 0 and k == 0 and f == 0:
             self._pipeline = None
             self._bind_group = None
             return
 
-        for f in self._fields:
-            for tex in (f._volume_tex, f._lut_tex, f._grad_lut_tex):
+        for img_f in self._fields:
+            for tex in (img_f._volume_tex, img_f._lut_tex, img_f._grad_lut_tex):
                 if tex is None:
                     continue
                 if tex._wgpu_object is None:
@@ -1632,11 +2235,12 @@ class WgpuVolumeBridge:
                       for r in self._rgba_volumes]
         wgsl = _build_wgsl(n, m, k,
                            segment_render_mode=self._segment_render_mode,
-                           rgba_render_modes=rgba_modes)
+                           rgba_render_modes=rgba_modes,
+                           f=f, num_peaks=num_peaks)
         shader = self.device.create_shader_module(code=wgsl)
 
         self._mat_ubo = self.device.create_buffer(
-            size=_mat_ubo_size(n, m, k),
+            size=_mat_ubo_size(n, m, k, f),
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
         entries = [
@@ -1694,11 +2298,13 @@ class WgpuVolumeBridge:
                              "view_dimension": wgpu.TextureViewDimension.d3,
                              "multisampled": False}},
             ]
-        # Per-RGBA-volume bindings (sampler + rgba16float 3D texture),
-        # starting right after per-segment bindings.
+        # Per-RGBA-volume bindings (sampler + rgba16float 3D texture +
+        # uint labelmap 3D), starting right after per-segment bindings.
+        # The labelmap is bound for segment-aware carving; sampled with
+        # textureLoad (no sampler needed for uint formats).
         br0 = bs0 + m * 2
         for q in range(k):
-            br = br0 + q * 2
+            br = br0 + q * 3
             entries += [
                 {"binding": br+0, "visibility": wgpu.ShaderStage.FRAGMENT,
                  "sampler": {"type": wgpu.SamplerBindingType.filtering}},
@@ -1706,7 +2312,52 @@ class WgpuVolumeBridge:
                  "texture": {"sample_type": wgpu.TextureSampleType.float,
                              "view_dimension": wgpu.TextureViewDimension.d3,
                              "multisampled": False}},
+                {"binding": br+2, "visibility": wgpu.ShaderStage.FRAGMENT,
+                 "texture": {"sample_type": wgpu.TextureSampleType.uint,
+                             "view_dimension": wgpu.TextureViewDimension.d3,
+                             "multisampled": False}},
             ]
+        # Per-fiber-field bindings: 1 sampler + num_peaks peak textures +
+        # 1 bundle-id 3D (uint) + 2 palettes (1D float) + 1 bundle->category
+        # 1D (uint). (num_peaks + 5) slots per fiber field.
+        bf0 = br0 + k * 3
+        per_fiber = num_peaks + 5
+        for p in range(f):
+            bf = bf0 + p * per_fiber
+            entries.append(
+                {"binding": bf + 0, "visibility": wgpu.ShaderStage.FRAGMENT,
+                 "sampler": {"type": wgpu.SamplerBindingType.filtering}})
+            for pk in range(num_peaks):
+                entries.append(
+                    {"binding": bf + 1 + pk,
+                     "visibility": wgpu.ShaderStage.FRAGMENT,
+                     "texture": {"sample_type": wgpu.TextureSampleType.float,
+                                 "view_dimension": wgpu.TextureViewDimension.d3,
+                                 "multisampled": False}})
+            entries.append(
+                {"binding": bf + 1 + num_peaks,
+                 "visibility": wgpu.ShaderStage.FRAGMENT,
+                 "texture": {"sample_type": wgpu.TextureSampleType.uint,
+                             "view_dimension": wgpu.TextureViewDimension.d3,
+                             "multisampled": False}})
+            entries.append(
+                {"binding": bf + 2 + num_peaks,
+                 "visibility": wgpu.ShaderStage.FRAGMENT,
+                 "texture": {"sample_type": wgpu.TextureSampleType.float,
+                             "view_dimension": wgpu.TextureViewDimension.d1,
+                             "multisampled": False}})
+            entries.append(
+                {"binding": bf + 3 + num_peaks,
+                 "visibility": wgpu.ShaderStage.FRAGMENT,
+                 "texture": {"sample_type": wgpu.TextureSampleType.float,
+                             "view_dimension": wgpu.TextureViewDimension.d1,
+                             "multisampled": False}})
+            entries.append(
+                {"binding": bf + 4 + num_peaks,
+                 "visibility": wgpu.ShaderStage.FRAGMENT,
+                 "texture": {"sample_type": wgpu.TextureSampleType.uint,
+                             "view_dimension": wgpu.TextureViewDimension.d1,
+                             "multisampled": False}})
         self._bgl = self.device.create_bind_group_layout(entries=entries)
         pl = self.device.create_pipeline_layout(bind_group_layouts=[self._bgl])
         self._pipeline = self.device.create_render_pipeline(
@@ -1732,7 +2383,8 @@ class WgpuVolumeBridge:
         """Assemble bind group from current fields + current depth texture.
         Called when pipeline rebuilds OR when the depth texture reallocates."""
         if self._bgl is None or (not self._fields and not self._segments
-                                 and not self._rgba_volumes):
+                                 and not self._rgba_volumes
+                                 and not self._fiber_fields):
             return
         bg = [
             {"binding": 0, "resource": {
@@ -1768,11 +2420,32 @@ class WgpuVolumeBridge:
             ]
         br0 = bs0 + len(self._segments) * 2
         for q, r in enumerate(self._rgba_volumes):
-            br = br0 + q * 2
+            br = br0 + q * 3
             bg += [
                 {"binding": br+0, "resource": r.sampler},
                 {"binding": br+1, "resource": r.tex_view},
+                {"binding": br+2, "resource": r._label_tex_view},
             ]
+        # Per-fiber-field bindings
+        bf0 = br0 + len(self._rgba_volumes) * 3
+        num_peaks = (self._fiber_fields[0].num_peaks
+                     if self._fiber_fields else 4)
+        per_fiber = num_peaks + 5
+        for p, ff in enumerate(self._fiber_fields):
+            bf = bf0 + p * per_fiber
+            bg.append({"binding": bf + 0, "resource": ff.sampler})
+            for pk in range(num_peaks):
+                bg.append({"binding": bf + 1 + pk,
+                           "resource": ff.peak_views[pk]})
+            # Need a separate bundle-id 3D view (uint) for each field
+            bg.append({"binding": bf + 1 + num_peaks,
+                       "resource": ff.bundle_id_view})
+            bg.append({"binding": bf + 2 + num_peaks,
+                       "resource": ff.palette_view})
+            bg.append({"binding": bf + 3 + num_peaks,
+                       "resource": ff.category_palette_view})
+            bg.append({"binding": bf + 4 + num_peaks,
+                       "resource": ff.bundle_to_category_view})
         self._bind_group = self.device.create_bind_group(
             layout=self._bgl, entries=bg)
 
@@ -1933,6 +2606,67 @@ class WgpuVolumeBridge:
         )
         return realloc
 
+    def set_clip_nodes(self, clip_nodes):
+        """Install observers on a list of vtkMRMLClipModelsNode / equivalent
+        plane-like clip nodes. The shader receives up to 8 active clip
+        planes; a sample is discarded when it lies on the negative side
+        of any active plane. Pass None or [] to disable clipping.
+
+        MRML's `vtkMRMLClipNode` exposes GetClippingNodeID + an implicit
+        function; for simplicity we accept objects implementing
+        `GetOrigin() -> (x, y, z)` and `GetNormal() -> (nx, ny, nz)` (the
+        common case for a plane-based clip node / `vtkMRMLMarkupsPlaneNode`).
+        """
+        # Tear down old observers
+        for obj, tag in self._clip_obs_tags:
+            try: obj.RemoveObserver(tag)
+            except Exception: pass
+        self._clip_obs_tags = []
+        self._clip_nodes = list(clip_nodes) if clip_nodes else []
+        self._refresh_clip_planes()
+        # Observe each for updates so dragging / moving the plane
+        # triggers a re-render.
+        for n in self._clip_nodes:
+            try:
+                tag = n.AddObserver(vtk.vtkCommand.ModifiedEvent,
+                                    self._on_clip_modified)
+                self._clip_obs_tags.append((n, tag))
+            except Exception:
+                pass
+        self.rw.Render()
+
+    def _on_clip_modified(self, caller, event):
+        if self._disposed:
+            return
+        try:
+            self._refresh_clip_planes()
+            self.rw.Render()
+        except Exception as e:
+            print(f"clip modified: {e}")
+
+    def _refresh_clip_planes(self):
+        """Read origin + normal from each clip node; rebuild the
+        (nx, ny, nz, offset) tuples where offset = -dot(origin, normal)
+        (shader uses `dot(wp, n) + offset >= 0` for 'keep side')."""
+        planes = []
+        for n in getattr(self, "_clip_nodes", []):
+            try:
+                origin = list(n.GetOrigin())
+                normal = list(n.GetNormal())
+                nlen = (normal[0]**2 + normal[1]**2 + normal[2]**2) ** 0.5
+                if nlen < 1e-6:
+                    continue
+                normal = [x / nlen for x in normal]
+                offset = -(origin[0] * normal[0]
+                           + origin[1] * normal[1]
+                           + origin[2] * normal[2])
+                planes.append((normal[0], normal[1], normal[2], offset))
+                if len(planes) >= 8:
+                    break
+            except Exception:
+                continue
+        self._clip_planes = planes
+
     def set_grid_transform(self, grid_node):
         """Attach a vtkMRMLGridTransformNode as the scene-wide warp. Pass
         None to detach. The bridge observes the node for Modified + transform
@@ -1977,6 +2711,27 @@ class WgpuVolumeBridge:
             print(f"WgpuVolumeBridge grid-modified: {e}")
 
     # ---------------- Segmentation support ----------------
+
+    def set_rgba_carve(self, rgba_field, segment_label_values,
+                       point_world, radius_mm):
+        """Configure segment-aware sphere carving for an RGBAVolumeField.
+
+        At sample time, voxels whose label value is in
+        `segment_label_values` AND whose world position lies inside the
+        sphere (`point_world`, `radius_mm`) drop out of compositing.
+        Up to 8 label values supported. radius_mm <= 0 disables carving.
+
+        Pure UBO update -- no pipeline rebuild, so this is cheap to call
+        on every markup-point drag.
+        """
+        if rgba_field is None:
+            return
+        ids = [int(v) for v in (segment_label_values or [])][:8]
+        rgba_field.carve_segment_label_values = ids
+        rgba_field.carve_center_world = np.asarray(
+            point_world, dtype=np.float32).reshape(3)
+        rgba_field.carve_radius_mm = float(max(radius_mm, 0.0))
+        self.rw.Render()
 
     def set_segment_render_mode(self, mode):
         """Switch between the two segment shaders:
@@ -2341,6 +3096,150 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 """
 
+    # ---- Surface-mode bake (Jump Flooding SDF + grown palette color) ----
+    #
+    # Three passes total: init seeds inside-boundary voxels (label > 0 with
+    # at least one label-0 neighbor) with their own coord + label; the JFA
+    # step pings ping-pong with offsets 2^(L-1), 2^(L-2), ..., 1 so each
+    # voxel ends up with its nearest inside-boundary seed; compose reads
+    # that seed back, computes the world-space distance, signs it by the
+    # voxel's own label, and looks up the palette to write (rgb, sdf_mm)
+    # into the rgba16float output. Total cost: O(log N) compute passes.
+    _BAKE_JFA_INIT_WGSL = """
+@group(0) @binding(0) var t_label: texture_3d<u32>;
+@group(0) @binding(1) var t_seed_dst: texture_storage_3d<rgba16float, write>;
+
+@compute @workgroup_size(8, 8, 4)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(t_seed_dst);
+    if (gid.x >= dims.x || gid.y >= dims.y || gid.z >= dims.z) { return; }
+    let v = vec3<i32>(gid);
+    let dims_i = vec3<i32>(dims);
+    let label_v = textureLoad(t_label, v, 0).r;
+
+    var seed = vec4<f32>(0.0, 0.0, 0.0, 0.0);  // w==0 means "no seed"
+    if (label_v > 0u) {
+        // Inside voxel. Boundary if any 6-face neighbor is label-0 (or OOB).
+        var is_b = false;
+        if (v.x == 0 ||
+            textureLoad(t_label, v + vec3<i32>(-1,0,0), 0).r == 0u) { is_b = true; }
+        if (!is_b && (v.x == dims_i.x - 1 ||
+            textureLoad(t_label, v + vec3<i32>(1,0,0), 0).r == 0u)) { is_b = true; }
+        if (!is_b && (v.y == 0 ||
+            textureLoad(t_label, v + vec3<i32>(0,-1,0), 0).r == 0u)) { is_b = true; }
+        if (!is_b && (v.y == dims_i.y - 1 ||
+            textureLoad(t_label, v + vec3<i32>(0,1,0), 0).r == 0u)) { is_b = true; }
+        if (!is_b && (v.z == 0 ||
+            textureLoad(t_label, v + vec3<i32>(0,0,-1), 0).r == 0u)) { is_b = true; }
+        if (!is_b && (v.z == dims_i.z - 1 ||
+            textureLoad(t_label, v + vec3<i32>(0,0,1), 0).r == 0u)) { is_b = true; }
+        if (is_b) { seed = vec4<f32>(vec3<f32>(v), f32(label_v)); }
+    }
+    textureStore(t_seed_dst, v, seed);
+}
+"""
+
+    _BAKE_JFA_STEP_WGSL = """
+@group(0) @binding(0) var t_seed_src: texture_3d<f32>;
+@group(0) @binding(1) var t_seed_dst: texture_storage_3d<rgba16float, write>;
+
+struct StepParams {
+    step_k: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+@group(0) @binding(2) var<uniform> u_params: StepParams;
+
+@compute @workgroup_size(8, 8, 4)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(t_seed_dst);
+    if (gid.x >= dims.x || gid.y >= dims.y || gid.z >= dims.z) { return; }
+    let v = vec3<i32>(gid);
+    let v_pos = vec3<f32>(v);
+    let k = i32(u_params.step_k);
+    let dims_i = vec3<i32>(dims);
+
+    var best = textureLoad(t_seed_src, v, 0);
+    var best_d2 = 1e30;
+    if (best.w > 0.5) {
+        let d = best.xyz - v_pos;
+        best_d2 = dot(d, d);
+    }
+
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                if (dx == 0 && dy == 0 && dz == 0) { continue; }
+                let nv = v + vec3<i32>(dx, dy, dz) * k;
+                if (any(nv < vec3<i32>(0)) || any(nv >= dims_i)) { continue; }
+                let s = textureLoad(t_seed_src, nv, 0);
+                if (s.w < 0.5) { continue; }
+                let d = s.xyz - v_pos;
+                let d2 = dot(d, d);
+                if (d2 < best_d2) {
+                    best = s;
+                    best_d2 = d2;
+                }
+            }
+        }
+    }
+    textureStore(t_seed_dst, v, best);
+}
+"""
+
+    _BAKE_JFA_COMPOSE_WGSL = """
+@group(0) @binding(0) var t_seed: texture_3d<f32>;
+@group(0) @binding(1) var t_dst: texture_storage_3d<rgba16float, write>;
+@group(0) @binding(2) var t_label: texture_3d<u32>;
+
+struct Palette {
+    entries: array<vec4<f32>, 256>,
+};
+@group(0) @binding(3) var<uniform> u_palette: Palette;
+
+struct ComposeParams {
+    // tex (0..1) -> world (mm). Maps voxel-center tex coord to a world point.
+    output_to_world: mat4x4<f32>,
+};
+@group(0) @binding(4) var<uniform> u_cp: ComposeParams;
+
+@compute @workgroup_size(8, 8, 4)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(t_dst);
+    if (gid.x >= dims.x || gid.y >= dims.y || gid.z >= dims.z) { return; }
+    let v = vec3<i32>(gid);
+    let v_pos = vec3<f32>(v);
+    let dims_f = vec3<f32>(dims);
+
+    let seed = textureLoad(t_seed, v, 0);
+    let label_v = textureLoad(t_label, v, 0).r;
+    let v_tex = (v_pos + vec3<f32>(0.5)) / dims_f;
+    let v_world4 = u_cp.output_to_world * vec4<f32>(v_tex, 1.0);
+    let v_world = v_world4.xyz / v_world4.w;
+
+    var sdf_mm: f32 = 0.0;
+    var rgb = vec3<f32>(0.0);
+
+    if (seed.w > 0.5) {
+        let s_tex = (seed.xyz + vec3<f32>(0.5)) / dims_f;
+        let s_world4 = u_cp.output_to_world * vec4<f32>(s_tex, 1.0);
+        let s_world = s_world4.xyz / s_world4.w;
+        let dist_mm = length(v_world - s_world);
+        let sgn = select(1.0, -1.0, label_v > 0u);
+        sdf_mm = sgn * dist_mm;
+        let li = min(u32(seed.w), 255u);
+        rgb = u_palette.entries[li].rgb;
+    } else {
+        // No seed found anywhere -- volume has no segments, or JFA passes
+        // didn't reach this voxel. Push SDF beyond any reasonable band so
+        // the shader's outside-band fast-path culls this sample.
+        sdf_mm = select(1e3, -1e3, label_v > 0u);
+    }
+    textureStore(t_dst, v, vec4<f32>(rgb, sdf_mm));
+}
+"""
+
     _BAKE_MODULATE_WGSL = """
 // Final pass: multiply alpha by normalized source-volume intensity.
 // Produces the same end-result as ColorizeVolume's CPU pipeline step
@@ -2457,34 +3356,127 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             size=128,  # two mat4x4<f32> = 2 * 64
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
+        # ---- JFA pipelines (surface-mode SDF + grown color) ----
+        # Pipeline: JFA init -- read t_label, write seeds where label>0 has
+        # a label-0 face neighbor.
+        jfa_init_shader = self.device.create_shader_module(
+            code=self._BAKE_JFA_INIT_WGSL)
+        self._bake_jfa_init_bgl = self.device.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE,
+             "texture": {"sample_type": wgpu.TextureSampleType.uint,
+                         "view_dimension": wgpu.TextureViewDimension.d3,
+                         "multisampled": False}},
+            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE,
+             "storage_texture": {"access": wgpu.StorageTextureAccess.write_only,
+                                 "format": wgpu.TextureFormat.rgba16float,
+                                 "view_dimension": wgpu.TextureViewDimension.d3}},
+        ])
+        self._bake_jfa_init_pipeline = self.device.create_compute_pipeline(
+            layout=self.device.create_pipeline_layout(
+                bind_group_layouts=[self._bake_jfa_init_bgl]),
+            compute={"module": jfa_init_shader, "entry_point": "main"})
+
+        # Pipeline: JFA step -- ping-pong propagation of seeds. Reads
+        # rgba16float seed source, writes rgba16float seed dest.
+        jfa_step_shader = self.device.create_shader_module(
+            code=self._BAKE_JFA_STEP_WGSL)
+        self._bake_jfa_step_bgl = self.device.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE,
+             "texture": {"sample_type": wgpu.TextureSampleType.unfilterable_float,
+                         "view_dimension": wgpu.TextureViewDimension.d3,
+                         "multisampled": False}},
+            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE,
+             "storage_texture": {"access": wgpu.StorageTextureAccess.write_only,
+                                 "format": wgpu.TextureFormat.rgba16float,
+                                 "view_dimension": wgpu.TextureViewDimension.d3}},
+            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE,
+             "buffer": {"type": wgpu.BufferBindingType.uniform}},
+        ])
+        self._bake_jfa_step_pipeline = self.device.create_compute_pipeline(
+            layout=self.device.create_pipeline_layout(
+                bind_group_layouts=[self._bake_jfa_step_bgl]),
+            compute={"module": jfa_step_shader, "entry_point": "main"})
+
+        # Pipeline: JFA compose -- read final seed + label + palette,
+        # write (rgb, sdf_mm) into the rgba volume.
+        jfa_compose_shader = self.device.create_shader_module(
+            code=self._BAKE_JFA_COMPOSE_WGSL)
+        self._bake_jfa_compose_bgl = self.device.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE,
+             "texture": {"sample_type": wgpu.TextureSampleType.unfilterable_float,
+                         "view_dimension": wgpu.TextureViewDimension.d3,
+                         "multisampled": False}},
+            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE,
+             "storage_texture": {"access": wgpu.StorageTextureAccess.write_only,
+                                 "format": wgpu.TextureFormat.rgba16float,
+                                 "view_dimension": wgpu.TextureViewDimension.d3}},
+            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE,
+             "texture": {"sample_type": wgpu.TextureSampleType.uint,
+                         "view_dimension": wgpu.TextureViewDimension.d3,
+                         "multisampled": False}},
+            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE,
+             "buffer": {"type": wgpu.BufferBindingType.uniform}},
+            {"binding": 4, "visibility": wgpu.ShaderStage.COMPUTE,
+             "buffer": {"type": wgpu.BufferBindingType.uniform}},
+        ])
+        self._bake_jfa_compose_pipeline = self.device.create_compute_pipeline(
+            layout=self.device.create_pipeline_layout(
+                bind_group_layouts=[self._bake_jfa_compose_bgl]),
+            compute={"module": jfa_compose_shader, "entry_point": "main"})
+
+        self._bake_jfa_step_ubo = self.device.create_buffer(
+            size=16,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+        self._bake_jfa_compose_ubo = self.device.create_buffer(
+            size=64,  # mat4x4<f32>
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+
     def _run_bake(self, rgba_field):
-        """Dispatch the Colorize bake into rgba_field.tex.
+        """Dispatch the bake into rgba_field.tex.
         Assumes rgba_field holds cached `_label_tex`, `_output_to_world`,
         `_world_to_label_tex`, `sigma_voxels`, and that the palette UBO
         is already up to date.
 
-        If `rgba_field._ct_tex is None` the CT modulate pass is skipped
-        (surface mode -- alpha stays as the palette-opacity-scaled smoothed
-        presence). Pass parity is flipped so the final result is always in
-        `rgba_field.tex`, regardless of whether modulate runs:
+        Density mode (`rgba_field._ct_tex is not None`): the existing
+        ColorizeVolume schedule -- resample on output grid, separable
+        Gaussian on alpha, multiply by normalized CT.
 
-            modulate=TRUE  (colorize, 4 GPU passes):
-                init tex <- label|palette
-                smooth X:  tex     -> scratch
-                smooth Y:  scratch -> tex
-                smooth Z:  tex     -> scratch
-                modulate:  scratch -> tex      (alpha *= ct_norm)
+            init  -> tex
+            smX   -> scratch
+            smY   -> tex
+            smZ   -> scratch
+            mod   -> tex                (alpha *= ct_norm)
 
-            modulate=FALSE (surface, 3 GPU passes):
-                init scratch <- label|palette
-                smooth X:  scratch -> tex
-                smooth Y:  tex     -> scratch
-                smooth Z:  scratch -> tex
+        Surface mode (CT not loaded): Jump-Flooding-Algorithm SDF +
+        grown palette color, run on the labelmap's own grid (rgba volume
+        is allocated to (lx, ly, lz) in this mode). One init pass seeds
+        every inside-boundary voxel with its own coord + label, then
+        ceil(log2(max_dim)) ping-pong steps propagate seeds; a final
+        compose writes (rgb, sdf_mm) into rgba_field.tex. Storage cost:
+        the existing `tex` and `scratch_tex` are reused as JFA seed
+        ping-pong; no extra allocation.
+
+            init      -> scratch
+            steps...  -> tex/scratch (ping-pong, parity controlled
+                                      to land in `scratch`)
+            compose   -> tex
         """
         self._ensure_bake_pipelines()
         import math, struct as _st
         dx, dy, dz = rgba_field.dims
-        modulate = rgba_field._ct_tex is not None
+        surface_mode = rgba_field._ct_tex is None
+
+        wg_x, wg_y, wg_z = 8, 8, 4
+        groups = ((dx + wg_x - 1) // wg_x,
+                  (dy + wg_y - 1) // wg_y,
+                  (dz + wg_z - 1) // wg_z)
+
+        if surface_mode:
+            self._run_bake_surface(rgba_field, groups)
+            return
+
+        # ---------------------- Density-mode bake ----------------------
+        modulate = True
 
         # Resample params UBO: output_to_world then world_to_label_tex,
         # both column-major so the transpose matches WGSL.
@@ -2496,7 +3488,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.device.queue.write_buffer(
             self._bake_resample_ubo, 0, rparams.tobytes())
 
-        # Smooth params (one UBO per axis)
         sigma = max(float(rgba_field.sigma_voxels), 0.25)
         radius = max(int(math.ceil(3.0 * sigma)), 1)
         for axis in range(3):
@@ -2507,40 +3498,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             self.device.queue.write_buffer(
                 self._bake_smooth_ubos[axis], 0, bytes(sbuf))
 
-        # Modulate params (only used when modulate=True)
-        if modulate:
-            mbuf = bytearray(16)
-            _st.pack_into("<f", mbuf, 0, float(rgba_field.window_min))
-            _st.pack_into("<f", mbuf, 4,
-                          float(rgba_field.window_max - rgba_field.window_min))
-            self.device.queue.write_buffer(self._bake_mod_ubo, 0, bytes(mbuf))
-
-        wg_x, wg_y, wg_z = 8, 8, 4
-        groups = ((dx + wg_x - 1) // wg_x,
-                  (dy + wg_y - 1) // wg_y,
-                  (dz + wg_z - 1) // wg_z)
+        mbuf = bytearray(16)
+        _st.pack_into("<f", mbuf, 0, float(rgba_field.window_min))
+        _st.pack_into("<f", mbuf, 4,
+                      float(rgba_field.window_max - rgba_field.window_min))
+        self.device.queue.write_buffer(self._bake_mod_ubo, 0, bytes(mbuf))
 
         encoder = self.device.create_command_encoder()
+        init_dst = rgba_field.tex
+        smooth_steps = [
+            (rgba_field.tex,         rgba_field.scratch_tex, 0),
+            (rgba_field.scratch_tex, rgba_field.tex,         1),
+            (rgba_field.tex,         rgba_field.scratch_tex, 2),
+        ]
 
-        # Pick init target + smooth schedule so the final result ends in
-        # rgba_field.tex after the pass count we actually run (4 for
-        # colorize, 3 for surface).
-        if modulate:
-            init_dst = rgba_field.tex
-            smooth_steps = [
-                (rgba_field.tex,         rgba_field.scratch_tex, 0),
-                (rgba_field.scratch_tex, rgba_field.tex,         1),
-                (rgba_field.tex,         rgba_field.scratch_tex, 2),
-            ]
-        else:
-            init_dst = rgba_field.scratch_tex
-            smooth_steps = [
-                (rgba_field.scratch_tex, rgba_field.tex,         0),
-                (rgba_field.tex,         rgba_field.scratch_tex, 1),
-                (rgba_field.scratch_tex, rgba_field.tex,         2),
-            ]
-
-        # Pass 1: resample labelmap + palette
         bg = self.device.create_bind_group(
             layout=self._bake_init_bgl, entries=[
                 {"binding": 0, "resource": rgba_field._label_tex.create_view()},
@@ -2571,18 +3542,167 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             p.dispatch_workgroups(*groups)
             p.end()
 
-        if modulate:
-            # Final pass: scratch -> tex with alpha *= ct_norm
+        bg = self.device.create_bind_group(
+            layout=self._bake_modulate_bgl, entries=[
+                {"binding": 0, "resource": rgba_field.scratch_tex.create_view()},
+                {"binding": 1, "resource": rgba_field.tex.create_view()},
+                {"binding": 2, "resource": rgba_field._ct_tex.create_view()},
+                {"binding": 3, "resource": {
+                    "buffer": self._bake_mod_ubo, "offset": 0, "size": 16}},
+            ])
+        p = encoder.begin_compute_pass()
+        p.set_pipeline(self._bake_modulate_pipeline)
+        p.set_bind_group(0, bg, [], 0, 0)
+        p.dispatch_workgroups(*groups)
+        p.end()
+
+        self.device.queue.submit([encoder.finish()])
+
+    def _run_bake_surface(self, rgba_field, groups):
+        """Surface-mode bake: GPU JFA over rgba_field._label_tex on the
+        labelmap grid, producing (rgb, sdf_mm) in rgba_field.tex.
+
+        Pass schedule:
+          1. Init: seeds every inside-boundary voxel into rgba_field.scratch.
+          2. JFA steps (ceil(log2(N)) + 1 + parity, ODD count chosen so
+             the final seed write lands in `tex` -- compose then reads
+             tex and writes scratch.
+          3. Compose: read seeds, write (rgb, sdf_mm) into scratch.
+          4. Three separable Gaussian passes on the .a channel (rgb is
+             copied through unchanged) to round off the equidistant
+             ridges where neighboring boundary seeds meet:
+                 scratch -> tex   (X)
+                 tex     -> scratch (Y)
+                 scratch -> tex   (Z)
+        Final result lands in rgba_field.tex.
+        """
+        import math, struct as _st
+        dx, dy, dz = rgba_field.dims
+
+        # Compose params UBO: output_to_world (tex 0..1 -> world mm).
+        # In surface mode rgba_field.patient_to_texture maps world -> tex,
+        # so output_to_world is its inverse.
+        p2t = np.asarray(rgba_field.patient_to_texture, dtype=np.float64)
+        try:
+            output_to_world = np.linalg.inv(p2t)
+        except np.linalg.LinAlgError:
+            output_to_world = np.eye(4, dtype=np.float64)
+        cp = np.asarray(output_to_world, dtype=np.float32).T.ravel()
+        self.device.queue.write_buffer(
+            self._bake_jfa_compose_ubo, 0, cp.tobytes())
+
+        # Smooth params: separable Gaussian on the SDF .a channel. Sigma
+        # in voxels of the rgba grid (= labelmap grid in surface mode).
+        sdf_sigma = max(float(getattr(rgba_field,
+                                      "sdf_smooth_sigma_voxels", 1.0)),
+                        0.25)
+        sdf_radius = max(int(math.ceil(3.0 * sdf_sigma)), 1)
+        for axis in range(3):
+            sbuf = bytearray(16)
+            _st.pack_into("<f", sbuf, 0, sdf_sigma)
+            _st.pack_into("<I", sbuf, 4, axis)
+            _st.pack_into("<I", sbuf, 8, sdf_radius)
+            self.device.queue.write_buffer(
+                self._bake_smooth_ubos[axis], 0, bytes(sbuf))
+
+        encoder = self.device.create_command_encoder()
+
+        # JFA init -- seed every inside-boundary voxel into scratch.
+        bg = self.device.create_bind_group(
+            layout=self._bake_jfa_init_bgl, entries=[
+                {"binding": 0, "resource": rgba_field._label_tex.create_view()},
+                {"binding": 1, "resource": rgba_field.scratch_tex.create_view()},
+            ])
+        p = encoder.begin_compute_pass()
+        p.set_pipeline(self._bake_jfa_init_pipeline)
+        p.set_bind_group(0, bg, [], 0, 0)
+        p.dispatch_workgroups(*groups)
+        p.end()
+
+        # JFA steps. Ping-pong scratch <-> tex. We want final seeds in
+        # `tex` so compose reads tex and writes scratch (different
+        # textures -> no aliasing in the bind group). Init wrote to
+        # scratch and each step swaps, so an ODD step count lands the
+        # final write in tex.
+        max_dim = max(dx, dy, dz)
+        ks = []
+        k = max(max_dim // 2, 1)
+        while k >= 1:
+            ks.append(k)
+            if k == 1:
+                break
+            k = max(k // 2, 1)
+        ks.append(1)  # extra k=1 pass: cleans up missed corners
+        if len(ks) % 2 == 0:
+            ks.append(1)  # parity pad: enforce odd count so seeds end in tex
+
+        step_ubos = []
+        for k_val in ks:
+            ubo = self.device.create_buffer(
+                size=16,
+                usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+            sbuf = bytearray(16)
+            _st.pack_into("<I", sbuf, 0, int(k_val))
+            self.device.queue.write_buffer(ubo, 0, bytes(sbuf))
+            step_ubos.append(ubo)
+
+        src = rgba_field.scratch_tex
+        dst = rgba_field.tex
+        for k_val, ubo in zip(ks, step_ubos):
             bg = self.device.create_bind_group(
-                layout=self._bake_modulate_bgl, entries=[
-                    {"binding": 0, "resource": rgba_field.scratch_tex.create_view()},
-                    {"binding": 1, "resource": rgba_field.tex.create_view()},
-                    {"binding": 2, "resource": rgba_field._ct_tex.create_view()},
-                    {"binding": 3, "resource": {
-                        "buffer": self._bake_mod_ubo, "offset": 0, "size": 16}},
+                layout=self._bake_jfa_step_bgl, entries=[
+                    {"binding": 0, "resource": src.create_view()},
+                    {"binding": 1, "resource": dst.create_view()},
+                    {"binding": 2, "resource": {
+                        "buffer": ubo, "offset": 0, "size": 16}},
                 ])
             p = encoder.begin_compute_pass()
-            p.set_pipeline(self._bake_modulate_pipeline)
+            p.set_pipeline(self._bake_jfa_step_pipeline)
+            p.set_bind_group(0, bg, [], 0, 0)
+            p.dispatch_workgroups(*groups)
+            p.end()
+            src, dst = dst, src
+        final_seed_tex = src  # = rgba_field.tex after odd N
+
+        # Compose: read final seeds + labelmap + palette, write (rgb, sdf)
+        # into scratch_tex (so the smoothing chain ends in tex).
+        bg = self.device.create_bind_group(
+            layout=self._bake_jfa_compose_bgl, entries=[
+                {"binding": 0, "resource": final_seed_tex.create_view()},
+                {"binding": 1, "resource": rgba_field.scratch_tex.create_view()},
+                {"binding": 2, "resource": rgba_field._label_tex.create_view()},
+                {"binding": 3, "resource": {
+                    "buffer": self._bake_palette_ubo, "offset": 0,
+                    "size": 4096}},
+                {"binding": 4, "resource": {
+                    "buffer": self._bake_jfa_compose_ubo,
+                    "offset": 0, "size": 64}},
+            ])
+        p = encoder.begin_compute_pass()
+        p.set_pipeline(self._bake_jfa_compose_pipeline)
+        p.set_bind_group(0, bg, [], 0, 0)
+        p.dispatch_workgroups(*groups)
+        p.end()
+
+        # Smooth the SDF: 3 separable passes (X, Y, Z). The smooth shader
+        # copies rgb from the center tap and writes the smoothed alpha,
+        # so the grown segment color is preserved.
+        smooth_steps = [
+            (rgba_field.scratch_tex, rgba_field.tex,         0),
+            (rgba_field.tex,         rgba_field.scratch_tex, 1),
+            (rgba_field.scratch_tex, rgba_field.tex,         2),
+        ]
+        for src_tex, dst_tex, axis in smooth_steps:
+            bg = self.device.create_bind_group(
+                layout=self._bake_smooth_bgl, entries=[
+                    {"binding": 0, "resource": src_tex.create_view()},
+                    {"binding": 1, "resource": dst_tex.create_view()},
+                    {"binding": 2, "resource": {
+                        "buffer": self._bake_smooth_ubos[axis],
+                        "offset": 0, "size": 16}},
+                ])
+            p = encoder.begin_compute_pass()
+            p.set_pipeline(self._bake_smooth_pipeline)
             p.set_bind_group(0, bg, [], 0, 0)
             p.dispatch_workgroups(*groups)
             p.end()
@@ -2643,9 +3763,124 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 return None
         return first
 
+    def add_fiber_rendering(self, reference_volume_node,
+                            peak_textures,          # list of K wgpu.GPUTexture
+                            bundle_id_texture,      # wgpu.GPUTexture r8uint 3D
+                            bundle_palette,         # (256, 4) uint8
+                            category_palette,       # (256, 4) uint8
+                            bundle_to_category,     # (256,) uint8
+                            dims,                   # (dx, dy, dz) of peak tex
+                            tex_to_world,           # 4x4 tex->world (world units)
+                            rod_radius_mm=0.15,
+                            rod_pitch_mm=0.55,
+                            opacity=1.0,
+                            direction_mix=0.0,
+                            network_mix=0.0,
+                            num_peaks=4):
+        """Install a FiberGrainField by adopting pre-voxelized GPU textures.
+
+        The companion voxelizer (FiberRendering module in SlicerDMRI)
+        produces `peak_textures` and `bundle_id_texture` on the same
+        wgpu device; passing them in directly avoids a GPU->CPU->GPU
+        readback/upload of ~hundreds of MB.
+
+        `dims` and `tex_to_world` describe the peak/bundle-id volumes'
+        grid, which may be coarser than the reference volume (see
+        max_dim in the voxelizer).
+        """
+        if len(peak_textures) != num_peaks:
+            raise ValueError(
+                f"expected {num_peaks} peak textures, got {len(peak_textures)}")
+
+        dx, dy, dz = dims
+        tex_to_world = np.asarray(tex_to_world, dtype=np.float64)
+        world_to_tex = np.linalg.inv(tex_to_world)
+
+        fib = FiberGrainField(self.device, num_peaks=num_peaks)
+
+        # Adopt the pre-voxelized GPU textures.
+        for k, t in enumerate(peak_textures):
+            fib.peak_texs[k] = t
+            fib.peak_views[k] = t.create_view()
+        fib.bundle_id_tex = bundle_id_texture
+        fib.bundle_id_view = bundle_id_texture.create_view()
+
+        # Allocate palettes + sampler only (peaks + bundle_id already
+        # present). Build palettes manually to avoid re-allocating peaks.
+        fib.sampler = self.device.create_sampler(
+            mag_filter=wgpu.FilterMode.linear,
+            min_filter=wgpu.FilterMode.linear,
+            address_mode_u=wgpu.AddressMode.clamp_to_edge,
+            address_mode_v=wgpu.AddressMode.clamp_to_edge,
+            address_mode_w=wgpu.AddressMode.clamp_to_edge)
+        fib.palette_tex = self.device.create_texture(
+            size=(256, 1, 1), dimension="1d",
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+        fib.palette_view = fib.palette_tex.create_view()
+        fib.category_palette_tex = self.device.create_texture(
+            size=(256, 1, 1), dimension="1d",
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+        fib.category_palette_view = fib.category_palette_tex.create_view()
+        fib.bundle_to_category_tex = self.device.create_texture(
+            size=(256, 1, 1), dimension="1d",
+            format=wgpu.TextureFormat.r8uint,
+            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+        fib.bundle_to_category_view = fib.bundle_to_category_tex.create_view()
+        fib.dims = (dx, dy, dz)
+
+        fib.write_palette(bundle_palette)
+        fib.write_category_palette(category_palette)
+        fib.write_bundle_to_category(bundle_to_category)
+
+        fib.patient_to_texture = world_to_tex.astype(np.float32)
+        parent = reference_volume_node.GetParentTransformNode()
+        if parent is not None:
+            pm = vtk.vtkMatrix4x4()
+            parent.GetMatrixTransformToWorld(pm)
+            fib.world_from_local = np.array(
+                [[pm.GetElement(i, j) for j in range(4)] for i in range(4)],
+                dtype=np.float32)
+        # Bounds from 8 corners in world space.
+        corners = np.array([
+            [0, 0, 0, 1], [1, 0, 0, 1], [0, 1, 0, 1], [1, 1, 0, 1],
+            [0, 0, 1, 1], [1, 0, 1, 1], [0, 1, 1, 1], [1, 1, 1, 1],
+        ], dtype=np.float64).T
+        world_corners = (tex_to_world @ corners)[:3].T
+        wfl = np.asarray(fib.world_from_local, dtype=np.float64)
+        world_corners_h = np.hstack([world_corners, np.ones((8, 1))])
+        world_corners_w = (wfl @ world_corners_h.T).T[:, :3]
+        fib._bounds = (world_corners_w.min(axis=0).astype(np.float32),
+                       world_corners_w.max(axis=0).astype(np.float32))
+
+        ct_img = reference_volume_node.GetImageData()
+        spacing = ct_img.GetSpacing()
+        # voxel_mm in the bake grid (may be coarser than CT).
+        vox_mm_iso = float((tex_to_world[:3, :3] @ np.array(
+            [1.0/dx, 1.0/dy, 1.0/dz])).__abs__().mean())
+        if vox_mm_iso <= 0.0:
+            vox_mm_iso = float(min(spacing))
+        fib._voxel_mm = vox_mm_iso
+        # Tighter ray step: thin rods alias at 0.5 * vox_mm. Clamp to a
+        # sane floor so we don't blow up the frame on huge volumes.
+        fib.sample_step_mm = max(vox_mm_iso * 0.25, 0.1)
+        fib.opacity_unit_distance = max(vox_mm_iso * 5.0, 1.0)
+        fib.rod_radius_mm = float(rod_radius_mm)
+        fib.rod_pitch_mm = float(rod_pitch_mm)
+        fib.opacity = float(opacity)
+        fib.direction_mix = float(direction_mix)
+        fib.network_mix = float(network_mix)
+
+        self._fiber_fields.append(fib)
+        self._rebuild_pipeline()
+        self.rw.Render()
+        return fib
+
     def add_colorize_volume(self, volume_node, segmentation_node,
                             sigma_voxels=1.5, window_level=None,
-                            modulate_by_ct=True):
+                            modulate_by_ct=True,
+                            carve_dilate_voxels=None):
         """Bake a ColorizeVolume-style RGBA 3D texture on the GPU and install
         it as a new RGBAVolumeField. All steps (labelmap resample + palette
         LUT, separable Gaussian on alpha, alpha * normalized-CT) run in
@@ -2815,6 +4050,37 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if label_node_to_delete is not None:
             slicer.mrmlScene.RemoveNode(label_node_to_delete)
 
+        # Dilated labelmap for carving. The bake's Gaussian spreads each
+        # segment's alpha ~2*sigma voxels into nominally-blank (label-0)
+        # territory; without dilation, the carve sphere only nulls samples
+        # whose exact labelmap voxel is in the carve set, so the soft
+        # halo at segment boundaries survives the cut. Grow each non-zero
+        # label into adjacent zero voxels by dilate_voxels (max-filter,
+        # preserving existing labels) so the carve check picks up that
+        # halo too. The bake's init pass keeps reading the un-dilated
+        # labelmap so segment shapes in the rendered output don't grow.
+        if carve_dilate_voxels is None:
+            carve_dilate_voxels = int(round(2.0 * float(sigma_voxels)))
+        carve_dilate_voxels = max(int(carve_dilate_voxels), 0)
+        if carve_dilate_voxels > 0:
+            from scipy.ndimage import maximum_filter
+            size = 2 * carve_dilate_voxels + 1
+            grown = maximum_filter(label_u8, size=size)
+            carve_u8 = np.ascontiguousarray(
+                np.where(label_u8 == 0, grown, label_u8).astype(np.uint8))
+            label_carve_tex = self.device.create_texture(
+                size=(lx, ly, lz), dimension="3d",
+                format=wgpu.TextureFormat.r8uint,
+                usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
+            self.device.queue.write_texture(
+                {"texture": label_carve_tex, "mip_level": 0,
+                 "origin": (0, 0, 0)},
+                carve_u8,
+                {"offset": 0, "bytes_per_row": lx, "rows_per_image": ly},
+                (lx, ly, lz))
+        else:
+            label_carve_tex = label_tex
+
         # Palette + RGBA field ----------------------------------------------
         palette = self._build_palette_array(segmentation_node)
         self._ensure_bake_pipelines()
@@ -2822,9 +4088,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             self._bake_palette_ubo, 0,
             np.ascontiguousarray(palette).tobytes())
 
+        # Surface mode allocates the rgba volume on the labelmap's own
+        # grid: the JFA SDF reads t_label directly, so resampling to the
+        # CT grid would just add a pass and consume more memory. Density
+        # mode keeps the CT grid because the modulate pass needs the CT.
         rgba_field = RGBAVolumeField(self.device)
-        rgba_field.allocate(dx, dy, dz)
-        rgba_field.patient_to_texture = world_to_output_tex.astype(np.float32)
+        if modulate_by_ct:
+            rgba_field.allocate(dx, dy, dz)
+            rgba_field.patient_to_texture = world_to_output_tex.astype(np.float32)
+            field_corner_to_world = output_to_world
+        else:
+            rgba_field.allocate(lx, ly, lz)
+            rgba_field.patient_to_texture = world_to_label_tex.astype(np.float32)
+            field_corner_to_world = label_tex_to_world
         parent = volume_node.GetParentTransformNode()
         if parent is not None:
             pm = vtk.vtkMatrix4x4()
@@ -2836,7 +4112,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             [0, 0, 0, 1], [1, 0, 0, 1], [0, 1, 0, 1], [1, 1, 0, 1],
             [0, 0, 1, 1], [1, 0, 1, 1], [0, 1, 1, 1], [1, 1, 1, 1],
         ], dtype=np.float64).T
-        world_corners = (output_to_world @ corners)[:3].T
+        world_corners = (field_corner_to_world @ corners)[:3].T
         wfl = rgba_field.world_from_local.astype(np.float64)
         world_corners_h = np.hstack([world_corners, np.ones((8, 1))])
         world_corners_w = (wfl @ world_corners_h.T).T[:, :3]
@@ -2847,6 +4123,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         vox = float(min(spacing))
         rgba_field.sample_step_mm = max(vox * 0.5, 0.1)
         rgba_field.opacity_unit_distance = max(vox * 5.0, 1.0)
+        # Density mode: gradient stencil width for the multi-tap smoothing.
+        # Surface mode: alpha-from-SDF transition band thickness in mm.
+        rgba_field.gradient_h_mm = max(vox * 1.5, rgba_field.sample_step_mm)
+        rgba_field.band_mm = max(vox * 1.5, rgba_field.sample_step_mm)
 
         # Cache on the field so rebakes don't re-upload CT + label.
         # For surface mode _ct_tex is None -- _run_bake uses its presence
@@ -2854,6 +4134,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         # schedules and leaves the result in rgba_field.tex either way.
         rgba_field._ct_tex = ct_tex
         rgba_field._label_tex = label_tex
+        rgba_field._label_carve_tex = label_carve_tex
+        # Bound for the carve check; either the dilated copy or, when
+        # carve_dilate_voxels=0, an alias of the bake labelmap.
+        rgba_field._label_tex_view = label_carve_tex.create_view()
         rgba_field._output_to_world = output_to_world
         rgba_field._world_to_label_tex = world_to_label_tex
         rgba_field.sigma_voxels = float(sigma_voxels)
@@ -2986,7 +4270,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     def _wgpu_render(self, w, h, proj_inv, view_inv):
         if self._pipeline is None or (not self._fields and not self._segments
-                                      and not self._rgba_volumes):
+                                      and not self._rgba_volumes
+                                      and not self._fiber_fields):
             return np.zeros((h, w, 4), dtype=np.uint8)
         self._ensure_target(w, h)
 
@@ -2999,9 +4284,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         visible_fields = [f for f in self._fields if f.visible]
         visible_segs = [s for s in self._segments if s.visible]
         visible_rgba = [r for r in self._rgba_volumes if r.visible]
+        visible_fiber = [f for f in self._fiber_fields if f.visible]
         src = (visible_fields or self._fields) \
               + (visible_segs or self._segments) \
-              + (visible_rgba or self._rgba_volumes)
+              + (visible_rgba or self._rgba_volumes) \
+              + (visible_fiber or self._fiber_fields)
         boxes = [r.aabb() for r in src]
         boxes = [b for b in boxes if b is not None]
         if boxes:
@@ -3018,7 +4305,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             self._mat_ubo, 0, _pack_material(
                 self._fields, self._segments, self._rgba_volumes,
                 bmin, bmax, step,
-                grid_p2t=self._grid_p2t, grid_gain=self._grid_gain))
+                fiber_fields=self._fiber_fields,
+                grid_p2t=self._grid_p2t, grid_gain=self._grid_gain,
+                clip_planes=self._clip_planes))
 
         enc = self.device.create_command_encoder()
         rp = enc.begin_render_pass(color_attachments=[{
@@ -3049,7 +4338,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             w, h = self.rw.GetSize()
             if w <= 0 or h <= 0 or (not self._fields
                                     and not self._segments
-                                    and not self._rgba_volumes):
+                                    and not self._rgba_volumes
+                                    and not self._fiber_fields):
                 return
             cam = caller.GetActiveCamera()
             aspect = w / h

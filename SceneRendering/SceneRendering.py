@@ -81,7 +81,7 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
         ("Injection: Multi-Volume (demo)",     "test_vtk_MultiVolume"),
         ("Injection: Landmark Deform (TPS)",   "test_vtk_LandmarkDeform"),
         ("Injection: Segmentation (paint)",    "test_vtk_Segmentation"),
-        ("Injection: Segment Surfaces",        "test_vtk_SegmentSurfaces"),
+        ("Injection: Segment Surface (Carving)", "test_vtk_SegmentSurfaces"),
         ("Injection: Colorize (RGBA)",         "test_vtk_ColorizeRGBA"),
     ]
     # Legacy DualView/pygfx tests.
@@ -653,6 +653,27 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             "segmentation": loaded.GetSegmentation(),
         }
         return loaded
+
+    @staticmethod
+    def _resolve_carve_label_values(seg_node, name_substrings):
+        """Map a list of segment-name substrings (case-insensitive) to the
+        labelmap values used on the GPU. Skips substrings that don't match
+        any segment so a partial match still carves something."""
+        seg = seg_node.GetSegmentation()
+        wanted = [s.lower() for s in name_substrings]
+        out = []
+        for i in range(seg.GetNumberOfSegments()):
+            sid = seg.GetNthSegmentID(i)
+            segment = seg.GetSegment(sid)
+            nm = (segment.GetName() or "").lower()
+            if any(w in nm for w in wanted):
+                try:
+                    lv = int(segment.GetLabelValue())
+                except Exception:
+                    lv = i + 1
+                if 0 < lv < 256:
+                    out.append(lv)
+        return out
 
     # ------------------------------------------------------------------
     # VTK-injection tests -- no DualView, wgpu renders directly into
@@ -1276,13 +1297,77 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         self.assertGreater(max(mx), 60,
             f"no surface-rendered output visible -- max_rgb={mx}")
 
+        # ------------------------------------------------------------------
+        # Carving: a single fiducial control point removes the liver, small
+        # bowel, and colon from compositing within a sphere whose radius is
+        # 3x the markup display radius -- enough to fully cut through them
+        # without overlapping the volume rendering's screen footprint.
+        # ------------------------------------------------------------------
+        carve_names = ("liver", "small bowel", "colon")
+        carve_ids = self._resolve_carve_label_values(seg, carve_names)
+        self.assertGreater(len(carve_ids), 0,
+            f"none of {carve_names} found in segmentation; "
+            f"available={[seg.GetSegmentation().GetNthSegmentID(i) for i in range(seg.GetSegmentation().GetNumberOfSegments())]}")
+
+        # Initial sphere center: roughly the volume center.
+        b = [0.0] * 6
+        vol.GetRASBounds(b)
+        center0 = ((b[0] + b[1]) * 0.5, (b[2] + b[3]) * 0.5, (b[4] + b[5]) * 0.5)
+
+        carve_node = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLMarkupsFiducialNode", "CarvePoint")
+        cdisp = carve_node.GetDisplayNode()
+        if cdisp is not None:
+            # Stable mm-sized glyph so 1.5x its diameter is a predictable
+            # carve. GlyphSize is interpreted as the marker's diameter,
+            # so the displayed radius is GlyphSize / 2.
+            cdisp.SetUseGlyphScale(False)
+            cdisp.SetGlyphSize(35.0)
+            cdisp.SetSelectedColor(1.0, 0.85, 0.0)
+        carve_node.AddControlPoint(*center0, "carve")
+
+        def _radius_from_glyph():
+            # carve sphere = 3x the marker's display radius = 1.5x diameter.
+            return 1.5 * float(cdisp.GetGlyphSize()) if cdisp else 30.0
+
+        def _push_carve():
+            pos = [0.0, 0.0, 0.0]
+            carve_node.GetNthControlPointPosition(0, pos)
+            bridge.set_rgba_carve(rgba, carve_ids, pos, _radius_from_glyph())
+
+        _push_carve()
+
+        def _on_carve_point_modified(caller, event):
+            try:
+                _push_carve()
+            except Exception as e:
+                print(f"_on_carve_point_modified: {e}")
+
+        def _on_carve_disp_modified(caller, event):
+            try:
+                _push_carve()
+            except Exception as e:
+                print(f"_on_carve_disp_modified: {e}")
+
+        carve_node.AddObserver(
+            slicer.vtkMRMLMarkupsNode.PointModifiedEvent,
+            _on_carve_point_modified)
+        if cdisp is not None:
+            cdisp.AddObserver(vtk.vtkCommand.ModifiedEvent,
+                              _on_carve_disp_modified)
+
+        view.forceRender()
+        slicer.app.processEvents()
+
         self._stash(vtkBridge=bridge, volume=vol, segmentation=seg,
-                    rgbaField=rgba)
+                    rgbaField=rgba, carveNode=carve_node)
         self.delayDisplay(
-            "Injection: Segment Surfaces PASSED -- drop any segment's "
-            "3D opacity slider and the apparent coverage stays flat "
-            "across thick vs thin structures, matching polydata surface "
-            "rendering.", 600)
+            "Injection: Segment Surface (Carving) PASSED -- drag the "
+            "yellow CarvePoint fiducial through the abdomen and the "
+            "liver / small bowel / colon are carved away inside a sphere "
+            "of radius 3x the glyph display radius (= 1.5x its diameter). "
+            "Resize the glyph to grow or shrink the carve. Other "
+            "segments are unaffected.", 600)
 
     # ------------------------------------------------------------------
     # Legacy DualView / pygfx tests
