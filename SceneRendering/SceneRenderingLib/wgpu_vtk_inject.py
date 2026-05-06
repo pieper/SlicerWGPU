@@ -994,15 +994,24 @@ fn sample_rgba_{q}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
     }}
     lit = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
 
-    // Per-step opacity for surface-mode compositing. dα/ds = (1/band)
-    // along the SDF gradient direction; projected on the ray, it scales
-    // by |grad_sdf · rd| (≈ |cos(angle)| for a true distance field). The
-    // total alpha across a surface crossing therefore integrates to 1.0
-    // independent of the ray's angle to the surface. The band gate skips
-    // contributions outside the alpha ramp.
+    // Per-step opacity for surface-mode compositing. Gradient-opacity:
+    // dα/ds = |grad α| = |grad_sdf · rd| / band inside the band, 0
+    // outside -- gives the thin-shell "surface" look (contribution
+    // concentrated where the alpha ramp lives, not throughout the
+    // segment interior). The naive form `op = |grad α| · step` has
+    // total integral 1.0 per crossing but only converges to 1 - 1/e
+    // ≈ 0.63 under outer over-compositing; we instead apply opacity
+    // correction so the total integrated alpha hits alpha_target
+    // (≈ fully opaque) per surface crossing, independent of ray
+    // angle and step size:
+    //     op = 1 - (1 - α_t) ^ (|grad α| · step)
+    // Across a band crossing, ∫|grad α| ds = 1, so
+    //     ∏ (1 - op_i)  =  (1 - α_t) ^ ∑(|grad α|·step)  =  (1 - α_t)
+    // and integrated.a converges to α_t.
     let in_band = step(abs(sdf), 0.5 * band);
     let dalpha_ds = abs(dot(grad_sdf, rd)) / band;
-    let op = clamp(dalpha_ds * step, 0.0, 1.0) * in_band;
+    let alpha_target = 0.95;
+    let op = (1.0 - pow(1.0 - alpha_target, dalpha_ds * step)) * in_band;
     return vec4<f32>(lit * op, op);
 }}
 """
@@ -3222,14 +3231,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var rgb = vec3<f32>(0.0);
 
     if (seed.w > 0.5) {
-        let s_tex = (seed.xyz + vec3<f32>(0.5)) / dims_f;
-        let s_world4 = u_cp.output_to_world * vec4<f32>(s_tex, 1.0);
-        let s_world = s_world4.xyz / s_world4.w;
-        let dist_mm = length(v_world - s_world);
-        let sgn = select(1.0, -1.0, label_v > 0u);
-        sdf_mm = sgn * dist_mm;
         let li = min(u32(seed.w), 255u);
-        rgb = u_palette.entries[li].rgb;
+        let pal = u_palette.entries[li];
+        if (pal.a < 0.5) {
+            // Nearest segment is hidden (display opacity 0 / invisible).
+            // Push SDF outside any reasonable band so the surface shader's
+            // band gate culls this voxel; the JFA still propagates the
+            // seed so neighboring visible segments aren't disturbed.
+            sdf_mm = select(1e3, -1e3, label_v > 0u);
+        } else {
+            let s_tex = (seed.xyz + vec3<f32>(0.5)) / dims_f;
+            let s_world4 = u_cp.output_to_world * vec4<f32>(s_tex, 1.0);
+            let s_world = s_world4.xyz / s_world4.w;
+            let dist_mm = length(v_world - s_world);
+            let sgn = select(1.0, -1.0, label_v > 0u);
+            sdf_mm = sgn * dist_mm;
+            rgb = pal.rgb;
+        }
     } else {
         // No seed found anywhere -- volume has no segments, or JFA passes
         // didn't reach this voxel. Push SDF beyond any reasonable band so
