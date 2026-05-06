@@ -575,7 +575,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> Varyings {
 """
 
 
-def _mat_struct_wgsl(n, m, k, f=0):
+def _mat_struct_wgsl(n, m, k):
     lines = []
     for i in range(n):
         lines += [
@@ -600,13 +600,6 @@ def _mat_struct_wgsl(n, m, k, f=0):
             f"    rgba{q}_carve_center: vec4<f32>,    // (cx, cy, cz, radius)",
             f"    rgba{q}_carve_ids_lo: vec4<u32>,    // 4 label values, 0 = unused",
             f"    rgba{q}_carve_ids_hi: vec4<u32>,    // 4 label values, 0 = unused",
-        ]
-    for p in range(f):
-        lines += [
-            f"    fiber{p}_p2t: mat4x4<f32>,",
-            f"    fiber{p}_step_unit: vec4<f32>,  // (step, pitch_mm, visible, voxel_mm)",
-            f"    fiber{p}_shade: vec4<f32>,      // (ka, kd, ks, shin)",
-            f"    fiber{p}_params: vec4<f32>,     // (rod_r_mm, opacity, dir_mix, net_mix)",
         ]
     body = "\n".join(lines)
     return f"""
@@ -1076,7 +1069,7 @@ fn sample_rgba_{q}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
 """
 
 
-def _main_wgsl(n, m, k, f=0):
+def _main_wgsl(n, m, k):
     img_calls = "\n".join([
         f"        {{ let c = sample_field_{i}(wp, rd); "
         f"if (c.a > 0.0) {{ sum = sum + c; }} }}"
@@ -1089,11 +1082,7 @@ def _main_wgsl(n, m, k, f=0):
         f"        {{ let c = sample_rgba_{q}(wp, rd); "
         f"if (c.a > 0.0) {{ sum = sum + c; }} }}"
         for q in range(k)])
-    fiber_calls = "\n".join([
-        f"        {{ let c = sample_fiber_grain_{p}(wp, rd); "
-        f"if (c.a > 0.0) {{ sum = sum + c; }} }}"
-        for p in range(f)])
-    calls_list = [c for c in (img_calls, seg_calls, rgba_calls, fiber_calls) if c]
+    calls_list = [c for c in (img_calls, seg_calls, rgba_calls) if c]
     calls = "\n".join(calls_list)
     return f"""
 @fragment
@@ -1162,185 +1151,9 @@ fn fs_main(v: Varyings) -> FragmentOutput {{
 """
 
 
-def _fiber_grain_field_wgsl(slot, n, m, k, num_peaks=4):
-    """Procedural fiber-grain rendering for a voxelized tractogram.
-
-    Bindings (9 for K=4): 1 sampler + K peak textures (rgba16float 3D,
-    .xyz = unit direction, .w = peak weight in [0,1]) + 1 bundle-id
-    texture (r8uint 3D, dominant bundle per voxel) + 1 bundle palette
-    (rgba8unorm 1D) + 1 category palette (rgba8unorm 1D) + 1
-    bundle->category LUT (r8uint 1D).
-
-    Binding offset within the bind group: after per-image (4n), vtk-depth
-    (2), grid (2), per-segment (2m), per-rgba (2k). Each fiber field
-    consumes K+5 = 9 slots with K=4.
-    """
-    p = slot
-    b0 = 2 + n * 4 + 4 + m * 2 + k * 2 + slot * (num_peaks + 5)
-    peak_bindings = []
-    for peak in range(num_peaks):
-        peak_bindings.append(
-            f"@group(0) @binding({b0 + 1 + peak}) "
-            f"var t_peak{peak}_f{p}: texture_3d<f32>;")
-    peak_bindings_str = "\n".join(peak_bindings)
-    # Inline peak-sample dispatch -- WGSL lacks dynamic texture indexing,
-    # so we generate an unrolled peak-index switch per fiber field.
-    peak_dispatch = []
-    for peak in range(num_peaks):
-        peak_dispatch.append(
-            f"        if (k == {peak}u) {{ return textureSampleLevel("
-            f"t_peak{peak}_f{p}, s_fiber{p}, t, 0.0); }}")
-    peak_dispatch_str = "\n".join(peak_dispatch)
-    bb = b0 + 1 + num_peaks        # bundle_id 3D
-    bp = bb + 1                    # bundle palette 1D
-    cp = bp + 1                    # category palette 1D
-    b2c = cp + 1                   # bundle->category 1D
-    return f"""
-@group(0) @binding({b0 + 0}) var s_fiber{p}: sampler;
-{peak_bindings_str}
-@group(0) @binding({bb}) var t_bundle_f{p}: texture_3d<u32>;
-@group(0) @binding({bp}) var t_bpalette_f{p}: texture_1d<f32>;
-@group(0) @binding({cp}) var t_cpalette_f{p}: texture_1d<f32>;
-@group(0) @binding({b2c}) var t_b2c_f{p}: texture_1d<u32>;
-
-fn fiber_sample_peak_{p}(wp: vec3<f32>, k: u32) -> vec4<f32> {{
-    let wpw = warp(wp);
-    let t4 = u_mat.fiber{p}_p2t * vec4<f32>(wpw, 1.0);
-    let t = t4.xyz;
-    if (any(t < vec3<f32>(0.0)) || any(t > vec3<f32>(1.0))) {{
-        return vec4<f32>(0.0);
-    }}
-{peak_dispatch_str}
-    return vec4<f32>(0.0);
-}}
-
-fn fiber_hash3_{p}(v: vec3<u32>) -> f32 {{
-    var h = v.x * 374761393u + v.y * 668265263u + v.z * 2147483647u;
-    h = (h ^ (h >> 13u)) * 1274126177u;
-    return f32(h & 0xFFFFFFu) / 16777215.0;
-}}
-
-fn sample_fiber_grain_{p}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
-    if (u_mat.fiber{p}_step_unit.z < 0.5) {{ return vec4<f32>(0.0); }}
-
-    let wpw = warp(wp);
-    let t4 = u_mat.fiber{p}_p2t * vec4<f32>(wpw, 1.0);
-    let t_uvw = t4.xyz;
-    if (any(t_uvw < vec3<f32>(0.0)) || any(t_uvw >= vec3<f32>(1.0))) {{
-        return vec4<f32>(0.0);
-    }}
-    let dims_f = vec3<f32>(textureDimensions(t_peak0_f{p}));
-    let ijk_u = vec3<u32>(floor(t_uvw * dims_f));
-
-    let pitch = max(u_mat.fiber{p}_step_unit.y, 0.05);
-
-    // Bundle + category lookup for coloring.
-    let bid = textureLoad(t_bundle_f{p}, vec3<i32>(ijk_u), 0).r;
-    let cat = textureLoad(t_b2c_f{p}, i32(bid), 0).r;
-    let bundle_col = textureSampleLevel(
-        t_bpalette_f{p}, s_fiber{p},
-        (f32(bid) + 0.5) / 256.0, 0.0).rgb;
-    let cat_col = textureSampleLevel(
-        t_cpalette_f{p}, s_fiber{p},
-        (f32(cat) + 0.5) / 256.0, 0.0).rgb;
-    let net_mix = clamp(u_mat.fiber{p}_params.w, 0.0, 1.0);
-    let dir_mix = clamp(u_mat.fiber{p}_params.z, 0.0, 1.0);
-
-    let rod_r = max(u_mat.fiber{p}_params.x, 1e-3);
-    let op_mult = u_mat.fiber{p}_params.y;
-    let shade = u_mat.fiber{p}_shade;
-
-    var accum = vec4<f32>(0.0);
-    for (var k = 0u; k < {num_peaks}u; k = k + 1u) {{
-        let peak = fiber_sample_peak_{p}(wp, k);
-        let dir_raw = peak.xyz;
-        let w = peak.w;
-        if (w < 1e-3) {{ continue; }}
-        let dir = normalize(dir_raw);
-
-        // World-space rod lattice perpendicular to this peak's direction.
-        // Build an orthonormal basis (u, v) perpendicular to dir. Rods
-        // live on an infinite grid in this plane, pitched at `pitch` mm,
-        // so adjacent voxels sharing the same peak produce continuous
-        // long rods instead of disconnected per-voxel segments.
-        let uhelp = select(vec3<f32>(0.0, 1.0, 0.0),
-                           vec3<f32>(1.0, 0.0, 0.0),
-                           abs(dir.y) > 0.9);
-        let u_axis = normalize(cross(dir, uhelp));
-        let v_axis = cross(dir, u_axis);
-
-        let uu = dot(wp, u_axis);
-        let vv = dot(wp, v_axis);
-
-        // Nearest lattice cell (biased into positive ints for stable hashing).
-        let cu = i32(floor(uu / pitch)) + 1073741824;
-        let cv = i32(floor(vv / pitch)) + 1073741824;
-        let cell_key = vec3<u32>(u32(cu), u32(cv),
-                                 k * 2654435761u + 1u);
-        let jx = fiber_hash3_{p}(cell_key) - 0.5;
-        let jy = fiber_hash3_{p}(cell_key + vec3<u32>(17u, 31u, 13u)) - 0.5;
-
-        // Rod axis passes through this point in the (u,v) plane, running
-        // parallel to dir. Jitter is capped so rods from different cells
-        // don't cross.
-        let center_u = (floor(uu / pitch) + 0.5 + jx * 0.35) * pitch;
-        let center_v = (floor(vv / pitch) + 0.5 + jy * 0.35) * pitch;
-
-        let du = uu - center_u;
-        let dv = vv - center_v;
-        let d_perp = sqrt(du * du + dv * dv);
-
-        // Narrower rods for weaker peaks, but not proportional-to-w (that
-        // made sub-dominant peaks invisible). sqrt(w) keeps them present.
-        let this_r = rod_r * sqrt(max(w, 1e-3));
-        if (d_perp > this_r) {{ continue; }}
-
-        // Exponential "glass core" profile: bright center, sharp edge.
-        let xr = d_perp / this_r;
-        let rod_alpha = exp(-xr * xr * 3.2);
-
-        // Base color.
-        let fa_rgb = abs(dir);
-        var col = mix(bundle_col, cat_col, net_mix);
-        col = mix(col, fa_rgb, dir_mix);
-
-        // Kajiya-Kay anisotropic highlight, with chromatic dispersion on
-        // the specular lobe (different reflection directions per R, G, B
-        // channel = glass-like color fringing at the rod edges).
-        let ldn = sqrt(max(1.0 - pow(dot(dir, -rd), 2.0), 0.0));
-        let shin = max(shade.w, 1.0);
-        let disp = u_axis * 0.035;
-        let refl_r = reflect(rd, normalize(dir + disp));
-        let refl_g = reflect(rd, dir);
-        let refl_b = reflect(rd, normalize(dir - disp));
-        let spec = vec3<f32>(
-            pow(max(0.0, sqrt(1.0 - pow(dot(refl_r, dir), 2.0))), shin),
-            pow(max(0.0, sqrt(1.0 - pow(dot(refl_g, dir), 2.0))), shin),
-            pow(max(0.0, sqrt(1.0 - pow(dot(refl_b, dir), 2.0))), shin));
-
-        // Fresnel: bright at grazing angles so rod rims pop.
-        let fres = 1.0 - abs(dot(dir, -rd));
-        let rim = fres * fres;
-
-        var lit = col * shade.x
-                + col * (shade.y * ldn)
-                + spec * shade.z
-                + vec3<f32>(rim * 0.35);
-        lit = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
-
-        let a = clamp(rod_alpha * op_mult * (0.5 + 0.5 * rim), 0.0, 1.0);
-        accum = vec4<f32>(
-            accum.rgb + (1.0 - accum.a) * lit * a,
-            accum.a + (1.0 - accum.a) * a);
-    }}
-    return accum;
-}}
-"""
-
-
 def _build_wgsl(n, m, k, segment_render_mode="iso",
-                rgba_render_modes=None, f=0, num_peaks=4):
-    parts = [_HEADER, _mat_struct_wgsl(n, m, k, f)]
+                rgba_render_modes=None):
+    parts = [_HEADER, _mat_struct_wgsl(n, m, k)]
     # Grid transform needs to come BEFORE the per-field functions (they call
     # warp()); its bindings sit after the VTK depth bindings.
     parts.append(_vtk_depth_wgsl(n))
@@ -1358,9 +1171,7 @@ def _build_wgsl(n, m, k, segment_render_mode="iso",
         mode = (rgba_render_modes[q]
                 if q < len(rgba_render_modes) else "density")
         parts.append(_rgba_field_wgsl(q, n, m, render_mode=mode))
-    for p in range(f):
-        parts.append(_fiber_grain_field_wgsl(p, n, m, k, num_peaks=num_peaks))
-    parts.append(_main_wgsl(n, m, k, f=f))
+    parts.append(_main_wgsl(n, m, k))
     return "\n".join(parts)
 
 
@@ -1374,26 +1185,23 @@ _SCENE_BYTES = 64
 _PER_FIELD_BYTES = 112   # mat4(64) + 3 * vec4(48) per image field
 _PER_SEG_BYTES = 112     # mat4(64) + 3 * vec4(48) per segment
 _PER_RGBA_BYTES = 208    # mat4(64) + 2 vec4(32) + carve: mat4(64) + 3 vec4(48)
-_PER_FIBER_BYTES = 112   # mat4(64) + 3 * vec4(48) per fiber-grain field
 # Grid transform tail: mat4x4 (64) + vec4 enabled (16) = 80 bytes
 _GRID_TAIL_BYTES = 80
 # Clip-plane tail: 8 * vec4 planes + vec4 count = 144 bytes
 _CLIP_TAIL_BYTES = 8 * 16 + 16
 
 
-def _mat_ubo_size(n, m, k, f=0):
+def _mat_ubo_size(n, m, k):
     total = (_SCENE_BYTES
              + n * _PER_FIELD_BYTES
              + m * _PER_SEG_BYTES
              + k * _PER_RGBA_BYTES
-             + f * _PER_FIBER_BYTES
              + _GRID_TAIL_BYTES
              + _CLIP_TAIL_BYTES)
     return (total + 15) & ~15
 
 
 def _pack_material(fields, segments, rgba_volumes, bmin, bmax, step,
-                   fiber_fields=None,
                    grid_p2t=None, grid_gain=1.0,
                    clip_planes=None):
     """Pack scene + per-field + per-segment + grid-transform tail.
@@ -1402,9 +1210,7 @@ def _pack_material(fields, segments, rgba_volumes, bmin, bmax, step,
     n = len(fields)
     m = len(segments)
     k = len(rgba_volumes)
-    fiber_fields = fiber_fields or []
-    f = len(fiber_fields)
-    buf = bytearray(_mat_ubo_size(n, m, k, f))
+    buf = bytearray(_mat_ubo_size(n, m, k))
     arr = np.frombuffer(buf, dtype=np.float32)
     arr[0:3] = bmin
     arr[4:7] = bmax
@@ -1469,34 +1275,11 @@ def _pack_material(fields, segments, rgba_volumes, bmin, bmax, step,
         ids_u32 = np.asarray(ids, dtype=np.uint32).view(np.float32)
         arr[off+44:off+48] = ids_u32[0:4]
         arr[off+48:off+52] = ids_u32[4:8]
-    # Per-fiber-field blocks (112 bytes each: p2t + step_unit + shade + params)
-    for p, fib in enumerate(fiber_fields):
-        off = ((_SCENE_BYTES // 4)
-               + n * (_PER_FIELD_BYTES // 4)
-               + m * (_PER_SEG_BYTES // 4)
-               + k * (_PER_RGBA_BYTES // 4)
-               + p * (_PER_FIBER_BYTES // 4))
-        p2t = _p2t_for_field(fib)
-        arr[off:off+16] = p2t.T.ravel()
-        # voxel_mm isotropic proxy = min edge of the reference volume spacing
-        vox_mm = getattr(fib, "_voxel_mm", 1.0)
-        # step_unit.y = rod lattice pitch (world mm). Drives how far
-        # apart neighbouring rods sit in the plane perpendicular to the
-        # peak direction.
-        arr[off+16:off+20] = [fib.sample_step_mm, fib.rod_pitch_mm,
-                              1.0 if fib.visible else 0.0,
-                              float(vox_mm)]
-        arr[off+20:off+24] = [fib.k_ambient, fib.k_diffuse, fib.k_specular,
-                              max(fib.shininess, 1.0)]
-        arr[off+24:off+28] = [fib.rod_radius_mm, fib.opacity,
-                              fib.direction_mix, fib.network_mix]
-
     # Grid transform tail
     tail_off = ((_SCENE_BYTES // 4)
                 + n * (_PER_FIELD_BYTES // 4)
                 + m * (_PER_SEG_BYTES // 4)
-                + k * (_PER_RGBA_BYTES // 4)
-                + f * (_PER_FIBER_BYTES // 4))
+                + k * (_PER_RGBA_BYTES // 4))
     if grid_p2t is not None:
         arr[tail_off:tail_off+16] = np.asarray(grid_p2t, dtype=np.float32).T.ravel()
         arr[tail_off+16:tail_off+20] = [1.0, float(grid_gain), 0.0, 0.0]
@@ -1815,165 +1598,6 @@ class RGBAVolumeField:
 
 
 # ---------------------------------------------------------------------------
-# FiberGrainField: procedural streamline "grain" rendering driven by a
-# per-voxel orientation histogram packed into K=4 peak textures.
-#
-# Each of the K peak textures is rgba16float 3D. Per voxel in each texture:
-#   .xyz = unit direction of that peak (RAS mm)
-#   .w   = pack(weight, bundle_id)
-# Bundle palette (1D rgba8unorm, 256 entries) and category (network)
-# palette (same) plus a bundle->category u8 LUT (1D r8uint, 256 entries)
-# provide the colors. Rod radius, opacity, direction-vs-palette color
-# blend, and bundle-vs-category color blend all come from the Mat UBO.
-#
-# The shader evaluates a procedural rod profile at each sample point:
-# rods are oriented along peak directions, offset by a hash of voxel-
-# index + peak-index so rods in adjacent voxels don't all converge on
-# voxel centers. Shading: Kajiya-Kay anisotropic BRDF over tangent T,
-# plus a Fresnel-ish edge term for the glass-rod look. See
-# _fiber_grain_field_wgsl() for the generated sampling code.
-# ---------------------------------------------------------------------------
-
-class FiberGrainField:
-    def __init__(self, device, num_peaks=4):
-        if num_peaks not in (1, 2, 4):
-            raise ValueError(
-                f"num_peaks must be 1, 2, or 4, got {num_peaks}")
-        self.device = device
-        self.num_peaks = num_peaks
-        self.peak_texs = [None] * num_peaks
-        self.peak_views = [None] * num_peaks
-        self.bundle_id_tex = None      # r8uint 3D, dominant bundle per voxel
-        self.bundle_id_view = None
-        self.sampler = None
-        self.palette_tex = None        # rgba8unorm 1D, 256 entries
-        self.palette_view = None
-        self.category_palette_tex = None
-        self.category_palette_view = None
-        self.bundle_to_category_tex = None   # r8uint 1D, 256 entries
-        self.bundle_to_category_view = None
-        self.dims = (0, 0, 0)
-        # Same attribute names as ImageField/SegmentField so _p2t_for_field
-        # composes through unchanged.
-        self.patient_to_texture = np.eye(4, dtype=np.float32)
-        self.world_from_local = np.eye(4, dtype=np.float32)
-        self.sample_step_mm = 1.0
-        self.opacity_unit_distance = 5.0
-        self.visible = True
-        # Fiber-rendering-specific parameters.
-        self.rod_radius_mm = 0.15
-        self.rod_pitch_mm = 0.55   # lattice spacing perpendicular to tangent
-        self.opacity = 1.0
-        self.direction_mix = 0.0   # 0 = palette RGB, 1 = FA-RGB from tangent
-        self.network_mix = 0.0     # 0 = bundle color, 1 = network color
-        self.k_ambient = 0.10
-        self.k_diffuse = 0.55
-        self.k_specular = 1.10
-        self.shininess = 220.0
-        self._bounds = (np.array([-100, -100, -100], dtype=np.float32),
-                        np.array([100, 100, 100], dtype=np.float32))
-
-    def aabb(self):
-        return self._bounds
-
-    def allocate(self, dx, dy, dz):
-        """Allocate the K peak textures + palette + category textures.
-        Must be called with dims matching what the voxelizer will produce."""
-        def _peak():
-            t = self.device.create_texture(
-                size=(dx, dy, dz), dimension="3d",
-                format=wgpu.TextureFormat.rgba16float,
-                usage=(wgpu.TextureUsage.TEXTURE_BINDING
-                       | wgpu.TextureUsage.STORAGE_BINDING
-                       | wgpu.TextureUsage.COPY_DST))
-            return t, t.create_view()
-        for i in range(self.num_peaks):
-            self.peak_texs[i], self.peak_views[i] = _peak()
-        self.bundle_id_tex = self.device.create_texture(
-            size=(dx, dy, dz), dimension="3d",
-            format=wgpu.TextureFormat.r8uint,
-            usage=(wgpu.TextureUsage.TEXTURE_BINDING
-                   | wgpu.TextureUsage.STORAGE_BINDING
-                   | wgpu.TextureUsage.COPY_DST))
-        self.bundle_id_view = self.bundle_id_tex.create_view()
-        self.sampler = self.device.create_sampler(
-            mag_filter=wgpu.FilterMode.linear,
-            min_filter=wgpu.FilterMode.linear,
-            address_mode_u=wgpu.AddressMode.clamp_to_edge,
-            address_mode_v=wgpu.AddressMode.clamp_to_edge,
-            address_mode_w=wgpu.AddressMode.clamp_to_edge)
-        self.palette_tex = self.device.create_texture(
-            size=(256, 1, 1), dimension="1d",
-            format=wgpu.TextureFormat.rgba8unorm,
-            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
-        self.palette_view = self.palette_tex.create_view()
-        self.category_palette_tex = self.device.create_texture(
-            size=(256, 1, 1), dimension="1d",
-            format=wgpu.TextureFormat.rgba8unorm,
-            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
-        self.category_palette_view = self.category_palette_tex.create_view()
-        self.bundle_to_category_tex = self.device.create_texture(
-            size=(256, 1, 1), dimension="1d",
-            format=wgpu.TextureFormat.r8uint,
-            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
-        self.bundle_to_category_view = self.bundle_to_category_tex.create_view()
-        self.dims = (dx, dy, dz)
-
-    # ---- Palette / category uploads ----
-    def write_palette(self, palette_rgba_u8):
-        """palette_rgba_u8: (256, 4) uint8. Index 0 reserved for background."""
-        arr = np.ascontiguousarray(
-            np.asarray(palette_rgba_u8, dtype=np.uint8).reshape(256, 4))
-        self.device.queue.write_texture(
-            {"texture": self.palette_tex, "mip_level": 0, "origin": (0, 0, 0)},
-            arr,
-            {"offset": 0, "bytes_per_row": 256 * 4, "rows_per_image": 1},
-            (256, 1, 1))
-
-    def write_category_palette(self, palette_rgba_u8):
-        arr = np.ascontiguousarray(
-            np.asarray(palette_rgba_u8, dtype=np.uint8).reshape(256, 4))
-        self.device.queue.write_texture(
-            {"texture": self.category_palette_tex, "mip_level": 0, "origin": (0, 0, 0)},
-            arr,
-            {"offset": 0, "bytes_per_row": 256 * 4, "rows_per_image": 1},
-            (256, 1, 1))
-
-    def write_bundle_to_category(self, bundle_to_category_u8):
-        """bundle_to_category_u8: (256,) uint8. bundle_id -> category_id."""
-        arr = np.ascontiguousarray(
-            np.asarray(bundle_to_category_u8, dtype=np.uint8).reshape(256))
-        self.device.queue.write_texture(
-            {"texture": self.bundle_to_category_tex, "mip_level": 0, "origin": (0, 0, 0)},
-            arr,
-            {"offset": 0, "bytes_per_row": 256, "rows_per_image": 1},
-            (256, 1, 1))
-
-    def write_peak(self, k, rgba16float_array):
-        """rgba16float_array: (D, H, W, 4) float16. Writes peak[k]."""
-        dx, dy, dz = self.dims
-        a = np.ascontiguousarray(
-            np.asarray(rgba16float_array, dtype=np.float16)
-            .reshape(dz, dy, dx, 4))
-        self.device.queue.write_texture(
-            {"texture": self.peak_texs[k], "mip_level": 0, "origin": (0, 0, 0)},
-            a,
-            {"offset": 0, "bytes_per_row": dx * 8, "rows_per_image": dy},
-            (dx, dy, dz))
-
-    def write_bundle_id_volume(self, bundle_id_array):
-        """bundle_id_array: (D, H, W) uint8. Dominant bundle per voxel."""
-        dx, dy, dz = self.dims
-        a = np.ascontiguousarray(
-            np.asarray(bundle_id_array, dtype=np.uint8).reshape(dz, dy, dx))
-        self.device.queue.write_texture(
-            {"texture": self.bundle_id_tex, "mip_level": 0, "origin": (0, 0, 0)},
-            a,
-            {"offset": 0, "bytes_per_row": dx, "rows_per_image": dy},
-            (dx, dy, dz))
-
-
-# ---------------------------------------------------------------------------
 # Bridge class
 # ---------------------------------------------------------------------------
 
@@ -2052,10 +1676,6 @@ class WgpuVolumeBridge:
         # palette UBO and rerun the bake using cached textures.
         self._rgba_obs_tags: list = []
 
-        # Fiber-rendering (DMRI / tractography "grain" field). List kept
-        # short (typically one), but multiple are supported so multiple
-        # tractograms can co-render.
-        self._fiber_fields: list = []
         # Active clip planes in world space: list of (nx, ny, nz, offset).
         # Observed from vtkMRMLClipModelsNode(s) via set_clip_nodes().
         self._clip_planes: list = []
@@ -2160,7 +1780,6 @@ class WgpuVolumeBridge:
             except Exception: pass
         self._rgba_obs_tags = []
         self._rgba_volumes = []
-        self._fiber_fields = []
         for obj, tag in self._clip_obs_tags:
             try: obj.RemoveObserver(tag)
             except Exception: pass
@@ -2223,10 +1842,7 @@ class WgpuVolumeBridge:
         n = len(self._fields)
         m = len(self._segments)
         k = len(self._rgba_volumes)
-        f = len(self._fiber_fields)
-        num_peaks = (self._fiber_fields[0].num_peaks
-                     if self._fiber_fields else 4)
-        if n == 0 and m == 0 and k == 0 and f == 0:
+        if n == 0 and m == 0 and k == 0:
             self._pipeline = None
             self._bind_group = None
             return
@@ -2244,12 +1860,11 @@ class WgpuVolumeBridge:
                       for r in self._rgba_volumes]
         wgsl = _build_wgsl(n, m, k,
                            segment_render_mode=self._segment_render_mode,
-                           rgba_render_modes=rgba_modes,
-                           f=f, num_peaks=num_peaks)
+                           rgba_render_modes=rgba_modes)
         shader = self.device.create_shader_module(code=wgsl)
 
         self._mat_ubo = self.device.create_buffer(
-            size=_mat_ubo_size(n, m, k, f),
+            size=_mat_ubo_size(n, m, k),
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
         entries = [
@@ -2326,47 +1941,6 @@ class WgpuVolumeBridge:
                              "view_dimension": wgpu.TextureViewDimension.d3,
                              "multisampled": False}},
             ]
-        # Per-fiber-field bindings: 1 sampler + num_peaks peak textures +
-        # 1 bundle-id 3D (uint) + 2 palettes (1D float) + 1 bundle->category
-        # 1D (uint). (num_peaks + 5) slots per fiber field.
-        bf0 = br0 + k * 3
-        per_fiber = num_peaks + 5
-        for p in range(f):
-            bf = bf0 + p * per_fiber
-            entries.append(
-                {"binding": bf + 0, "visibility": wgpu.ShaderStage.FRAGMENT,
-                 "sampler": {"type": wgpu.SamplerBindingType.filtering}})
-            for pk in range(num_peaks):
-                entries.append(
-                    {"binding": bf + 1 + pk,
-                     "visibility": wgpu.ShaderStage.FRAGMENT,
-                     "texture": {"sample_type": wgpu.TextureSampleType.float,
-                                 "view_dimension": wgpu.TextureViewDimension.d3,
-                                 "multisampled": False}})
-            entries.append(
-                {"binding": bf + 1 + num_peaks,
-                 "visibility": wgpu.ShaderStage.FRAGMENT,
-                 "texture": {"sample_type": wgpu.TextureSampleType.uint,
-                             "view_dimension": wgpu.TextureViewDimension.d3,
-                             "multisampled": False}})
-            entries.append(
-                {"binding": bf + 2 + num_peaks,
-                 "visibility": wgpu.ShaderStage.FRAGMENT,
-                 "texture": {"sample_type": wgpu.TextureSampleType.float,
-                             "view_dimension": wgpu.TextureViewDimension.d1,
-                             "multisampled": False}})
-            entries.append(
-                {"binding": bf + 3 + num_peaks,
-                 "visibility": wgpu.ShaderStage.FRAGMENT,
-                 "texture": {"sample_type": wgpu.TextureSampleType.float,
-                             "view_dimension": wgpu.TextureViewDimension.d1,
-                             "multisampled": False}})
-            entries.append(
-                {"binding": bf + 4 + num_peaks,
-                 "visibility": wgpu.ShaderStage.FRAGMENT,
-                 "texture": {"sample_type": wgpu.TextureSampleType.uint,
-                             "view_dimension": wgpu.TextureViewDimension.d1,
-                             "multisampled": False}})
         self._bgl = self.device.create_bind_group_layout(entries=entries)
         pl = self.device.create_pipeline_layout(bind_group_layouts=[self._bgl])
         self._pipeline = self.device.create_render_pipeline(
@@ -2392,8 +1966,7 @@ class WgpuVolumeBridge:
         """Assemble bind group from current fields + current depth texture.
         Called when pipeline rebuilds OR when the depth texture reallocates."""
         if self._bgl is None or (not self._fields and not self._segments
-                                 and not self._rgba_volumes
-                                 and not self._fiber_fields):
+                                 and not self._rgba_volumes):
             return
         bg = [
             {"binding": 0, "resource": {
@@ -2435,26 +2008,6 @@ class WgpuVolumeBridge:
                 {"binding": br+1, "resource": r.tex_view},
                 {"binding": br+2, "resource": r._label_tex_view},
             ]
-        # Per-fiber-field bindings
-        bf0 = br0 + len(self._rgba_volumes) * 3
-        num_peaks = (self._fiber_fields[0].num_peaks
-                     if self._fiber_fields else 4)
-        per_fiber = num_peaks + 5
-        for p, ff in enumerate(self._fiber_fields):
-            bf = bf0 + p * per_fiber
-            bg.append({"binding": bf + 0, "resource": ff.sampler})
-            for pk in range(num_peaks):
-                bg.append({"binding": bf + 1 + pk,
-                           "resource": ff.peak_views[pk]})
-            # Need a separate bundle-id 3D view (uint) for each field
-            bg.append({"binding": bf + 1 + num_peaks,
-                       "resource": ff.bundle_id_view})
-            bg.append({"binding": bf + 2 + num_peaks,
-                       "resource": ff.palette_view})
-            bg.append({"binding": bf + 3 + num_peaks,
-                       "resource": ff.category_palette_view})
-            bg.append({"binding": bf + 4 + num_peaks,
-                       "resource": ff.bundle_to_category_view})
         self._bind_group = self.device.create_bind_group(
             layout=self._bgl, entries=bg)
 
@@ -3781,120 +3334,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 return None
         return first
 
-    def add_fiber_rendering(self, reference_volume_node,
-                            peak_textures,          # list of K wgpu.GPUTexture
-                            bundle_id_texture,      # wgpu.GPUTexture r8uint 3D
-                            bundle_palette,         # (256, 4) uint8
-                            category_palette,       # (256, 4) uint8
-                            bundle_to_category,     # (256,) uint8
-                            dims,                   # (dx, dy, dz) of peak tex
-                            tex_to_world,           # 4x4 tex->world (world units)
-                            rod_radius_mm=0.15,
-                            rod_pitch_mm=0.55,
-                            opacity=1.0,
-                            direction_mix=0.0,
-                            network_mix=0.0,
-                            num_peaks=4):
-        """Install a FiberGrainField by adopting pre-voxelized GPU textures.
-
-        The companion voxelizer (FiberRendering module in SlicerDMRI)
-        produces `peak_textures` and `bundle_id_texture` on the same
-        wgpu device; passing them in directly avoids a GPU->CPU->GPU
-        readback/upload of ~hundreds of MB.
-
-        `dims` and `tex_to_world` describe the peak/bundle-id volumes'
-        grid, which may be coarser than the reference volume (see
-        max_dim in the voxelizer).
-        """
-        if len(peak_textures) != num_peaks:
-            raise ValueError(
-                f"expected {num_peaks} peak textures, got {len(peak_textures)}")
-
-        dx, dy, dz = dims
-        tex_to_world = np.asarray(tex_to_world, dtype=np.float64)
-        world_to_tex = np.linalg.inv(tex_to_world)
-
-        fib = FiberGrainField(self.device, num_peaks=num_peaks)
-
-        # Adopt the pre-voxelized GPU textures.
-        for k, t in enumerate(peak_textures):
-            fib.peak_texs[k] = t
-            fib.peak_views[k] = t.create_view()
-        fib.bundle_id_tex = bundle_id_texture
-        fib.bundle_id_view = bundle_id_texture.create_view()
-
-        # Allocate palettes + sampler only (peaks + bundle_id already
-        # present). Build palettes manually to avoid re-allocating peaks.
-        fib.sampler = self.device.create_sampler(
-            mag_filter=wgpu.FilterMode.linear,
-            min_filter=wgpu.FilterMode.linear,
-            address_mode_u=wgpu.AddressMode.clamp_to_edge,
-            address_mode_v=wgpu.AddressMode.clamp_to_edge,
-            address_mode_w=wgpu.AddressMode.clamp_to_edge)
-        fib.palette_tex = self.device.create_texture(
-            size=(256, 1, 1), dimension="1d",
-            format=wgpu.TextureFormat.rgba8unorm,
-            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
-        fib.palette_view = fib.palette_tex.create_view()
-        fib.category_palette_tex = self.device.create_texture(
-            size=(256, 1, 1), dimension="1d",
-            format=wgpu.TextureFormat.rgba8unorm,
-            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
-        fib.category_palette_view = fib.category_palette_tex.create_view()
-        fib.bundle_to_category_tex = self.device.create_texture(
-            size=(256, 1, 1), dimension="1d",
-            format=wgpu.TextureFormat.r8uint,
-            usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
-        fib.bundle_to_category_view = fib.bundle_to_category_tex.create_view()
-        fib.dims = (dx, dy, dz)
-
-        fib.write_palette(bundle_palette)
-        fib.write_category_palette(category_palette)
-        fib.write_bundle_to_category(bundle_to_category)
-
-        fib.patient_to_texture = world_to_tex.astype(np.float32)
-        parent = reference_volume_node.GetParentTransformNode()
-        if parent is not None:
-            pm = vtk.vtkMatrix4x4()
-            parent.GetMatrixTransformToWorld(pm)
-            fib.world_from_local = np.array(
-                [[pm.GetElement(i, j) for j in range(4)] for i in range(4)],
-                dtype=np.float32)
-        # Bounds from 8 corners in world space.
-        corners = np.array([
-            [0, 0, 0, 1], [1, 0, 0, 1], [0, 1, 0, 1], [1, 1, 0, 1],
-            [0, 0, 1, 1], [1, 0, 1, 1], [0, 1, 1, 1], [1, 1, 1, 1],
-        ], dtype=np.float64).T
-        world_corners = (tex_to_world @ corners)[:3].T
-        wfl = np.asarray(fib.world_from_local, dtype=np.float64)
-        world_corners_h = np.hstack([world_corners, np.ones((8, 1))])
-        world_corners_w = (wfl @ world_corners_h.T).T[:, :3]
-        fib._bounds = (world_corners_w.min(axis=0).astype(np.float32),
-                       world_corners_w.max(axis=0).astype(np.float32))
-
-        ct_img = reference_volume_node.GetImageData()
-        spacing = ct_img.GetSpacing()
-        # voxel_mm in the bake grid (may be coarser than CT).
-        vox_mm_iso = float((tex_to_world[:3, :3] @ np.array(
-            [1.0/dx, 1.0/dy, 1.0/dz])).__abs__().mean())
-        if vox_mm_iso <= 0.0:
-            vox_mm_iso = float(min(spacing))
-        fib._voxel_mm = vox_mm_iso
-        # Tighter ray step: thin rods alias at 0.5 * vox_mm. Clamp to a
-        # sane floor so we don't blow up the frame on huge volumes.
-        fib.sample_step_mm = max(vox_mm_iso * 0.25, 0.1)
-        fib.opacity_unit_distance = max(vox_mm_iso * 5.0, 1.0)
-        fib.rod_radius_mm = float(rod_radius_mm)
-        fib.rod_pitch_mm = float(rod_pitch_mm)
-        fib.opacity = float(opacity)
-        fib.direction_mix = float(direction_mix)
-        fib.network_mix = float(network_mix)
-
-        self._fiber_fields.append(fib)
-        self._rebuild_pipeline()
-        self.rw.Render()
-        return fib
-
     def add_colorize_volume(self, volume_node, segmentation_node,
                             sigma_voxels=1.5, window_level=None,
                             modulate_by_ct=True,
@@ -4288,8 +3727,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     def _wgpu_render(self, w, h, proj_inv, view_inv):
         if self._pipeline is None or (not self._fields and not self._segments
-                                      and not self._rgba_volumes
-                                      and not self._fiber_fields):
+                                      and not self._rgba_volumes):
             return np.zeros((h, w, 4), dtype=np.uint8)
         self._ensure_target(w, h)
 
@@ -4302,11 +3740,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         visible_fields = [f for f in self._fields if f.visible]
         visible_segs = [s for s in self._segments if s.visible]
         visible_rgba = [r for r in self._rgba_volumes if r.visible]
-        visible_fiber = [f for f in self._fiber_fields if f.visible]
         src = (visible_fields or self._fields) \
               + (visible_segs or self._segments) \
-              + (visible_rgba or self._rgba_volumes) \
-              + (visible_fiber or self._fiber_fields)
+              + (visible_rgba or self._rgba_volumes)
         boxes = [r.aabb() for r in src]
         boxes = [b for b in boxes if b is not None]
         if boxes:
@@ -4323,7 +3759,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             self._mat_ubo, 0, _pack_material(
                 self._fields, self._segments, self._rgba_volumes,
                 bmin, bmax, step,
-                fiber_fields=self._fiber_fields,
                 grid_p2t=self._grid_p2t, grid_gain=self._grid_gain,
                 clip_planes=self._clip_planes))
 
@@ -4356,8 +3791,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             w, h = self.rw.GetSize()
             if w <= 0 or h <= 0 or (not self._fields
                                     and not self._segments
-                                    and not self._rgba_volumes
-                                    and not self._fiber_fields):
+                                    and not self._rgba_volumes):
                 return
             cam = caller.GetActiveCamera()
             aspect = w / h
