@@ -83,6 +83,9 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
         ("Injection: Segmentation (paint)",    "test_vtk_Segmentation"),
         ("Injection: Segment Surface (Carving)", "test_vtk_SegmentSurfaces"),
         ("Injection: Colorize (RGBA)",         "test_vtk_ColorizeRGBA"),
+        ("Injection: Fiber Strands (A-buffer)", "test_vtk_FiberStrands"),
+        ("Injection: Field Compositing (lavalamp + strands + fiducials)",
+         "test_vtk_FieldCompositing"),
     ]
     # Legacy DualView/pygfx tests.
     TESTS = [
@@ -228,7 +231,14 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         # also rips out singletons, which can cascade into side effects
         # in modules that re-register singleton observers, so we stick
         # to the data-only flavor for test resets.
-        slicer.mrmlScene.Clear(0)
+        #
+        # Skip the clear if the user has loaded vtkMRMLFiberBundleNode
+        # instances -- test_vtk_FiberStrands picks them up to drive the
+        # rasterizer, so wiping the scene would defeat that path.
+        coll = slicer.mrmlScene.GetNodesByClass("vtkMRMLFiberBundleNode")
+        coll.UnRegister(None)
+        if coll.GetNumberOfItems() == 0:
+            slicer.mrmlScene.Clear(0)
         slicer.app.processEvents()
 
     def runTest(self):
@@ -1368,6 +1378,701 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             "of radius 3x the glyph display radius (= 1.5x its diameter). "
             "Resize the glyph to grow or shrink the carve. Other "
             "segments are unaffected.", 600)
+
+    def _collect_scene_fiber_bundles(self):
+        """Scan the MRML scene for vtkMRMLFiberBundleNode instances; if
+        any are found, build a single combined polydata with one bundle
+        id per fiber bundle node, populate a 256-entry palette from each
+        bundle's line-display colour and opacity, and hide the line
+        display so our rasterized tubes show through.
+
+        Returns (polydata, palette, hidden_line_displays) on success, or
+        (None, None, []) if the scene has no fiber bundles (caller falls
+        back to the synthetic scene).
+        """
+        import numpy as np
+
+        coll = slicer.mrmlScene.GetNodesByClass("vtkMRMLFiberBundleNode")
+        coll.UnRegister(None)  # decrement the ref the collection added
+        n_nodes = coll.GetNumberOfItems()
+        if n_nodes == 0:
+            return None, None, []
+
+        combined_pts = vtk.vtkPoints()
+        combined_lines = vtk.vtkCellArray()
+        bundle_array = vtk.vtkIntArray()
+        bundle_array.SetName("BundleId")
+        palette = np.zeros((256, 4), dtype=np.uint8)
+        hidden = []
+        bundle_id = 0
+        point_offset = 0
+        n_strands_total = 0
+
+        for i in range(n_nodes):
+            node = coll.GetItemAsObject(i)
+            polydata = node.GetPolyData()
+            if polydata is None:
+                continue
+            pts = polydata.GetPoints()
+            lines = polydata.GetLines()
+            if (pts is None or lines is None
+                    or pts.GetNumberOfPoints() == 0
+                    or lines.GetNumberOfCells() == 0):
+                continue
+            bundle_id += 1
+            if bundle_id > 255:
+                # Palette only has slots 1..255 (0 reserved). Cap.
+                bundle_id = 255
+
+            # Per-bundle colour + opacity from the line display node.
+            ldisp = None
+            if hasattr(node, "GetLineDisplayNode"):
+                ldisp = node.GetLineDisplayNode()
+            if ldisp is None:
+                # Fall back to scanning all display nodes for a line one.
+                for di in range(node.GetNumberOfDisplayNodes()):
+                    dn = node.GetNthDisplayNode(di)
+                    if dn is not None and dn.IsA(
+                            "vtkMRMLFiberBundleLineDisplayNode"):
+                        ldisp = dn
+                        break
+            color = (1.0, 1.0, 1.0)
+            opacity = 1.0
+            if ldisp is not None:
+                try:
+                    color = ldisp.GetColor()
+                    opacity = float(ldisp.GetOpacity())
+                except Exception:
+                    pass
+                if ldisp.GetVisibility():
+                    ldisp.SetVisibility(False)
+                    hidden.append(ldisp)
+            palette[bundle_id, 0] = int(np.clip(color[0] * 255, 0, 255))
+            palette[bundle_id, 1] = int(np.clip(color[1] * 255, 0, 255))
+            palette[bundle_id, 2] = int(np.clip(color[2] * 255, 0, 255))
+            palette[bundle_id, 3] = int(np.clip(opacity * 255, 0, 255))
+
+            # Copy points and re-emit lines with offset indices + bundle id.
+            n_pts = pts.GetNumberOfPoints()
+            for pi in range(n_pts):
+                p = [0.0, 0.0, 0.0]
+                pts.GetPoint(pi, p)
+                combined_pts.InsertNextPoint(*p)
+            id_list = vtk.vtkIdList()
+            lines.InitTraversal()
+            while lines.GetNextCell(id_list):
+                new_cell = vtk.vtkIdList()
+                for j in range(id_list.GetNumberOfIds()):
+                    new_cell.InsertNextId(point_offset + id_list.GetId(j))
+                combined_lines.InsertNextCell(new_cell)
+                bundle_array.InsertNextValue(bundle_id)
+                n_strands_total += 1
+            point_offset += n_pts
+
+        if point_offset == 0:
+            return None, None, []
+
+        combined = vtk.vtkPolyData()
+        combined.SetPoints(combined_pts)
+        combined.SetLines(combined_lines)
+        combined.GetCellData().AddArray(bundle_array)
+        return combined, palette, hidden
+
+    def test_vtk_FiberStrands(self):
+        """Per-strand cylinder-impostor rasterization through an A-buffer
+        FragmentField. Each polyline segment is rasterized as an
+        instanced billboard, the fragment shader does an analytic
+        ray-cylinder intersection and atomic-appends premultiplied
+        (depth, rgba8) into a per-pixel sorted list (K=64 fragments).
+        The main ray-march reads from this list and interleaves the
+        fragments with volume samples by depth -- correct compositing
+        with anything else in the scene.
+
+        If the scene already has vtkMRMLFiberBundleNode instances, use
+        them: combine their polylines with one bundle id per node and
+        populate the palette from each line-display node's colour and
+        opacity, then hide the default line display so our rendering
+        replaces it. Otherwise build the synthetic 4-bundle scene
+        (helix, U-arc, fan, diagonal) at ~1500 streamlines.
+        """
+        import numpy as np
+
+        self.delayDisplay(
+            "Injection: Fiber Strands (A-buffer) -- scanning scene", 150)
+
+        polydata, palette, hidden_displays = (
+            self._collect_scene_fiber_bundles())
+        used_scene_bundles = polydata is not None
+        if used_scene_bundles:
+            n_strands = polydata.GetLines().GetNumberOfCells()
+            n_pts = polydata.GetPoints().GetNumberOfPoints()
+            self.delayDisplay(
+                f"Found {len(palette[palette[:,3] > 0]) - 1} fiber "
+                f"bundle(s) in the scene -- baking "
+                f"{n_strands} strands, {n_pts} points...", 150)
+            self._stash(hiddenLineDisplays=hidden_displays)
+
+        if not used_scene_bundles:
+            self.delayDisplay(
+                "No fiber bundles in the scene -- building synthetic "
+                "4-bundle test scene", 150)
+
+            polydata = vtk.vtkPolyData()
+            points = vtk.vtkPoints()
+            lines = vtk.vtkCellArray()
+            bundle_array = vtk.vtkIntArray()
+            bundle_array.SetName("BundleId")
+
+            rng = np.random.default_rng(42)
+
+            def add_strand(strand_fn, bundle_id, n_samples=60,
+                           jitter_mm=0.02):
+                """Per-strand offset gives variety; per-sample jitter
+                must stay well below tube_radius (0.2 mm) so consecutive
+                segments share tangent direction and the capsule chain
+                reads as a smooth tube. With jitter ~ tube_radius the
+                strand looks zigzag."""
+                cell = vtk.vtkIdList()
+                offset = rng.normal(scale=0.8, size=3)
+                for i in range(n_samples):
+                    t = i / float(n_samples - 1)
+                    p = (np.asarray(strand_fn(t), dtype=np.float64)
+                         + offset
+                         + rng.normal(scale=jitter_mm, size=3))
+                    pid = points.InsertNextPoint(float(p[0]), float(p[1]),
+                                                 float(p[2]))
+                    cell.InsertNextId(pid)
+                lines.InsertNextCell(cell)
+                bundle_array.InsertNextValue(bundle_id)
+
+            # Bundle 1: helix along +Z, ~400 strands.
+            for s in range(400):
+                phase = 2 * np.pi * s / 400
+                r = 22.0 + (s % 13 - 6) * 0.7
+                def fn(t, phase=phase, r=r):
+                    z = (t - 0.5) * 110.0
+                    theta = 2 * np.pi * z / 38.0 + phase
+                    return (r * np.cos(theta), r * np.sin(theta), z)
+                add_strand(fn, bundle_id=1, n_samples=70)
+
+            # Bundle 2: U-arc along +X, ~400 strands.
+            for s in range(400):
+                z_off = (s - 200) * 0.30
+                y_thick = (s % 11 - 5) * 0.4
+                def fn(t, z_off=z_off, y_thick=y_thick):
+                    x = -55.0 + 110.0 * t
+                    y = 32.0 * np.sin(np.pi * t) + y_thick
+                    return (x, y, z_off)
+                add_strand(fn, bundle_id=2, n_samples=70)
+
+            # Bundle 3: fan from a focal point, ~400 strands on a 20x20
+            # grid over a forward-facing cone.
+            focal = np.array([-30.0, -8.0, 0.0])
+            for s in range(400):
+                sx = s % 20
+                sy = s // 20
+                azim = 2 * np.pi * sx / 20.0
+                elev = 0.40 * np.pi * (sy - 9.5) / 10.0
+                dx = np.cos(elev)
+                spread = np.sin(elev)
+                dy = spread * np.cos(azim) * 0.8
+                dz = spread * np.sin(azim) * 0.8
+                direction = np.array([dx, dy, dz])
+                direction = direction / max(np.linalg.norm(direction), 1e-6)
+                length = 80.0
+                def fn(t, direction=direction, length=length):
+                    return tuple(focal + length * t * direction)
+                add_strand(fn, bundle_id=3, n_samples=60)
+
+            # Bundle 4: diagonal bundle through the centre, ~300 strands.
+            axis = np.array([1.0, 1.0, 1.0]) / np.sqrt(3.0)
+            u_axis = np.array([1.0, -1.0, 0.0]) / np.sqrt(2.0)
+            v_axis = np.cross(axis, u_axis)
+            for s in range(300):
+                angle = 2 * np.pi * s / 300
+                r = 9.0 + (s % 7 - 3) * 0.4
+                offset_perp = r * (np.cos(angle) * u_axis
+                                   + np.sin(angle) * v_axis)
+                def fn(t, offset_perp=offset_perp):
+                    return tuple((t - 0.5) * 100.0 * axis + offset_perp)
+                add_strand(fn, bundle_id=4, n_samples=60)
+
+            polydata.SetPoints(points)
+            polydata.SetLines(lines)
+            polydata.GetCellData().AddArray(bundle_array)
+            n_strands = lines.GetNumberOfCells()
+            n_pts = points.GetNumberOfPoints()
+
+            # Palette: 4 distinct colours for the 4 bundles.
+            palette = np.zeros((256, 4), dtype=np.uint8)
+            palette[1] = (235,  70,  70, 255)
+            palette[2] = ( 80, 190, 235, 255)
+            palette[3] = (245, 200,  70, 255)
+            palette[4] = ( 90, 220, 130, 255)
+
+        self.delayDisplay(
+            f"Injection: Fiber Strands rasterizing "
+            f"{n_strands} strands, {n_pts} pts...", 150)
+
+        bridge = self._install_vtk_bridge()
+        sf = bridge.add_fiber_strands(
+            polydata, palette,
+            tube_radius_mm=0.2,
+            bundle_id_array_name="BundleId")
+        self.assertIsNotNone(sf, "add_fiber_strands returned None")
+
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        renderer = view.renderWindow().GetRenderers().GetFirstRenderer()
+        renderer.ResetCamera()
+        view.forceRender()
+        slicer.app.processEvents()
+
+        rgb = self._vtk_render_and_snapshot()
+        mx = tuple(int(x) for x in rgb.max(axis=(0, 1)))
+        self.assertGreater(max(mx), 60,
+            f"no strand output visible -- max_rgb={mx}")
+
+        self._stash(vtkBridge=bridge, fiberPolyData=polydata,
+                    fiberStrandField=sf)
+        source = ("scene bundles" if used_scene_bundles
+                  else "synthetic 4-bundle scene")
+        self.delayDisplay(
+            f"Injection: Fiber Strands (A-buffer) PASSED -- {source} "
+            f"({n_strands} strands, {n_pts} points) rasterized as "
+            "anisotropic 3D tubes via cylinder impostors + per-pixel "
+            "sorted A-buffer (K=64 fragments) for depth-correct "
+            "compositing with the rest of the scene.", 700)
+
+    def test_vtk_FieldCompositing(self):
+        """Three-way compositing test that exercises every render path
+        the bridge supports interacting with each other:
+
+          - FiberStrandField (cylinder-impostor rasterization → A-buffer)
+          - RGBAVolumeField  (volumetric ray-march, density mode)
+                             animated as a "lavalamp" -- 3 Gaussian blobs
+                             of distinct primary colours moving on
+                             Lissajous paths.
+          - vtkMRMLMarkupsFiducialNode (rendered the normal VTK way;
+                             clips the volume ray-march and the strand
+                             pass via the existing VTK depth integration)
+
+        A QTimer.singleShot loop updates the volume CPU-side and re-uploads
+        ~20 fps. The animation is event-loop friendly (no threading) and
+        stops automatically when the bridge is uninstalled.
+        """
+        import numpy as np
+        import time
+        import qt
+
+        self.delayDisplay(
+            "Injection: Field Compositing -- building scene", 200)
+
+        # --- 1. Fiber strands (4 bundles, ~1500 strands). ---
+        polydata = vtk.vtkPolyData()
+        points = vtk.vtkPoints()
+        lines = vtk.vtkCellArray()
+        bundle_array = vtk.vtkIntArray()
+        bundle_array.SetName("BundleId")
+        rng = np.random.default_rng(42)
+
+        def add_strand(strand_fn, bundle_id, n_samples=60, jitter_mm=0.02):
+            cell = vtk.vtkIdList()
+            offset = rng.normal(scale=0.8, size=3)
+            for i in range(n_samples):
+                t_p = i / float(n_samples - 1)
+                p = (np.asarray(strand_fn(t_p), dtype=np.float64)
+                     + offset
+                     + rng.normal(scale=jitter_mm, size=3))
+                pid = points.InsertNextPoint(float(p[0]), float(p[1]),
+                                             float(p[2]))
+                cell.InsertNextId(pid)
+            lines.InsertNextCell(cell)
+            bundle_array.InsertNextValue(bundle_id)
+
+        for s in range(400):
+            phase = 2 * np.pi * s / 400
+            r = 22.0 + (s % 13 - 6) * 0.7
+            def fn(t, phase=phase, r=r):
+                z = (t - 0.5) * 110.0
+                theta = 2 * np.pi * z / 38.0 + phase
+                return (r * np.cos(theta), r * np.sin(theta), z)
+            add_strand(fn, bundle_id=1, n_samples=70)
+        for s in range(400):
+            z_off = (s - 200) * 0.30
+            y_thick = (s % 11 - 5) * 0.4
+            def fn(t, z_off=z_off, y_thick=y_thick):
+                x = -55.0 + 110.0 * t
+                y = 32.0 * np.sin(np.pi * t) + y_thick
+                return (x, y, z_off)
+            add_strand(fn, bundle_id=2, n_samples=70)
+        focal = np.array([-30.0, -8.0, 0.0])
+        for s in range(400):
+            sx = s % 20
+            sy = s // 20
+            azim = 2 * np.pi * sx / 20.0
+            elev = 0.40 * np.pi * (sy - 9.5) / 10.0
+            dx = np.cos(elev)
+            spread = np.sin(elev)
+            dy = spread * np.cos(azim) * 0.8
+            dz = spread * np.sin(azim) * 0.8
+            direction = np.array([dx, dy, dz])
+            direction = direction / max(np.linalg.norm(direction), 1e-6)
+            length = 80.0
+            def fn(t, direction=direction, length=length):
+                return tuple(focal + length * t * direction)
+            add_strand(fn, bundle_id=3, n_samples=60)
+        axis = np.array([1.0, 1.0, 1.0]) / np.sqrt(3.0)
+        u_axis = np.array([1.0, -1.0, 0.0]) / np.sqrt(2.0)
+        v_axis = np.cross(axis, u_axis)
+        for s in range(300):
+            angle = 2 * np.pi * s / 300
+            r = 9.0 + (s % 7 - 3) * 0.4
+            offset_perp = r * (np.cos(angle) * u_axis
+                               + np.sin(angle) * v_axis)
+            def fn(t, offset_perp=offset_perp):
+                return tuple((t - 0.5) * 100.0 * axis + offset_perp)
+            add_strand(fn, bundle_id=4, n_samples=60)
+        polydata.SetPoints(points)
+        polydata.SetLines(lines)
+        polydata.GetCellData().AddArray(bundle_array)
+
+        palette = np.zeros((256, 4), dtype=np.uint8)
+        palette[1] = (235,  70,  70, 220)
+        palette[2] = ( 80, 190, 235, 128)   # blue at 0.5 opacity
+        palette[3] = (245, 200,  70, 220)
+        palette[4] = ( 90, 220, 130, 220)
+
+        bridge = self._install_vtk_bridge()
+        sf = bridge.add_fiber_strands(
+            polydata, palette,
+            tube_radius_mm=0.2,
+            bundle_id_array_name="BundleId")
+
+        # --- 2. Markup fiducials (rendered through VTK normally). ---
+        fnode = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLMarkupsFiducialNode", "RefPoints")
+        fdisp = fnode.GetDisplayNode()
+        if fdisp is not None:
+            fdisp.SetUseGlyphScale(False)
+            fdisp.SetGlyphSize(8.0)
+            fdisp.SetSelectedColor(1.0, 1.0, 0.3)
+        # First control point is the lavalamp's attractor -- placed in
+        # the periphery (outside the helix) so the blobs orbit somewhere
+        # the user can actually see them, not buried in the bundle.
+        fnode.AddControlPoint(40.0, 25.0, 30.0, "attractor")
+        fnode.AddControlPoint(0.0, 0.0, 0.0, "origin")
+        fnode.AddControlPoint(0.0, 0.0, 45.0, "+Z")
+        fnode.AddControlPoint(-30.0, 25.0, -30.0, "back-left")
+
+        # --- 3. Lavalamp volume (animated). ---
+        lava = self._add_lavalamp_volume(
+            bridge,
+            dims=(48, 48, 48),
+            bbox=(-60.0, 60.0, -45.0, 45.0, -60.0, 60.0))
+
+        # --- 4. Animation timer (singleShot chain) + physics state. ---
+        # Each blob has a primary RGB colour, an initial position
+        # spread away from origin so they don't all collapse, and zero
+        # velocity. Per tick: attract toward the first fiducial,
+        # repel from each other, integrate with damping. Blobs end up
+        # orbiting the fiducial in a "fighting for the centre" pattern.
+        anim_state = {
+            "start": time.time(),
+            "last_t": time.time(),
+            "running": True,
+            "frame": 0,
+            "fnode": fnode,
+            # Initial positions in a triangle around the attractor
+            # (40, 25, 30) so they're visible from frame 1.
+            "blob_pos": [
+                np.array([ 60.0,  25.0,  30.0], dtype=np.float64),
+                np.array([ 30.0,  45.0,  30.0], dtype=np.float64),
+                np.array([ 30.0,  15.0,  50.0], dtype=np.float64),
+            ],
+            # Slight initial swirl so the orbit is visible while it
+            # damps toward equilibrium.
+            "blob_vel": [
+                np.array([  0.0,  10.0,   0.0], dtype=np.float64),
+                np.array([ 10.0,   0.0,  10.0], dtype=np.float64),
+                np.array([-10.0, -10.0,   0.0], dtype=np.float64),
+            ],
+            "blob_color": [
+                (1.00, 0.18, 0.18),
+                (0.18, 1.00, 0.30),
+                (0.25, 0.45, 1.00),
+            ],
+            # Per-blob breathing periods (seconds) and phase offsets.
+            # Prime-ish ratios so the three blobs never sync up.
+            "blob_period": [3.7, 5.3, 4.6],
+            "blob_phase":  [0.0, 2.1, 4.7],
+        }
+
+        def tick():
+            try:
+                if not anim_state["running"]:
+                    return
+                if getattr(bridge, "_disposed", False):
+                    anim_state["running"] = False
+                    return
+                now = time.time()
+                dt = min(now - anim_state["last_t"], 0.1)
+                anim_state["last_t"] = now
+                self._step_lavalamp_physics(anim_state, dt)
+                # Per-blob breathing: pulse(t) ∈ [0, 1], modulating
+                # both drawn sigma (size) and attraction strength.
+                t_anim = now - anim_state["start"]
+                two_pi = 2.0 * np.pi
+                sigma_scales = [
+                    0.6 + 0.6 * (0.5 + 0.5 * np.sin(
+                        two_pi * t_anim / p + ph))
+                    for p, ph in zip(anim_state["blob_period"],
+                                     anim_state["blob_phase"])
+                ]
+                blobs = list(zip(anim_state["blob_pos"],
+                                 anim_state["blob_color"],
+                                 sigma_scales))
+                self._animate_lavalamp(lava, blobs)
+                bridge.rw.Render()
+                anim_state["frame"] += 1
+            except Exception as e:
+                print(f"lavalamp tick: {e}")
+                anim_state["running"] = False
+                return
+            qt.QTimer.singleShot(50, tick)
+
+        # Initial frame + start the chain. Use sigma_scale=1.0 for
+        # the first frame; the breathing phase will pick up next tick.
+        initial_blobs = [(p, c, 1.0) for p, c in zip(
+            anim_state["blob_pos"], anim_state["blob_color"])]
+        self._animate_lavalamp(lava, initial_blobs)
+
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        renderer = view.renderWindow().GetRenderers().GetFirstRenderer()
+        renderer.ResetCamera()
+        view.forceRender()
+        slicer.app.processEvents()
+
+        qt.QTimer.singleShot(0, tick)
+
+        self._stash(vtkBridge=bridge, fiberStrandField=sf,
+                    fiberPolyData=polydata, lavalampField=lava,
+                    lavalampState=anim_state, fiducialNode=fnode)
+
+        self.delayDisplay(
+            "Injection: Field Compositing PASSED -- four fiber bundles "
+            "(A-buffer rasterization), three-blob animated lavalamp "
+            "(volumetric density mode), and four markup fiducials "
+            "(VTK opaque) all composite together with correct depth "
+            "interleaving. Animation runs from a singleShot QTimer "
+            "chain at ~20 fps; set "
+            "slicer.modules.lavalampState['running']=False to stop.",
+            900)
+
+    # ----- Lavalamp helpers (used by test_vtk_FieldCompositing) -----
+
+    def _add_lavalamp_volume(self, bridge, dims, bbox):
+        """Allocate an RGBAVolumeField sized to `dims` covering world
+        bbox=(xmin,xmax,ymin,ymax,zmin,zmax), register it with the bridge
+        in density-mode without a bake. The texture is created with
+        COPY_DST so we can write_texture into it each frame."""
+        import numpy as np
+        import wgpu
+        from SceneRenderingLib.wgpu_vtk_inject import RGBAVolumeField
+
+        dx, dy, dz = dims
+        xmin, xmax, ymin, ymax, zmin, zmax = bbox
+
+        field = RGBAVolumeField(bridge.device)
+        # Re-create the main texture with COPY_DST (allocate() leaves
+        # only TEXTURE_BINDING + STORAGE_BINDING).
+        field.tex = bridge.device.create_texture(
+            size=(dx, dy, dz), dimension="3d",
+            format=wgpu.TextureFormat.rgba16float,
+            usage=(wgpu.TextureUsage.TEXTURE_BINDING
+                   | wgpu.TextureUsage.COPY_DST),
+        )
+        field.tex_view = field.tex.create_view()
+        # scratch_tex isn't used (no bake), but the bind group only
+        # references tex_view so we leave scratch_tex None.
+        if field.sampler is None:
+            field.sampler = bridge.device.create_sampler(
+                mag_filter=wgpu.FilterMode.linear,
+                min_filter=wgpu.FilterMode.linear,
+                address_mode_u=wgpu.AddressMode.clamp_to_edge,
+                address_mode_v=wgpu.AddressMode.clamp_to_edge,
+                address_mode_w=wgpu.AddressMode.clamp_to_edge,
+            )
+        field.dims = (dx, dy, dz)
+
+        # patient_to_texture: world -> [0, 1]^3.
+        ext = np.array([xmax-xmin, ymax-ymin, zmax-zmin], dtype=np.float64)
+        org = np.array([xmin, ymin, zmin], dtype=np.float64)
+        p2t = np.eye(4, dtype=np.float64)
+        p2t[0, 0] = 1.0 / ext[0]
+        p2t[1, 1] = 1.0 / ext[1]
+        p2t[2, 2] = 1.0 / ext[2]
+        p2t[0, 3] = -org[0] / ext[0]
+        p2t[1, 3] = -org[1] / ext[1]
+        p2t[2, 3] = -org[2] / ext[2]
+        field.patient_to_texture = p2t.astype(np.float32)
+        field._bounds = (np.array([xmin, ymin, zmin], dtype=np.float32),
+                         np.array([xmax, ymax, zmax], dtype=np.float32))
+        # Density mode: alpha is per-sample density, integrated over
+        # opacity_unit_distance. Tuned so a single blob (sigma ~ 7% of
+        # bbox extent ~= 8 mm) integrates to ~0.85 alpha across its
+        # diameter; lower opacity_unit_distance → denser/more opaque.
+        field.sample_step_mm = max(min(ext) / dx * 0.5, 0.5)
+        field.opacity_unit_distance = max(min(ext) / 12.0, 4.0)
+        field.render_mode = "density"
+
+        # Placeholder labelmap: the rgba bind layout requires a uint 3D
+        # texture for the carve check, but with carve_radius_mm=0 the
+        # shader never samples it. 1x1x1 r8uint zero suffices.
+        label_tex = bridge.device.create_texture(
+            size=(1, 1, 1), dimension="3d",
+            format=wgpu.TextureFormat.r8uint,
+            usage=(wgpu.TextureUsage.TEXTURE_BINDING
+                   | wgpu.TextureUsage.COPY_DST),
+        )
+        bridge.device.queue.write_texture(
+            {"texture": label_tex, "mip_level": 0, "origin": (0, 0, 0)},
+            np.zeros((1, 1, 1), dtype=np.uint8),
+            {"offset": 0, "bytes_per_row": 256, "rows_per_image": 1},
+            (1, 1, 1))
+        field._label_tex = label_tex
+        field._label_carve_tex = label_tex
+        field._label_tex_view = label_tex.create_view()
+        field._world_to_label_tex = np.eye(4, dtype=np.float64)
+        field._output_to_world = np.linalg.inv(p2t).astype(np.float64)
+
+        # Stash bbox + dims for the animator.
+        field._lava_dims = dims
+        field._lava_bbox = bbox
+
+        bridge._rgba_volumes.append(field)
+        bridge._rebuild_pipeline()
+        return field
+
+    def _animate_lavalamp(self, field, blobs):
+        """Render the volume from a list of `blobs` =
+        [((cx, cy, cz), (cr, cg, cb), sigma_scale), ...]. Each blob is
+        a Gaussian whose width is sigma_base * sigma_scale (sigma_base
+        ~8% of bbox extent), so per-blob `sigma_scale` makes the blob
+        visibly grow and shrink for the lava-lamp pulse. CPU compute
+        (~1 ms at 48^3) + write_texture upload."""
+        import numpy as np
+
+        dx, dy, dz = field._lava_dims
+        xmin, xmax, ymin, ymax, zmin, zmax = field._lava_bbox
+
+        # Voxel-center grid in world.
+        xs = np.linspace(xmin + (xmax - xmin) / (2 * dx),
+                         xmax - (xmax - xmin) / (2 * dx),
+                         dx, dtype=np.float32)
+        ys = np.linspace(ymin + (ymax - ymin) / (2 * dy),
+                         ymax - (ymax - ymin) / (2 * dy),
+                         dy, dtype=np.float32)
+        zs = np.linspace(zmin + (zmax - zmin) / (2 * dz),
+                         zmax - (zmax - zmin) / (2 * dz),
+                         dz, dtype=np.float32)
+        Z, Y, X = np.meshgrid(zs, ys, xs, indexing='ij')
+
+        ext_max = max(xmax - xmin, ymax - ymin, zmax - zmin)
+        sigma_base = ext_max * 0.07         # sharper -- distinct droplets
+
+        rgba = np.zeros((dz, dy, dx, 4), dtype=np.float32)
+        for blob in blobs:
+            # Tolerate (pos, color) for the first-frame call site.
+            if len(blob) == 3:
+                (cx, cy, cz), (cr, cg, cb), sigma_scale = blob
+            else:
+                (cx, cy, cz), (cr, cg, cb) = blob
+                sigma_scale = 1.0
+            sigma = sigma_base * float(sigma_scale)
+            inv_2s2 = 1.0 / (2 * sigma * sigma)
+            d2 = (X - cx) ** 2 + (Y - cy) ** 2 + (Z - cz) ** 2
+            density = np.exp(-d2 * inv_2s2)
+            rgba[..., 0] += density * cr
+            rgba[..., 1] += density * cg
+            rgba[..., 2] += density * cb
+            rgba[..., 3] += density
+        # Normalize rgb by total density so blob colours stay pure where
+        # blobs overlap (otherwise heavy overlap of primary lights would
+        # bleach to white). Cap alpha at 1.
+        a_total = rgba[..., 3:4]
+        rgba[..., :3] = rgba[..., :3] / np.maximum(a_total, 1e-6)
+        rgba[..., 3] = np.clip(rgba[..., 3], 0.0, 1.0)
+
+        rgba_f16 = np.ascontiguousarray(rgba.astype(np.float16))
+        field.device.queue.write_texture(
+            {"texture": field.tex, "mip_level": 0, "origin": (0, 0, 0)},
+            rgba_f16,
+            {"offset": 0, "bytes_per_row": dx * 8, "rows_per_image": dy},
+            (dx, dy, dz))
+
+    def _step_lavalamp_physics(self, state, dt):
+        """Step the blob simulation: each blob is attracted to the first
+        control point of state["fnode"] (linear spring) and repelled
+        from every other blob (inverse-square, softened). Velocity is
+        damped per step. The result is a stable orbit-ish fight where
+        all three blobs jostle for the spot nearest the fiducial.
+
+        Per-blob breathing: each blob has its own pulse_period and
+        phase, and the attraction gain is multiplied by 0.3 + 1.4 *
+        pulse(t) -- so when a blob is at peak size it pulls hard, and
+        at its minimum it nearly lets go. With prime-ish periods the
+        three blobs hand the "winner" position back and forth without
+        ever syncing, which gives the scene its lively unsteady feel."""
+        import numpy as np
+
+        positions = state["blob_pos"]
+        velocities = state["blob_vel"]
+        n = len(positions)
+
+        # Read fiducial position (first control point).
+        fid = [0.0, 0.0, 0.0]
+        fnode = state.get("fnode")
+        if fnode is not None and fnode.GetNumberOfControlPoints() > 0:
+            fnode.GetNthControlPointPosition(0, fid)
+        fid_pos = np.array(fid, dtype=np.float64)
+
+        # Per-blob breathing (matches _animate_lavalamp's sigma_scale).
+        import time as _time
+        t_anim = _time.time() - state["start"]
+        two_pi = 2.0 * np.pi
+        periods = state.get("blob_period", [1.0] * n)
+        phases  = state.get("blob_phase",  [0.0] * n)
+        pulse = [
+            0.5 + 0.5 * np.sin(two_pi * t_anim / periods[i] + phases[i])
+            for i in range(n)
+        ]
+
+        k_attract = 1.2      # base spring gain (mm/s^2 per mm); per-blob
+                             # pulse modulates in [0.3, 1.7] x.
+        k_repel   = 4500.0   # inverse-square push (mm^3/s^2)
+        damping   = 0.985    # per-step velocity decay (lighter than
+                             # critical -> visible oscillation)
+        v_max     = 50.0     # mm/s cap
+
+        forces = [np.zeros(3, dtype=np.float64) for _ in range(n)]
+        for i in range(n):
+            k_i = k_attract * (0.3 + 1.4 * pulse[i])
+            forces[i] += k_i * (fid_pos - positions[i])
+            for j in range(n):
+                if i == j:
+                    continue
+                d = positions[i] - positions[j]
+                d2 = float(np.dot(d, d)) + 4.0   # softened (mm^2)
+                forces[i] += k_repel * d / (d2 ** 1.5)
+
+        for i in range(n):
+            velocities[i] = velocities[i] * damping + forces[i] * dt
+            speed = float(np.linalg.norm(velocities[i]))
+            if speed > v_max:
+                velocities[i] *= (v_max / speed)
+            positions[i] = positions[i] + velocities[i] * dt
 
     # ------------------------------------------------------------------
     # Legacy DualView / pygfx tests

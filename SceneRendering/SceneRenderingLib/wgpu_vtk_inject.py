@@ -545,6 +545,8 @@ struct Camera {
     proj_inv: mat4x4<f32>,
     view_inv: mat4x4<f32>,
     size: vec4<f32>,
+    proj: mat4x4<f32>,
+    view: mat4x4<f32>,
 };
 @group(0) @binding(0) var<uniform> u_cam: Camera;
 
@@ -553,6 +555,12 @@ fn ndc_to_world(ndc: vec4<f32>) -> vec3<f32> {
     let eye = clip.xyz / clip.w;
     let world = u_cam.view_inv * vec4<f32>(eye, 1.0);
     return world.xyz / world.w;
+}
+
+fn world_depth_01(wp: vec3<f32>) -> f32 {
+    let clip = u_cam.proj * u_cam.view * vec4<f32>(wp, 1.0);
+    let ndc_z = clip.z / max(clip.w, 1e-6);
+    return clamp(ndc_z * 0.5 + 0.5, 0.0, 1.0);
 }
 
 fn ray_aabb(o: vec3<f32>, d: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
@@ -1069,7 +1077,7 @@ fn sample_rgba_{q}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
 """
 
 
-def _main_wgsl(n, m, k):
+def _main_wgsl(n, m, k, has_fragments=False, frag_binding=0, K=32):
     img_calls = "\n".join([
         f"        {{ let c = sample_field_{i}(wp, rd); "
         f"if (c.a > 0.0) {{ sum = sum + c; }} }}"
@@ -1084,7 +1092,69 @@ def _main_wgsl(n, m, k):
         for q in range(k)])
     calls_list = [c for c in (img_calls, seg_calls, rgba_calls) if c]
     calls = "\n".join(calls_list)
+
+    # Fragment-integration plumbing. When the bridge has a FragmentField,
+    # the main shader pulls per-pixel sorted (depth, packed_rgba) entries
+    # from a storage buffer and interleaves them by depth with the volume
+    # samples (depth-correct compositing of rasterized strands + volume).
+    if has_fragments:
+        frag_decls = f"""
+@group(0) @binding({frag_binding+0}) var<storage, read> u_frag_counts: array<u32>;
+@group(0) @binding({frag_binding+1}) var<storage, read> u_frag_data:   array<u32>;
+"""
+        frag_init = f"""
+    let pixel_idx = u32(v.position.y) * u32(u_cam.size.x) + u32(v.position.x);
+    let frag_count = min(u_frag_counts[pixel_idx], {K}u);
+    var frag_idx: u32 = 0u;
+"""
+        frag_consume_in_loop = f"""
+        // Consume any A-buffer fragments that lie in front of the current
+        // ray sample (depth_01 <= world_depth_01(wp)). Standard front-to-
+        // back over-compositing.
+        let curr_depth = world_depth_01(wp);
+        loop {{
+            if (frag_idx >= frag_count) {{ break; }}
+            let f_depth = bitcast<f32>(
+                u_frag_data[(pixel_idx * {K}u + frag_idx) * 2u]);
+            if (f_depth > curr_depth) {{ break; }}
+            let pkd = u_frag_data[(pixel_idx * {K}u + frag_idx) * 2u + 1u];
+            let fr = f32(pkd & 0xffu) / 255.0;
+            let fg = f32((pkd >> 8u) & 0xffu) / 255.0;
+            let fb = f32((pkd >> 16u) & 0xffu) / 255.0;
+            let fa = f32((pkd >> 24u) & 0xffu) / 255.0;
+            integrated = vec4<f32>(
+                integrated.rgb + (1.0 - integrated.a) * vec3<f32>(fr, fg, fb),
+                integrated.a   + (1.0 - integrated.a) * fa);
+            frag_idx = frag_idx + 1u;
+        }}
+"""
+        frag_drain = f"""
+    // After the volume ray-march terminates (hit t_far, alpha-saturated,
+    // or safety break), drain any remaining sorted fragments that lie
+    // behind the volume's far face -- they were never reached but should
+    // still composite as background.
+    loop {{
+        if (frag_idx >= frag_count) {{ break; }}
+        if (integrated.a >= 0.999) {{ break; }}
+        let pkd = u_frag_data[(pixel_idx * {K}u + frag_idx) * 2u + 1u];
+        let fr = f32(pkd & 0xffu) / 255.0;
+        let fg = f32((pkd >> 8u) & 0xffu) / 255.0;
+        let fb = f32((pkd >> 16u) & 0xffu) / 255.0;
+        let fa = f32((pkd >> 24u) & 0xffu) / 255.0;
+        integrated = vec4<f32>(
+            integrated.rgb + (1.0 - integrated.a) * vec3<f32>(fr, fg, fb),
+            integrated.a   + (1.0 - integrated.a) * fa);
+        frag_idx = frag_idx + 1u;
+    }}
+"""
+    else:
+        frag_decls = ""
+        frag_init = ""
+        frag_consume_in_loop = ""
+        frag_drain = ""
+
     return f"""
+{frag_decls}
 @fragment
 fn fs_main(v: Varyings) -> FragmentOutput {{
     var out: FragmentOutput;
@@ -1109,16 +1179,24 @@ fn fs_main(v: Varyings) -> FragmentOutput {{
         if (tg > 0.0) {{ t_far = min(t_far, tg); }}
     }}
 
-    if (t_far <= t_near) {{ out.color = vec4<f32>(0.0); return out; }}
     let step = max(u_mat.scene_step, 1e-3);
-    var t = t_near + fract(sin(dot(v.position.xy, vec2<f32>(12.9898,78.233))) * 43758.5453) * step;
     var integrated = vec4<f32>(0.0);
+{frag_init}
+    if (t_far <= t_near) {{
+        // Volume contributes nothing along this ray, but A-buffer
+        // fragments at this pixel may still be visible.
+{frag_drain}
+        out.color = integrated;
+        return out;
+    }}
+    var t = t_near + fract(sin(dot(v.position.xy, vec2<f32>(12.9898,78.233))) * 43758.5453) * step;
     var safety: i32 = 0;
     loop {{
         if (t >= t_far) {{ break; }}
         if (safety >= 2048) {{ break; }}
         if (integrated.a >= 0.99) {{ break; }}
         let wp = ro + rd * t;
+{frag_consume_in_loop}
 
         // Clip-plane test: if any active plane says wp is on its
         // negative side, skip this sample. The wp > n * offset check
@@ -1145,6 +1223,7 @@ fn fs_main(v: Varyings) -> FragmentOutput {{
         t = t + step;
         safety = safety + 1;
     }}
+{frag_drain}
     out.color = integrated;
     return out;
 }}
@@ -1152,7 +1231,8 @@ fn fs_main(v: Varyings) -> FragmentOutput {{
 
 
 def _build_wgsl(n, m, k, segment_render_mode="iso",
-                rgba_render_modes=None):
+                rgba_render_modes=None,
+                has_fragments=False, frag_binding=0, K=32):
     parts = [_HEADER, _mat_struct_wgsl(n, m, k)]
     # Grid transform needs to come BEFORE the per-field functions (they call
     # warp()); its bindings sit after the VTK depth bindings.
@@ -1171,7 +1251,10 @@ def _build_wgsl(n, m, k, segment_render_mode="iso",
         mode = (rgba_render_modes[q]
                 if q < len(rgba_render_modes) else "density")
         parts.append(_rgba_field_wgsl(q, n, m, render_mode=mode))
-    parts.append(_main_wgsl(n, m, k))
+    parts.append(_main_wgsl(n, m, k,
+                            has_fragments=has_fragments,
+                            frag_binding=frag_binding,
+                            K=K))
     return "\n".join(parts)
 
 
@@ -1598,6 +1681,105 @@ class RGBAVolumeField:
 
 
 # ---------------------------------------------------------------------------
+# FragmentField: singleton per-bridge A-buffer for depth-correct compositing
+# of rasterized geometry (FiberStrandField, etc.) with the volume ray-march.
+#
+# Per pixel: a sorted list of K fragments, each (depth f32, packed rgba8 u32).
+# Layout in the storage buffer: 2 u32 per fragment, K fragments per pixel,
+# pixel-major (row-major over (x, y)). Counts are kept in a separate buffer
+# of atomic<u32>, one per pixel.
+#
+# Lifecycle:
+#   - lazily allocated on first add_fiber_strands.
+#   - reallocated when viewport size changes (handled by ensure_size).
+#   - per-frame: counts cleared, rasterizers append fragments, sort pass
+#     reorders by depth, main ray-march reads sorted lists and interleaves
+#     fragment compositing with volume samples.
+# ---------------------------------------------------------------------------
+
+class FragmentField:
+    K = 64          # fragments kept per pixel (overflow handled by
+                    # keep-K-shallowest in the rasterizer; deepest is
+                    # evicted when the buffer is full)
+    FRAG_BYTES = 8  # 4 B depth (f32 bitcast u32) + 4 B packed rgba8
+
+    def __init__(self, device):
+        self.device = device
+        self.fragments_buffer = None
+        self.counts_buffer = None
+        self.viewport = (0, 0)
+
+    def ensure_size(self, w, h):
+        if self.viewport == (w, h) and self.fragments_buffer is not None:
+            return
+        self.fragments_buffer = self.device.create_buffer(
+            size=w * h * self.K * self.FRAG_BYTES,
+            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
+        )
+        self.counts_buffer = self.device.create_buffer(
+            size=w * h * 4,
+            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST,
+        )
+        self.viewport = (w, h)
+
+
+# ---------------------------------------------------------------------------
+# FiberStrandField: per-strand cylinder rasterization data source. Holds
+# polyline geometry on the GPU; render-time, an instanced quad expansion +
+# cylinder-impostor fragment shader writes hits into the bridge's
+# FragmentField. Not directly a Field in the ray-march sense.
+# ---------------------------------------------------------------------------
+
+class FiberStrandField:
+    def __init__(self, device):
+        self.device = device
+        self.segments_buffer = None       # storage buffer of (p0, p1, bid, ...)
+        self.num_segments = 0
+        # Strip-rendering buffers. Per polyline-point we emit 2 vertices
+        # (top, bot of the tube). The index buffer wires up adjacent
+        # sub-segments via SHARED vertex indices, so the rasterization
+        # mesh is watertight by construction (no per-joint billboard
+        # boundary).
+        self.vertex_buffer = None
+        self.index_buffer = None
+        self.num_indices = 0
+        self.palette_tex = None           # rgba8unorm 1D, 256 entries
+        self.palette_view = None
+        self.params_ubo = None            # per-field StrandParams UBO
+        self.bind_group = None            # per-field bind group for raster pipeline
+        self.world_from_local = np.eye(4, dtype=np.float32)
+        self.tube_radius_mm = 0.2
+        self.k_ambient = 0.20
+        self.k_diffuse = 0.65
+        self.k_specular = 0.20
+        self.shininess = 96.0
+        self.visible = True
+        self._bounds = (np.array([-100, -100, -100], dtype=np.float32),
+                        np.array([100, 100, 100], dtype=np.float32))
+
+    def aabb(self):
+        return self._bounds
+
+    def write_palette(self, palette_rgba_u8):
+        """palette_rgba_u8: (256, 4) uint8. Bundle 0 reserved (no tube)."""
+        arr = np.ascontiguousarray(
+            np.asarray(palette_rgba_u8, dtype=np.uint8).reshape(256, 4))
+        if self.palette_tex is None:
+            self.palette_tex = self.device.create_texture(
+                size=(256, 1, 1), dimension="1d",
+                format=wgpu.TextureFormat.rgba8unorm,
+                usage=(wgpu.TextureUsage.TEXTURE_BINDING
+                       | wgpu.TextureUsage.COPY_DST),
+            )
+            self.palette_view = self.palette_tex.create_view()
+        self.device.queue.write_texture(
+            {"texture": self.palette_tex, "mip_level": 0, "origin": (0, 0, 0)},
+            arr,
+            {"offset": 0, "bytes_per_row": 256 * 4, "rows_per_image": 1},
+            (256, 1, 1))
+
+
+# ---------------------------------------------------------------------------
 # Bridge class
 # ---------------------------------------------------------------------------
 
@@ -1622,8 +1804,12 @@ class WgpuVolumeBridge:
         self._size = (0, 0)
         self._aligned_bpr = 0
         self._fields = []
+        # Camera UBO: proj_inv (64) + view_inv (64) + size (16) +
+        # proj (64) + view (64) = 272, rounded to 16 = 272.
+        # The forward proj/view are needed by FragmentField's depth
+        # comparisons during the ray-march fragment-integration loop.
         self._cam_ubo = self.device.create_buffer(
-            size=144,
+            size=272,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
         self._mat_ubo = None
 
@@ -1675,6 +1861,19 @@ class WgpuVolumeBridge:
         # nodes driving RGBA volumes. On display change we rebuild the
         # palette UBO and rerun the bake using cached textures.
         self._rgba_obs_tags: list = []
+
+        # Per-strand cylinder rasterization sources. Each entry is a
+        # FiberStrandField; rasterization writes hits into self._fragment_field
+        # (lazy singleton) for depth-correct compositing in the main shader.
+        self._fiber_strand_fields: list = []
+        self._fragment_field: FragmentField | None = None
+        self._strand_pipeline = None
+        self._strand_pipeline_bgl = None
+        self._fragment_clear_pipeline = None
+        self._fragment_clear_bgl = None
+        self._fragment_sort_pipeline = None
+        self._fragment_sort_bgl = None
+        self._fragment_sort_ubo = None
 
         # Active clip planes in world space: list of (nx, ny, nz, offset).
         # Observed from vtkMRMLClipModelsNode(s) via set_clip_nodes().
@@ -1780,6 +1979,8 @@ class WgpuVolumeBridge:
             except Exception: pass
         self._rgba_obs_tags = []
         self._rgba_volumes = []
+        self._fiber_strand_fields = []
+        self._fragment_field = None
         for obj, tag in self._clip_obs_tags:
             try: obj.RemoveObserver(tag)
             except Exception: pass
@@ -1842,7 +2043,8 @@ class WgpuVolumeBridge:
         n = len(self._fields)
         m = len(self._segments)
         k = len(self._rgba_volumes)
-        if n == 0 and m == 0 and k == 0:
+        has_strands = bool(self._fiber_strand_fields)
+        if n == 0 and m == 0 and k == 0 and not has_strands:
             self._pipeline = None
             self._bind_group = None
             return
@@ -1858,9 +2060,16 @@ class WgpuVolumeBridge:
 
         rgba_modes = [getattr(r, "render_mode", "density")
                       for r in self._rgba_volumes]
+        # Fragment-buffer bindings sit AFTER all field bindings:
+        #   2 + n*4 + 4 (depth+grid) + m*2 + k*3 = frag_base.
+        frag_base = 2 + n * 4 + 4 + m * 2 + k * 3
+        K_const = FragmentField.K
         wgsl = _build_wgsl(n, m, k,
                            segment_render_mode=self._segment_render_mode,
-                           rgba_render_modes=rgba_modes)
+                           rgba_render_modes=rgba_modes,
+                           has_fragments=has_strands,
+                           frag_binding=frag_base,
+                           K=K_const)
         shader = self.device.create_shader_module(code=wgsl)
 
         self._mat_ubo = self.device.create_buffer(
@@ -1941,6 +2150,13 @@ class WgpuVolumeBridge:
                              "view_dimension": wgpu.TextureViewDimension.d3,
                              "multisampled": False}},
             ]
+        if has_strands:
+            entries += [
+                {"binding": frag_base + 0, "visibility": wgpu.ShaderStage.FRAGMENT,
+                 "buffer": {"type": wgpu.BufferBindingType.read_only_storage}},
+                {"binding": frag_base + 1, "visibility": wgpu.ShaderStage.FRAGMENT,
+                 "buffer": {"type": wgpu.BufferBindingType.read_only_storage}},
+            ]
         self._bgl = self.device.create_bind_group_layout(entries=entries)
         pl = self.device.create_pipeline_layout(bind_group_layouts=[self._bgl])
         self._pipeline = self.device.create_render_pipeline(
@@ -1966,7 +2182,8 @@ class WgpuVolumeBridge:
         """Assemble bind group from current fields + current depth texture.
         Called when pipeline rebuilds OR when the depth texture reallocates."""
         if self._bgl is None or (not self._fields and not self._segments
-                                 and not self._rgba_volumes):
+                                 and not self._rgba_volumes
+                                 and not self._fiber_strand_fields):
             return
         bg = [
             {"binding": 0, "resource": {
@@ -2007,6 +2224,19 @@ class WgpuVolumeBridge:
                 {"binding": br+0, "resource": r.sampler},
                 {"binding": br+1, "resource": r.tex_view},
                 {"binding": br+2, "resource": r._label_tex_view},
+            ]
+        if self._fiber_strand_fields and self._fragment_field is not None \
+                and self._fragment_field.fragments_buffer is not None:
+            frag_base = br0 + len(self._rgba_volumes) * 3
+            bg += [
+                {"binding": frag_base + 0, "resource": {
+                    "buffer": self._fragment_field.counts_buffer,
+                    "offset": 0,
+                    "size": self._fragment_field.counts_buffer.size}},
+                {"binding": frag_base + 1, "resource": {
+                    "buffer": self._fragment_field.fragments_buffer,
+                    "offset": 0,
+                    "size": self._fragment_field.fragments_buffer.size}},
             ]
         self._bind_group = self.device.create_bind_group(
             layout=self._bgl, entries=bg)
@@ -3334,6 +3564,494 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 return None
         return first
 
+    # ---------------------------------------------------------------------
+    # FragmentField + strand rasterization pipelines (lazy)
+    # ---------------------------------------------------------------------
+
+    _STRAND_RASTER_WGSL = """
+// Strip-based polyline rasterization. Per polyline-point we emit two
+// vertices (top + bot of the tube); adjacent sub-segments are wired up
+// via an INDEX BUFFER that shares the joint vertices, so the
+// rasterization mesh is watertight by construction (no per-joint
+// billboard boundary, no rasterization gap from edge tile mismatch).
+//
+// Each vertex carries its own polyline neighborhood (prev_p0, pos,
+// next_p1) so it can compute a bisector tangent at its own point and
+// deflect to ±r along the perpendicular to (bisector, view ray). The
+// LEFT vertex of every segment also forwards p0/p1/prev_p0 in world
+// space via `@interpolate(flat)` so the fragment shader can run the
+// analytic cylinder + sphere intersection against the correct segment.
+
+struct Camera {
+    proj_inv: mat4x4<f32>,
+    view_inv: mat4x4<f32>,
+    size: vec4<f32>,        // (w, h, _, _)
+    proj: mat4x4<f32>,
+    view: mat4x4<f32>,
+};
+
+struct StrandParams {
+    world_from_local: mat4x4<f32>,
+    tube_radius_mm: f32,
+    pad_world_mm: f32,       // billboard padding for sub-pixel coverage
+    K: u32,                  // FragmentField K (max frags / pixel)
+    _pad0: u32,
+    shade: vec4<f32>,        // (ka, kd, ks, shin)
+};
+
+@group(0) @binding(0) var<uniform> u_cam: Camera;
+@group(0) @binding(1) var<uniform> u_field: StrandParams;
+@group(0) @binding(3) var t_pal: texture_1d<f32>;
+@group(0) @binding(4) var<storage, read_write> u_counts: array<atomic<u32>>;
+// Atomic view of the fragment buffer so keep-K-shallowest can do a
+// compare-exchange on the deepest stored slot. Sort + main shaders read
+// the same memory non-atomically (no concurrent writes after raster).
+@group(0) @binding(5) var<storage, read_write> u_fragments: array<atomic<u32>>;
+
+struct VsIn {
+    @location(0) pos_local: vec3<f32>,
+    @location(1) prev_p0_local: vec3<f32>,
+    @location(2) next_p1_local: vec3<f32>,
+    @location(3) side_sign: f32,    // -1 = bot, +1 = top
+    @location(4) bundle_id: f32,
+    @location(5) is_head: f32,
+};
+
+struct VsOut {
+    @builtin(position) clip: vec4<f32>,
+    // p0/p1/prev_p0 of the segment THIS fragment belongs to. Sourced
+    // from the LEFT vertex of each triangle (provoking-vertex-first +
+    // @interpolate(flat)). The LEFT vertex's pos_local is segment K's
+    // p0; its next_p1_local is segment K's p1; its prev_p0_local is
+    // segment K-1's p0 (used for the inside-prev-cylinder check).
+    @location(0) @interpolate(flat) p0_world: vec3<f32>,
+    @location(1) @interpolate(flat) p1_world: vec3<f32>,
+    @location(2) @interpolate(flat) bundle_id: f32,
+    @location(3) @interpolate(flat) is_head: f32,
+    @location(4) @interpolate(flat) prev_p0_world: vec3<f32>,
+};
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    // pos_local always = segment K's p0; next_p1_local = K's p1;
+    // prev_p0_local = K-1's p0 (for inside_prev sphere check).
+    // bundle_id encodes (whole part = bundle ID, fractional = endpoint
+    // selector: 0.0 = position vertex at p0, 0.5 = at p1).
+    let bid_whole = floor(in.bundle_id);
+    let endpoint = in.bundle_id - bid_whole;  // 0.0 or 0.5
+    let endpoint_t = step(0.25, endpoint);    // 0.0 or 1.0
+
+    let p0_w4 = u_field.world_from_local * vec4<f32>(in.pos_local, 1.0);
+    let p0_w = p0_w4.xyz / max(p0_w4.w, 1e-6);
+    let p1_w4 = u_field.world_from_local * vec4<f32>(in.next_p1_local, 1.0);
+    let p1_w = p1_w4.xyz / max(p1_w4.w, 1e-6);
+    let prev_w4 = u_field.world_from_local * vec4<f32>(in.prev_p0_local, 1.0);
+    let prev_w = prev_w4.xyz / max(prev_w4.w, 1e-6);
+
+    // Anchor the vertex at p0 or p1 depending on endpoint flag.
+    let anchor = mix(p0_w, p1_w, endpoint_t);
+
+    // Bisector tangent at the ANCHOR vertex. For a vertex at p0:
+    // bisector = average of prev_axis and current axis. For a vertex
+    // at p1: bisector = current axis (we don't have next's-next info,
+    // and for the LAST segment of a strand p1 is the tail anyway).
+    // Adjacent segments at the joint will compute the SAME bisector
+    // there: K's p1 vertex uses K's axis only; K+1's p0 vertex uses
+    // average(K's axis, K+1's axis). These differ for kinked joints
+    // -- but for collinear sub-segments they coincide.
+    let cur_axis = p1_w - p0_w;
+    let cur_l = length(cur_axis);
+    let prev_axis = p0_w - prev_w;
+    let prev_l = length(prev_axis);
+
+    var bis_p0 = vec3<f32>(1.0, 0.0, 0.0);
+    if (cur_l > 1e-6) { bis_p0 = cur_axis / cur_l; }
+    if (prev_l > 1e-6 && cur_l > 1e-6) {
+        let s = prev_axis / prev_l + cur_axis / cur_l;
+        let sl = length(s);
+        if (sl > 1e-6) { bis_p0 = s / sl; }
+    }
+    var bis_p1 = vec3<f32>(1.0, 0.0, 0.0);
+    if (cur_l > 1e-6) { bis_p1 = cur_axis / cur_l; }
+
+    let bis = mix(bis_p0, bis_p1, endpoint_t);
+
+    let cam_pos = u_cam.view_inv[3].xyz;
+    let view_v = anchor - cam_pos;
+    let side_raw = cross(bis, view_v);
+    var side = vec3<f32>(0.0, 1.0, 0.0);
+    let sl = length(side_raw);
+    if (sl > 1e-6) { side = side_raw / sl; }
+
+    let r = u_field.tube_radius_mm + max(u_field.pad_world_mm, 0.0);
+    let p_world = anchor + (r * in.side_sign) * side;
+
+    var out: VsOut;
+    out.clip = u_cam.proj * u_cam.view * vec4<f32>(p_world, 1.0);
+    out.p0_world = p0_w;
+    out.p1_world = p1_w;
+    out.bundle_id = bid_whole;     // strip the endpoint encoding
+    out.is_head = in.is_head;
+    out.prev_p0_world = prev_w;
+    return out;
+}
+
+fn ndc_to_world_strand(ndc: vec4<f32>) -> vec3<f32> {
+    let v = u_cam.proj_inv * ndc;
+    let w = u_cam.view_inv * vec4<f32>(v.xyz / v.w, 1.0);
+    return w.xyz;
+}
+
+struct FsOut {
+    @location(0) dummy: vec4<f32>,
+};
+
+@fragment
+fn fs_main(in: VsOut) -> FsOut {
+    var out: FsOut;
+    out.dummy = vec4<f32>(0.0);
+
+    // Reconstruct world-space ray for this pixel from frag_coord (in.clip).
+    let ndc_x = (in.clip.x / u_cam.size.x) * 2.0 - 1.0;
+    let ndc_y = 1.0 - (in.clip.y / u_cam.size.y) * 2.0;
+    let wn = ndc_to_world_strand(vec4<f32>(ndc_x, ndc_y, 0.0, 1.0));
+    let wf = ndc_to_world_strand(vec4<f32>(ndc_x, ndc_y, 1.0, 1.0));
+    let ro = wn;
+    let rd = normalize(wf - wn);
+
+    // Ray-cylinder body + ray-sphere(p0). Pick the closest hit. The
+    // "owner" rule for shared endpoints: cylinder body uses strict
+    // along < axis_len so a segment doesn't render its downstream
+    // endpoint -- the *next* segment's p0 sphere covers it. No p1
+    // sphere on this segment, so no doubling. The closest-hit pick
+    // ensures one fragment per pixel even where the sphere overlaps
+    // the cylinder body near p0.
+    let axis = in.p1_world - in.p0_world;
+    let axis_len = length(axis);
+    if (axis_len < 1e-6) { discard; }
+    let axis_n = axis / axis_len;
+    let r = u_field.tube_radius_mm;
+
+    var best_t: f32 = 1e30;
+    var best_hit = vec3<f32>(0.0);
+    var best_normal = vec3<f32>(0.0);
+
+    // Cylinder body (along ∈ [0, axis_len), strict on the right).
+    // Ownership convention: each interior joint is owned by the NEXT
+    // segment (via its `along >= 0` accept). The strict-`<` bound on
+    // the right prevents adjacent segments' cylinders from both
+    // emitting at the joint -- doubled fragments would alpha-modulate
+    // translucent tubes (joints visibly more opaque than the body).
+    // The next segment's billboard back-extension by r ensures the
+    // joint pixel is rasterized even when the top-left rule gives the
+    // boundary to the previous segment.
+    let oc = ro - in.p0_world;
+    let rd_along = dot(rd, axis_n);
+    let rd_perp = rd - rd_along * axis_n;
+    let oc_along = dot(oc, axis_n);
+    let oc_perp = oc - oc_along * axis_n;
+    let a = dot(rd_perp, rd_perp);
+    if (a > 1e-9) {
+        let b = 2.0 * dot(oc_perp, rd_perp);
+        let c = dot(oc_perp, oc_perp) - r * r;
+        let disc = b * b - 4.0 * a * c;
+        if (disc >= 0.0) {
+            let sd = sqrt(disc);
+            let tc = (-b - sd) / (2.0 * a);
+            if (tc >= 0.0) {
+                let hit_c = ro + tc * rd;
+                let along_c = dot(hit_c - in.p0_world, axis_n);
+                // The cylinder hit's along_c can substantially overshoot
+                // [0, axis_len] under perspective foreshortening: a ray
+                // through a pixel near a segment quad's edge can hit
+                // the *infinite* cylinder at a position that's
+                // physically inside the next segment's body. With
+                // per-segment quads (no sharing across segments) and
+                // top-left rule guaranteeing one triangle per pixel,
+                // accepting a generous tolerance is safe -- adjacent
+                // segments can't both emit at the same pixel. Tolerance
+                // = axis_len covers the typical perspective offset
+                // (~0.25 axis_len in close views; 1x axis_len gives
+                // headroom for steep camera angles).
+                let eps_axis = max(axis_len, 1e-4);
+                if (along_c >= -eps_axis && along_c <= axis_len + eps_axis) {
+                    best_t = tc;
+                    best_hit = hit_c;
+                    let perp_c = (hit_c - in.p0_world) - along_c * axis_n;
+                    best_normal = normalize(perp_c);
+                }
+            }
+        }
+    }
+
+    // p0 sphere. Always tested, but rejected if the hit lies inside
+    // either THIS segment's cylinder (would double the cylinder
+    // fragment) or the PREVIOUS segment's cylinder (collinear case --
+    // would alpha-modulate joints on translucent tubes). Heads bypass
+    // the prev-cylinder check (no previous segment exists). Net
+    // effect: for collinear interiors, the sphere never emits; for
+    // kinks, the sphere fills the convex wedge; for heads, full
+    // hemisphere cap.
+    {
+        let oc0 = ro - in.p0_world;
+        let b0 = 2.0 * dot(rd, oc0);
+        let c0 = dot(oc0, oc0) - r * r;
+        let disc0 = b0 * b0 - 4.0 * c0;
+        if (disc0 >= 0.0) {
+            let sd0 = sqrt(disc0);
+            let t0 = (-b0 - sd0) * 0.5;
+            if (t0 >= 0.0 && t0 < best_t) {
+                let hit_0 = ro + t0 * rd;
+                let to_hit = hit_0 - in.p0_world;
+
+                // Inside this segment's cylinder?
+                let along_self = dot(to_hit, axis_n);
+                let perp_self = to_hit - along_self * axis_n;
+                let inside_self =
+                    along_self >= 0.0 && along_self <= axis_len
+                    && dot(perp_self, perp_self) <= r * r + 1e-5;
+
+                // Inside the previous segment's cylinder? (Skip for heads.)
+                var inside_prev = false;
+                if (in.is_head < 0.5) {
+                    let prev_axis_v = in.p0_world - in.prev_p0_world;
+                    let prev_len = length(prev_axis_v);
+                    if (prev_len > 1e-6) {
+                        let prev_dir = prev_axis_v / prev_len;
+                        let to_hit_prev = hit_0 - in.prev_p0_world;
+                        let along_prev = dot(to_hit_prev, prev_dir);
+                        let perp_prev = to_hit_prev - along_prev * prev_dir;
+                        inside_prev =
+                            along_prev >= 0.0 && along_prev <= prev_len
+                            && dot(perp_prev, perp_prev) <= r * r + 1e-5;
+                    }
+                }
+
+                if (in.is_head > 0.5 || (!inside_self && !inside_prev)) {
+                    best_t = t0;
+                    best_hit = hit_0;
+                    best_normal = normalize(hit_0 - in.p0_world);
+                }
+            }
+        }
+    }
+
+    if (best_t > 1e29) { discard; }
+    let hit = best_hit;
+    let tangent = axis_n;
+
+    // Kajiya-Kay headlight shading. textureLoad on the 1D palette (no
+    // sampler filtering -- bundle_id is integer, no need for interp).
+    let bid_clamped = clamp(i32(in.bundle_id), 0, 255);
+    let pal = textureLoad(t_pal, bid_clamped, 0);
+    let base_color = pal.rgb;
+    let bundle_alpha = pal.a;
+
+    // Hybrid shading. Lambertian on the SURFACE NORMAL (perpendicular
+    // to axis at the hit point) gives the cylinder's cross-section
+    // curvature -- bright in the middle of the visible side, dark at
+    // the silhouettes. Kajiya-Kay specular on the TANGENT (along the
+    // axis) gives the anisotropic streak characteristic of hair/fibres.
+    let nl = max(dot(-rd, best_normal), 0.0);
+    let ct = dot(rd, tangent);
+    let st = sqrt(max(1.0 - ct * ct, 0.0));     // sin(angle(rd, T))
+    let shade = u_field.shade;
+    var lit = base_color * (shade.x + shade.y * nl)
+            + vec3<f32>(shade.z * pow(st, max(shade.w, 1.0)) * nl);
+    lit = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    let alpha = bundle_alpha;
+    let cr = u32(clamp(lit.r * alpha, 0.0, 1.0) * 255.0);
+    let cg = u32(clamp(lit.g * alpha, 0.0, 1.0) * 255.0);
+    let cb = u32(clamp(lit.b * alpha, 0.0, 1.0) * 255.0);
+    let ca = u32(clamp(alpha, 0.0, 1.0) * 255.0);
+    let packed = cr | (cg << 8u) | (cb << 16u) | (ca << 24u);
+
+    let clip_hit = u_cam.proj * u_cam.view * vec4<f32>(hit, 1.0);
+    let ndc_z = clip_hit.z / max(clip_hit.w, 1e-6);
+    let depth_01 = clamp(ndc_z * 0.5 + 0.5, 0.0, 1.0);
+
+    let pixel_idx = u32(in.clip.y) * u32(u_cam.size.x) + u32(in.clip.x);
+    let slot = atomicAdd(&u_counts[pixel_idx], 1u);
+    let K = u_field.K;
+    let new_d_bits = bitcast<u32>(depth_01);
+    if (slot < K) {
+        // Fast path: append at the next free slot.
+        let buf_idx = (pixel_idx * K + slot) * 2u;
+        atomicStore(&u_fragments[buf_idx], new_d_bits);
+        atomicStore(&u_fragments[buf_idx + 1u], packed);
+    } else {
+        // Slow path: buffer full. Find the deepest stored fragment and,
+        // if our depth is shallower, atomic-replace it. Read-then-CAS is
+        // racy under concurrent writes from other threads at the same
+        // pixel, but the worst case is "approximate" K-shallowest --
+        // visually far better than first-come-wins.
+        var worst_idx: u32 = 0u;
+        var worst_d_bits: u32 = atomicLoad(&u_fragments[pixel_idx * K * 2u]);
+        var worst_d: f32 = bitcast<f32>(worst_d_bits);
+        for (var i = 1u; i < K; i = i + 1u) {
+            let d_bits = atomicLoad(&u_fragments[(pixel_idx * K + i) * 2u]);
+            let d = bitcast<f32>(d_bits);
+            if (d > worst_d) {
+                worst_d = d;
+                worst_d_bits = d_bits;
+                worst_idx = i;
+            }
+        }
+        if (depth_01 < worst_d) {
+            let buf_idx = (pixel_idx * K + worst_idx) * 2u;
+            let res = atomicCompareExchangeWeak(
+                &u_fragments[buf_idx], worst_d_bits, new_d_bits);
+            if (res.exchanged) {
+                // We won the race; commit the colour. There is a brief
+                // window where another thread can read (new depth, old
+                // colour) -- accepted: races resolve before the strand
+                // pass ends and the sort/main shader fire.
+                atomicStore(&u_fragments[buf_idx + 1u], packed);
+            }
+        }
+    }
+    return out;
+}
+"""
+
+    _FRAG_CLEAR_WGSL = """
+@group(0) @binding(0) var<storage, read_write> u_counts: array<atomic<u32>>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= arrayLength(&u_counts)) { return; }
+    atomicStore(&u_counts[idx], 0u);
+}
+"""
+
+    _FRAG_SORT_WGSL = """
+struct SortParams {
+    width: u32,
+    height: u32,
+    K: u32,
+    _pad: u32,
+};
+
+@group(0) @binding(0) var<storage, read> u_counts: array<u32>;
+@group(0) @binding(1) var<storage, read_write> u_fragments: array<u32>;
+@group(0) @binding(2) var<uniform> u_p: SortParams;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let total = u_p.width * u_p.height;
+    let pixel_idx = gid.x;
+    if (pixel_idx >= total) { return; }
+    let count = min(u_counts[pixel_idx], u_p.K);
+    if (count <= 1u) { return; }
+
+    // Per-pixel insertion sort by depth (ascending: front-to-back).
+    let base = pixel_idx * u_p.K * 2u;
+    for (var i = 1u; i < count; i = i + 1u) {
+        let key_d_bits = u_fragments[base + i * 2u];
+        let key_c = u_fragments[base + i * 2u + 1u];
+        let key_d = bitcast<f32>(key_d_bits);
+        var j = i;
+        loop {
+            if (j == 0u) { break; }
+            let prev_d = bitcast<f32>(u_fragments[base + (j - 1u) * 2u]);
+            if (prev_d <= key_d) { break; }
+            u_fragments[base + j * 2u]      = u_fragments[base + (j - 1u) * 2u];
+            u_fragments[base + j * 2u + 1u] = u_fragments[base + (j - 1u) * 2u + 1u];
+            j = j - 1u;
+        }
+        u_fragments[base + j * 2u] = key_d_bits;
+        u_fragments[base + j * 2u + 1u] = key_c;
+    }
+}
+"""
+
+    def _ensure_strand_pipelines(self):
+        if self._strand_pipeline is not None:
+            return
+        # ---- Strand raster pipeline (vertex + fragment) ----
+        shader = self.device.create_shader_module(
+            code=self._STRAND_RASTER_WGSL)
+        # Strip pipeline: per-vertex polyline neighborhood data + index
+        # buffer that shares vertices at sub-segment joints. No segment
+        # storage buffer -- the LEFT vertex of each segment carries
+        # p0/p1/prev_p0 forward to the fragment shader via @flat.
+        self._strand_pipeline_bgl = self.device.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
+             "buffer": {"type": wgpu.BufferBindingType.uniform}},
+            {"binding": 1, "visibility": wgpu.ShaderStage.VERTEX | wgpu.ShaderStage.FRAGMENT,
+             "buffer": {"type": wgpu.BufferBindingType.uniform}},
+            {"binding": 3, "visibility": wgpu.ShaderStage.FRAGMENT,
+             "texture": {"sample_type": wgpu.TextureSampleType.float,
+                         "view_dimension": wgpu.TextureViewDimension.d1,
+                         "multisampled": False}},
+            {"binding": 4, "visibility": wgpu.ShaderStage.FRAGMENT,
+             "buffer": {"type": wgpu.BufferBindingType.storage}},
+            {"binding": 5, "visibility": wgpu.ShaderStage.FRAGMENT,
+             "buffer": {"type": wgpu.BufferBindingType.storage}},
+        ])
+        layout = self.device.create_pipeline_layout(
+            bind_group_layouts=[self._strand_pipeline_bgl])
+        # Render pass writes a dummy output; the actual visible work is the
+        # atomic-append into the A-buffer. Color target format must match
+        # whatever begin_render_pass binds, but we use a 1x1 throwaway view.
+        # Vertex layout (48 bytes): pos_local(12) + prev_p0_local(12)
+        # + next_p1_local(12) + side_sign(4) + bundle_id(4) + is_head(4).
+        vertex_buffer_layout = {
+            "array_stride": 48,
+            "step_mode": wgpu.VertexStepMode.vertex,
+            "attributes": [
+                {"format": wgpu.VertexFormat.float32x3, "offset":  0, "shader_location": 0},
+                {"format": wgpu.VertexFormat.float32x3, "offset": 12, "shader_location": 1},
+                {"format": wgpu.VertexFormat.float32x3, "offset": 24, "shader_location": 2},
+                {"format": wgpu.VertexFormat.float32,   "offset": 36, "shader_location": 3},
+                {"format": wgpu.VertexFormat.float32,   "offset": 40, "shader_location": 4},
+                {"format": wgpu.VertexFormat.float32,   "offset": 44, "shader_location": 5},
+            ],
+        }
+        self._strand_pipeline = self.device.create_render_pipeline(
+            layout=layout,
+            vertex={"module": shader, "entry_point": "vs_main",
+                    "buffers": [vertex_buffer_layout]},
+            fragment={"module": shader, "entry_point": "fs_main",
+                      "targets": [{"format": wgpu.TextureFormat.rgba8unorm,
+                                   "write_mask": 0}]},
+            primitive={"topology": wgpu.PrimitiveTopology.triangle_list,
+                       "cull_mode": wgpu.CullMode.none},
+        )
+
+        # ---- Clear-counts compute pipeline ----
+        clear_shader = self.device.create_shader_module(
+            code=self._FRAG_CLEAR_WGSL)
+        self._fragment_clear_bgl = self.device.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE,
+             "buffer": {"type": wgpu.BufferBindingType.storage}},
+        ])
+        self._fragment_clear_pipeline = self.device.create_compute_pipeline(
+            layout=self.device.create_pipeline_layout(
+                bind_group_layouts=[self._fragment_clear_bgl]),
+            compute={"module": clear_shader, "entry_point": "main"})
+
+        # ---- Sort compute pipeline ----
+        sort_shader = self.device.create_shader_module(
+            code=self._FRAG_SORT_WGSL)
+        self._fragment_sort_bgl = self.device.create_bind_group_layout(entries=[
+            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE,
+             "buffer": {"type": wgpu.BufferBindingType.read_only_storage}},
+            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE,
+             "buffer": {"type": wgpu.BufferBindingType.storage}},
+            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE,
+             "buffer": {"type": wgpu.BufferBindingType.uniform}},
+        ])
+        self._fragment_sort_pipeline = self.device.create_compute_pipeline(
+            layout=self.device.create_pipeline_layout(
+                bind_group_layouts=[self._fragment_sort_bgl]),
+            compute={"module": sort_shader, "entry_point": "main"})
+        self._fragment_sort_ubo = self.device.create_buffer(
+            size=16,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+
     def add_colorize_volume(self, volume_node, segmentation_node,
                             sigma_voxels=1.5, window_level=None,
                             modulate_by_ct=True,
@@ -3623,6 +4341,317 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.rw.Render()
         return rgba_field
 
+    # ---------------------------------------------------------------------
+    # FiberStrandField (per-strand cylinder rasterization, A-buffer)
+    # ---------------------------------------------------------------------
+
+    def add_fiber_strands(self, polydata, bundle_palette,
+                          tube_radius_mm=0.2,
+                          pad_world_mm=None,
+                          bundle_id_array_name=None,
+                          parent_transform_node=None,
+                          k_ambient=0.20, k_diffuse=0.65,
+                          k_specular=0.20, shininess=96.0,
+                          subdivisions=4):
+        """Add a per-strand cylinder rasterization source. Each polyline
+        segment becomes an instanced quad billboard; the fragment shader
+        does an analytic ray-cylinder intersection and atomic-appends
+        (depth, premultiplied rgba8) into the bridge's FragmentField for
+        depth-correct compositing with the volume ray-march.
+
+        polydata: vtkPolyData with Lines (one polyline per cell). Optionally
+            a cell-data int array `bundle_id_array_name` mapping each
+            polyline to a bundle id in [1, 255].
+        bundle_palette: numpy (256, 4) uint8 RGBA per bundle id. Index 0
+            reserved (no tube). The .a channel doubles as per-bundle
+            opacity.
+        tube_radius_mm: rendered tube radius in world mm.
+        pad_world_mm: extra billboard padding (defaults to tube_radius).
+        subdivisions: each polyline segment is replaced by N short linear
+            sub-segments interpolated along a Catmull-Rom cubic Hermite
+            curve through the polyline points. N=1 = original linear
+            polyline. N>=4 makes the kink between adjacent sub-segments
+            sub-pixel for typical viewing scales (eliminating joint
+            wedge gaps) and gives a smooth tube look at zoom. Cost
+            scales linearly: N x more rasterization + memory.
+        """
+        import vtk.util.numpy_support as vnp
+
+        # --- Extract segments + bundle ids. ---
+        pts = polydata.GetPoints()
+        if pts is None or pts.GetNumberOfPoints() == 0:
+            raise ValueError("polydata has no points")
+        all_pts = vnp.vtk_to_numpy(pts.GetData()).astype(np.float64)
+        cell_bundles = None
+        if bundle_id_array_name is not None:
+            arr = polydata.GetCellData().GetArray(bundle_id_array_name)
+            if arr is not None:
+                cell_bundles = vnp.vtk_to_numpy(arr).astype(np.int32)
+        lines = polydata.GetLines()
+        if lines is None or lines.GetNumberOfCells() == 0:
+            raise ValueError("polydata has no Lines")
+        lines.InitTraversal()
+        id_list = vtk.vtkIdList()
+        # Per-vertex strip data, accumulated across all strands.
+        # Each polyline-point produces 2 vertices (top, bot). Adjacent
+        # sub-segments share their joint vertex INDEX, so the
+        # rasterization mesh is watertight by construction (no per-
+        # joint billboard tiling, no edge precision artifacts).
+        verts_pos: list = []           # vec3 per vertex
+        verts_prev: list = []          # vec3: the polyline point BEFORE this one (= self for heads)
+        verts_next: list = []          # vec3: the polyline point AFTER this one (= self for tails)
+        verts_side: list = []          # f32: -1 or +1
+        verts_bid: list = []           # f32: bundle id
+        verts_head: list = []          # f32: 1 if this point is a polyline head, else 0
+        indices: list = []             # u32 triangle list, 6 indices per sub-segment
+        # AABB tracking.
+        all_min = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
+        all_max = -all_min.copy()
+        cell_idx = 0
+        n_sub = max(1, int(subdivisions))
+        num_segments = 0
+
+        while lines.GetNextCell(id_list):
+            n_pts = id_list.GetNumberOfIds()
+            bid = 1
+            if cell_bundles is not None and cell_idx < len(cell_bundles):
+                bid = max(1, min(255, int(cell_bundles[cell_idx])))
+            cell_idx += 1
+            if n_pts < 2:
+                continue
+            # Pull all points for this polyline, drop zero-length runs.
+            pts = np.asarray(
+                [all_pts[id_list.GetId(i)] for i in range(n_pts)],
+                dtype=np.float64)
+            keep = np.ones(len(pts), dtype=bool)
+            for i in range(1, len(pts)):
+                if np.linalg.norm(pts[i] - pts[i - 1]) < 1e-6:
+                    keep[i] = False
+            pts = pts[keep]
+            if len(pts) < 2:
+                continue
+            # Catmull-Rom subdivision: cubic Hermite through every point
+            # with centered-difference tangents. n_sub samples per
+            # original polyline-segment; n_sub=1 disables subdivision.
+            tans = np.zeros_like(pts)
+            tans[1:-1] = 0.5 * (pts[2:] - pts[:-2])
+            tans[0] = pts[1] - pts[0]
+            tans[-1] = pts[-1] - pts[-2]
+            ts = np.linspace(0.0, 1.0, n_sub + 1)
+            tcol = ts[:, None]
+            t2 = tcol * tcol
+            t3 = t2 * tcol
+            h00 = 2 * t3 - 3 * t2 + 1
+            h10 = t3 - 2 * t2 + tcol
+            h01 = -2 * t3 + 3 * t2
+            h11 = t3 - t2
+            # Densify the polyline to (len(pts)-1)*n_sub + 1 points.
+            dense_pts = [pts[0]]
+            for i in range(len(pts) - 1):
+                sub_pts = (h00 * pts[i] + h10 * tans[i]
+                           + h01 * pts[i + 1] + h11 * tans[i + 1])
+                # Skip the first sample of each segment (it equals the
+                # last sample of the previous segment / pts[i]).
+                for k in range(1, n_sub + 1):
+                    dense_pts.append(sub_pts[k])
+            dense_pts = np.asarray(dense_pts, dtype=np.float64)
+            # Drop sub-segments of zero length (shouldn't happen with
+            # smooth Catmull-Rom, but defensive).
+            keep_dense = np.ones(len(dense_pts), dtype=bool)
+            for i in range(1, len(dense_pts)):
+                if np.linalg.norm(
+                        dense_pts[i] - dense_pts[i - 1]) < 1e-6:
+                    keep_dense[i] = False
+            dense_pts = dense_pts[keep_dense]
+            if len(dense_pts) < 2:
+                continue
+            all_min = np.minimum(all_min, dense_pts.min(axis=0))
+            all_max = np.maximum(all_max, dense_pts.max(axis=0))
+
+            # Per-segment 4 vertices (NO sharing across segments). At
+            # each shared joint we have duplicate vertex pairs: for
+            # segment K-1 (whose right endpoint is the joint) and for
+            # segment K (whose left endpoint is the joint). All 4
+            # vertices of segment K's quad carry segment K's own
+            # (pos=p0, next=p1, prev=prev_p0) data, so flat-interp
+            # delivers correct segment data regardless of provoking
+            # vertex (works whether the backend uses spec-mandated
+            # "first" or Metal-native "last"). Duplicate joint
+            # vertices project to identical clip coords for collinear
+            # joints -> rasterization is still watertight.
+            #
+            # We add an EndpointFlag (0 = use p0, 1 = use p1) packed
+            # into bundle_id's fractional bit to position the vertex
+            # at the correct end without requiring a separate
+            # attribute. (Vertex layout has 6 attribs; adding a 7th
+            # would mean a layout change.) Concretely: bundle_id_f =
+            # bundle_id (whole) + 0.5 if endpoint==1 else 0.0.
+            n_dense = len(dense_pts)
+            for i in range(n_dense - 1):
+                p0 = dense_pts[i]
+                p1 = dense_pts[i + 1]
+                prev = dense_pts[i - 1] if i > 0 else p0
+                is_head = 1.0 if i == 0 else 0.0
+                # 4 vertices per segment quad, each with all of segment
+                # K's data. Endpoint flag distinguishes p0 vs p1 vertex.
+                # Vertex 0: top@p0 (side=+1, endpoint=0)
+                # Vertex 1: bot@p0 (side=-1, endpoint=0)
+                # Vertex 2: top@p1 (side=+1, endpoint=1)
+                # Vertex 3: bot@p1 (side=-1, endpoint=1)
+                base_v = len(verts_pos)
+                for sign, ep in [(+1.0, 0.0), (-1.0, 0.0),
+                                 (+1.0, 1.0), (-1.0, 1.0)]:
+                    verts_pos.append(p0)         # always seg K's p0
+                    verts_prev.append(prev)
+                    verts_next.append(p1)        # always seg K's p1
+                    verts_side.append(sign)
+                    # Pack endpoint flag into bundle_id field:
+                    # whole part = bundle_id, fractional = endpoint.
+                    verts_bid.append(float(bid) + 0.5 * ep)
+                    verts_head.append(is_head)
+                # Triangle indices: standard quad split.
+                # Both triangles' first vertex is at p0 (vertex 0 or 1)
+                # so flat-interp from FIRST vertex also yields seg K's
+                # data -- redundant safety with the all-4-store
+                # approach.
+                indices.extend([base_v + 0, base_v + 1, base_v + 2])
+                indices.extend([base_v + 1, base_v + 3, base_v + 2])
+                num_segments += 1
+
+        if not verts_pos:
+            raise ValueError("polydata has Lines but no usable segments")
+
+        # --- Build the FiberStrandField + GPU resources. ---
+        sf = FiberStrandField(self.device)
+        sf.tube_radius_mm = float(tube_radius_mm)
+        if pad_world_mm is None:
+            pad_world_mm = float(tube_radius_mm) * 1.0
+        sf.k_ambient = float(k_ambient)
+        sf.k_diffuse = float(k_diffuse)
+        sf.k_specular = float(k_specular)
+        sf.shininess = float(shininess)
+        if parent_transform_node is not None:
+            pm = vtk.vtkMatrix4x4()
+            parent_transform_node.GetMatrixTransformToWorld(pm)
+            sf.world_from_local = np.array(
+                [[pm.GetElement(i, j) for j in range(4)] for i in range(4)],
+                dtype=np.float32)
+
+        # World AABB from accumulated min/max in local space.
+        wfl = np.asarray(sf.world_from_local, dtype=np.float64)
+        local_corners = np.array([
+            [all_min[0], all_min[1], all_min[2]],
+            [all_max[0], all_min[1], all_min[2]],
+            [all_min[0], all_max[1], all_min[2]],
+            [all_max[0], all_max[1], all_min[2]],
+            [all_min[0], all_min[1], all_max[2]],
+            [all_max[0], all_min[1], all_max[2]],
+            [all_min[0], all_max[1], all_max[2]],
+            [all_max[0], all_max[1], all_max[2]],
+        ], dtype=np.float64)
+        ch = np.hstack([local_corners, np.ones((8, 1))])
+        cw = (wfl @ ch.T).T[:, :3]
+        pad = float(tube_radius_mm) * 4.0
+        sf._bounds = ((cw.min(axis=0) - pad).astype(np.float32),
+                      (cw.max(axis=0) + pad).astype(np.float32))
+
+        # Vertex buffer: per-vertex strip data (48 bytes each).
+        # Layout matches the pipeline's vertex_buffer_layout.
+        n_verts = len(verts_pos)
+        vbuf = np.zeros((n_verts, 12), dtype=np.float32)
+        vbuf[:, 0:3] = np.asarray(verts_pos, dtype=np.float32)
+        vbuf[:, 3:6] = np.asarray(verts_prev, dtype=np.float32)
+        vbuf[:, 6:9] = np.asarray(verts_next, dtype=np.float32)
+        vbuf[:, 9] = np.asarray(verts_side, dtype=np.float32)
+        vbuf[:, 10] = np.asarray(verts_bid, dtype=np.float32)
+        vbuf[:, 11] = np.asarray(verts_head, dtype=np.float32)
+        sf.vertex_buffer = self.device.create_buffer(
+            size=vbuf.nbytes,
+            usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.COPY_DST)
+        self.device.queue.write_buffer(
+            sf.vertex_buffer, 0, np.ascontiguousarray(vbuf).tobytes())
+
+        # Index buffer (u32).
+        ibuf = np.asarray(indices, dtype=np.uint32)
+        sf.index_buffer = self.device.create_buffer(
+            size=ibuf.nbytes,
+            usage=wgpu.BufferUsage.INDEX | wgpu.BufferUsage.COPY_DST)
+        self.device.queue.write_buffer(
+            sf.index_buffer, 0, np.ascontiguousarray(ibuf).tobytes())
+        sf.num_indices = int(ibuf.size)
+        sf.num_segments = int(num_segments)
+
+        # Palette.
+        sf.write_palette(np.asarray(bundle_palette, dtype=np.uint8))
+
+        # Per-field StrandParams UBO (96 bytes: mat4 + 4 floats + 4 padding floats + vec4).
+        sf.params_ubo = self.device.create_buffer(
+            size=128,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+        self._update_strand_params_ubo(sf, pad_world_mm)
+
+        # Compile pipelines + create bind group. Bind group references
+        # FragmentField buffers, so the FragmentField must exist first.
+        self._ensure_strand_pipelines()
+        if self._fragment_field is None:
+            self._fragment_field = FragmentField(self.device)
+        # Allocate fragment buffers at a sensible default size; will be
+        # reallocated to match the actual viewport on first render.
+        try:
+            w, h = self.rw.GetSize()
+            if w > 0 and h > 0:
+                self._fragment_field.ensure_size(w, h)
+        except Exception:
+            pass
+        if self._fragment_field.fragments_buffer is None:
+            # Pre-allocate at 1080p so the bind group can resolve. Will
+            # reallocate at first render if the actual viewport differs.
+            self._fragment_field.ensure_size(1920, 1080)
+
+        sf.bind_group = self._make_strand_bind_group(sf)
+        self._fiber_strand_fields.append(sf)
+        self._rebuild_pipeline()
+        self.rw.Render()
+        return sf
+
+    def _update_strand_params_ubo(self, sf, pad_world_mm):
+        import struct as _st
+        buf = bytearray(128)
+        wfl = np.asarray(sf.world_from_local,
+                         dtype=np.float32).T.ravel()
+        for i in range(16):
+            _st.pack_into("<f", buf, i * 4, float(wfl[i]))
+        _st.pack_into("<f", buf, 64, float(sf.tube_radius_mm))
+        _st.pack_into("<f", buf, 68, float(pad_world_mm))
+        _st.pack_into("<I", buf, 72, FragmentField.K)
+        _st.pack_into("<I", buf, 76, 0)  # _pad0
+        _st.pack_into("<f", buf, 80, float(sf.k_ambient))
+        _st.pack_into("<f", buf, 84, float(sf.k_diffuse))
+        _st.pack_into("<f", buf, 88, float(sf.k_specular))
+        _st.pack_into("<f", buf, 92, max(float(sf.shininess), 1.0))
+        # 96..128 padding (struct rounded to 16-byte alignment by WGSL).
+        self.device.queue.write_buffer(sf.params_ubo, 0, bytes(buf))
+
+    def _make_strand_bind_group(self, sf):
+        return self.device.create_bind_group(
+            layout=self._strand_pipeline_bgl, entries=[
+                {"binding": 0, "resource": {
+                    "buffer": self._cam_ubo, "offset": 0,
+                    "size": self._cam_ubo.size}},
+                {"binding": 1, "resource": {
+                    "buffer": sf.params_ubo, "offset": 0,
+                    "size": sf.params_ubo.size}},
+                {"binding": 3, "resource": sf.palette_view},
+                {"binding": 4, "resource": {
+                    "buffer": self._fragment_field.counts_buffer,
+                    "offset": 0,
+                    "size": self._fragment_field.counts_buffer.size}},
+                {"binding": 5, "resource": {
+                    "buffer": self._fragment_field.fragments_buffer,
+                    "offset": 0,
+                    "size": self._fragment_field.fragments_buffer.size}},
+            ])
+
     def _on_rgba_display_modified(self, rgba_field):
         """Segmentation display changed (visibility / color / opacity).
         Rebuild the palette UBO and re-run the bake passes using cached
@@ -3725,25 +4754,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         )
         self._size = (w, h)
 
-    def _wgpu_render(self, w, h, proj_inv, view_inv):
+    def _wgpu_render(self, w, h, proj_inv, view_inv,
+                     proj_fwd=None, view_fwd=None):
         if self._pipeline is None or (not self._fields and not self._segments
-                                      and not self._rgba_volumes):
+                                      and not self._rgba_volumes
+                                      and not self._fiber_strand_fields):
             return np.zeros((h, w, 4), dtype=np.uint8)
         self._ensure_target(w, h)
 
-        cbuf = np.zeros(36, dtype=np.float32)
+        # Cam UBO layout (272 bytes):
+        #   proj_inv (mat4 col-major)  bytes  0..64
+        #   view_inv (mat4)            bytes 64..128
+        #   size      (vec4 w,h,_,_)   bytes 128..144
+        #   proj      (mat4)           bytes 144..208
+        #   view      (mat4)           bytes 208..272
+        cbuf = np.zeros(68, dtype=np.float32)
         cbuf[0:16] = proj_inv.T.ravel()
         cbuf[16:32] = view_inv.T.ravel()
         cbuf[32] = float(w); cbuf[33] = float(h)
+        if proj_fwd is not None:
+            cbuf[36:52] = np.asarray(proj_fwd, dtype=np.float32).T.ravel()
+        else:
+            cbuf[36:52] = np.eye(4, dtype=np.float32).T.ravel()
+        if view_fwd is not None:
+            cbuf[52:68] = np.asarray(view_fwd, dtype=np.float32).T.ravel()
+        else:
+            cbuf[52:68] = np.eye(4, dtype=np.float32).T.ravel()
         self.device.queue.write_buffer(self._cam_ubo, 0, cbuf.tobytes())
 
         visible_fields = [f for f in self._fields if f.visible]
         visible_segs = [s for s in self._segments if s.visible]
         visible_rgba = [r for r in self._rgba_volumes if r.visible]
-        src = (visible_fields or self._fields) \
-              + (visible_segs or self._segments) \
-              + (visible_rgba or self._rgba_volumes)
-        boxes = [r.aabb() for r in src]
+        visible_strands = [t for t in self._fiber_strand_fields if t.visible]
+        # Strand fields contribute to scene bounds (so the volume AABB
+        # ray-march reaches them), but only volumetric fields contribute
+        # ray-march sample step.
+        vol_src = (visible_fields or self._fields) \
+                  + (visible_segs or self._segments) \
+                  + (visible_rgba or self._rgba_volumes)
+        all_src = vol_src \
+                  + (visible_strands or self._fiber_strand_fields)
+        boxes = [r.aabb() for r in all_src]
         boxes = [b for b in boxes if b is not None]
         if boxes:
             bmin = np.min(np.stack([b[0] for b in boxes]), axis=0)
@@ -3754,7 +4805,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         else:
             bmin = np.array([-100, -100, -100], dtype=np.float32)
             bmax = np.array([100, 100, 100], dtype=np.float32)
-        step = float(min(r.sample_step_mm for r in src))
+        if vol_src:
+            step = float(min(r.sample_step_mm for r in vol_src))
+        else:
+            # Strand-only scene: pick a step that gives reasonable depth
+            # resolution along the AABB. ~256 samples across the diagonal.
+            diag = float(np.linalg.norm(bmax - bmin))
+            step = max(diag / 256.0, 0.1)
         self.device.queue.write_buffer(
             self._mat_ubo, 0, _pack_material(
                 self._fields, self._segments, self._rgba_volumes,
@@ -3763,6 +4820,87 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 clip_planes=self._clip_planes))
 
         enc = self.device.create_command_encoder()
+
+        # Strand rasterization → A-buffer pass. Only when at least one
+        # FiberStrandField is present and visible. Uses a separate render
+        # pipeline whose fragment shader atomic-appends into the
+        # FragmentField's per-pixel sorted list.
+        if self._fiber_strand_fields and self._fragment_field is not None:
+            old_vp = self._fragment_field.viewport
+            self._fragment_field.ensure_size(w, h)
+            if self._fragment_field.viewport != old_vp:
+                # Buffers reallocated -- strand bind groups + main bind
+                # group still hold references to the old buffers; rebuild.
+                for sf in self._fiber_strand_fields:
+                    sf.bind_group = self._make_strand_bind_group(sf)
+                self._rebuild_bind_group()
+            # 1. Clear counts buffer.
+            num_pixels = w * h
+            cgroups = (num_pixels + 63) // 64
+            cbg = self.device.create_bind_group(
+                layout=self._fragment_clear_bgl, entries=[
+                    {"binding": 0, "resource": {
+                        "buffer": self._fragment_field.counts_buffer,
+                        "offset": 0,
+                        "size": self._fragment_field.counts_buffer.size}},
+                ])
+            cp = enc.begin_compute_pass()
+            cp.set_pipeline(self._fragment_clear_pipeline)
+            cp.set_bind_group(0, cbg, [], 0, 0)
+            cp.dispatch_workgroups(cgroups, 1, 1)
+            cp.end()
+            # 2. Rasterize each strand field.
+            # The strand pipeline writes only to the A-buffer; its color
+            # attachment is masked off (write_mask=0). Use load_op=clear so
+            # the color_tex is in a defined state even when this is the
+            # first pass of the frame; the main ray-march clears again.
+            stub_color = self._color_tex.create_view()
+            srp = enc.begin_render_pass(color_attachments=[{
+                "view": stub_color,
+                "load_op": wgpu.LoadOp.clear,
+                "store_op": wgpu.StoreOp.store,
+                "clear_value": (0, 0, 0, 0),
+            }])
+            srp.set_pipeline(self._strand_pipeline)
+            for sf in (visible_strands or []):
+                if (sf.bind_group is None or sf.vertex_buffer is None
+                        or sf.num_indices == 0):
+                    continue
+                srp.set_bind_group(0, sf.bind_group, [], 0, 0)
+                srp.set_vertex_buffer(0, sf.vertex_buffer)
+                srp.set_index_buffer(sf.index_buffer,
+                                     wgpu.IndexFormat.uint32)
+                srp.draw_indexed(sf.num_indices)
+            srp.end()
+            # 3. Per-pixel sort.
+            import struct as _st
+            sbuf = bytearray(16)
+            _st.pack_into("<I", sbuf, 0, w)
+            _st.pack_into("<I", sbuf, 4, h)
+            _st.pack_into("<I", sbuf, 8, FragmentField.K)
+            self.device.queue.write_buffer(
+                self._fragment_sort_ubo, 0, bytes(sbuf))
+            sortbg = self.device.create_bind_group(
+                layout=self._fragment_sort_bgl, entries=[
+                    {"binding": 0, "resource": {
+                        "buffer": self._fragment_field.counts_buffer,
+                        "offset": 0,
+                        "size": self._fragment_field.counts_buffer.size}},
+                    {"binding": 1, "resource": {
+                        "buffer": self._fragment_field.fragments_buffer,
+                        "offset": 0,
+                        "size": self._fragment_field.fragments_buffer.size}},
+                    {"binding": 2, "resource": {
+                        "buffer": self._fragment_sort_ubo,
+                        "offset": 0, "size": 16}},
+                ])
+            spp = enc.begin_compute_pass()
+            spp.set_pipeline(self._fragment_sort_pipeline)
+            spp.set_bind_group(0, sortbg, [], 0, 0)
+            spp.dispatch_workgroups(cgroups, 1, 1)
+            spp.end()
+
+        # Main ray-march (volume + interleaved A-buffer fragments).
         rp = enc.begin_render_pass(color_attachments=[{
             "view": self._color_tex.create_view(),
             "load_op": wgpu.LoadOp.clear,
@@ -3791,7 +4929,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             w, h = self.rw.GetSize()
             if w <= 0 or h <= 0 or (not self._fields
                                     and not self._segments
-                                    and not self._rgba_volumes):
+                                    and not self._rgba_volumes
+                                    and not self._fiber_strand_fields):
                 return
             cam = caller.GetActiveCamera()
             aspect = w / h
@@ -3804,6 +4943,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                          dtype=np.float64)
             proj_inv = np.linalg.inv(P).astype(np.float32)
             view_inv = np.linalg.inv(V).astype(np.float32)
+            proj_fwd = P.astype(np.float32)
+            view_fwd = V.astype(np.float32)
 
             self.rw.MakeCurrent()
             rfb = self.rw.GetRenderFramebuffer()
@@ -3821,7 +4962,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self._rebuild_bind_group()
             self._upload_vtk_depth(w, h)
 
-            rgba = self._wgpu_render(w, h, proj_inv, view_inv)
+            rgba = self._wgpu_render(w, h, proj_inv, view_inv,
+                                     proj_fwd, view_fwd)
             rgba_gl = np.ascontiguousarray(rgba[::-1])
 
             # GL-side composite: hardware premultiplied-alpha blend of our
