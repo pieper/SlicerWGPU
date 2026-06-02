@@ -410,6 +410,27 @@ def _adapter_backend(adapter):
 
 
 def _shared_wgpu_device():
+    """Acquire the offscreen wgpu device with DISPLAY unset during enumeration.
+
+    wgpu enumerates ALL backends when requesting an adapter, and its OpenGL backend
+    probes the EGL X11 platform whenever DISPLAY is set. On NVIDIA under XWayland (a
+    headless / browser-streamed desktop) eglGetPlatformDisplay returns NO_DISPLAY
+    *without* setting an EGL error, and khronos-egl panics on its unwrap -> the whole
+    process aborts (SlicerApp-real exit abnormally). The injection bridge's device is
+    purely offscreen (compute + render-to-texture; the GL composite uses VTK's own
+    already-current context via libGL), so it never needs X. Unset DISPLAY for the
+    duration so the GL backend falls back to surfaceless and Vulkan is selected.
+    """
+    import os
+    _saved_display = os.environ.pop("DISPLAY", None)
+    try:
+        return _shared_wgpu_device_impl()
+    finally:
+        if _saved_display is not None:
+            os.environ["DISPLAY"] = _saved_display
+
+
+def _shared_wgpu_device_impl():
     """Return pygfx's shared wgpu device, with fallback paths for partial
     pygfx initialization and OpenGL-only systems.
 
