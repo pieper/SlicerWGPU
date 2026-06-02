@@ -274,6 +274,49 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
                 self.delayDisplay(f"pip-installing {pkg}", 100)
                 slicer.util.pip_install(pkg)
 
+        # wgpu's GL backend probes the EGL wayland/X11 platform during adapter
+        # enumeration; on NVIDIA under XWayland (headless / browser-streamed desktop)
+        # that aborts the whole process -- eglGetPlatformDisplay returns BAD_ACCESS
+        # (wayland, wl_drm) or NO_DISPLAY-without-error (x11) and wgpu-hal / khronos-egl
+        # panic across the C FFI (unrecoverable; SlicerApp-real exit abnormally). pygfx
+        # creates its default device via wgpu.gpu.request_adapter_sync on first render --
+        # which can run BEFORE slicer_wgpu (and its own copy of this patch) is imported
+        # below. So neutralize the windowing env for OFFSCREEN (no-canvas) adapter
+        # requests HERE, before pygfx, so the GL backend falls back to surfaceless/device
+        # -> Vulkan. Idempotent (flag); on-screen (canvas) requests are untouched; no-op
+        # where the vars aren't set (macOS / Windows / real headless).
+        try:
+            import os as _os, functools as _ft, wgpu as _wgpu
+            if not getattr(_wgpu, "_desktopia_offscreen_patched", False):
+                def _wrap(orig, always=False):
+                    @_ft.wraps(orig)
+                    def inner(*a, **k):
+                        if not (always or k.get("canvas", None) is None):
+                            return orig(*a, **k)
+                        saved = {x: _os.environ.pop(x, None)
+                                 for x in ("WAYLAND_DISPLAY", "DISPLAY")}
+                        try:
+                            return orig(*a, **k)
+                        finally:
+                            for x, v in saved.items():
+                                if v is not None:
+                                    _os.environ[x] = v
+                    return inner
+                for _owner in (getattr(_wgpu, "gpu", None), _wgpu):
+                    if _owner is None:
+                        continue
+                    for _n in ("request_adapter_sync", "request_adapter"):
+                        _f = getattr(_owner, _n, None)
+                        if callable(_f):
+                            setattr(_owner, _n, _wrap(_f))
+                    for _n in ("enumerate_adapters_sync", "enumerate_adapters"):
+                        _f = getattr(_owner, _n, None)
+                        if callable(_f):
+                            setattr(_owner, _n, _wrap(_f, always=True))
+                _wgpu._desktopia_offscreen_patched = True
+        except Exception as _e:
+            print(f"wgpu offscreen-adapter patch skipped: {_e}")
+
         try:
             import pygfx
             # Require a real install, not a namespace-package shadow (e.g. a
