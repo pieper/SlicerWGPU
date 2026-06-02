@@ -409,28 +409,51 @@ def _adapter_backend(adapter):
     return "Unknown"
 
 
-def _shared_wgpu_device():
-    """Acquire the offscreen wgpu device with the windowing-system env unset.
+def _force_vulkan_only_wgpu_instance():
+    """On Linux, create the wgpu instance with only the Vulkan backend enabled.
 
-    wgpu enumerates ALL backends when requesting an adapter, and its OpenGL backend
-    picks an EGL *platform* from the environment: WAYLAND_DISPLAY -> wayland platform,
-    else DISPLAY -> X11 platform. On NVIDIA under XWayland (a headless / browser-streamed
-    desktop) BOTH of those crash the process during enumeration:
-      - wayland: eglGetPlatformDisplay -> EGL_BAD_ACCESS (wl_drm) -> wgpu-hal egl.rs panic
-      - x11:     eglGetPlatformDisplay -> NO_DISPLAY w/o error  -> khronos-egl panic
-    so SlicerApp-real aborts. The injection bridge's device is purely offscreen (compute +
-    render-to-texture; the GL composite uses VTK's own already-current context via libGL),
-    so it needs neither X nor Wayland. Clear both for the duration of enumeration so the GL
-    backend falls back to the surfaceless/device platform and Vulkan is selected.
+    wgpu enumerates EVERY backend when it first creates its instance / requests an adapter.
+    Its OpenGL-ES backend opens an EGL platform display chosen from the environment
+    (WAYLAND_DISPLAY -> wayland, else DISPLAY -> X11). On NVIDIA under XWayland (a headless /
+    browser-streamed desktop) that EGL probe aborts the whole process -- wgpu-hal panics with
+    BadAccess across the C FFI (unrecoverable). Restricting the instance to Vulkan means the
+    GL/ES backend is never created, so the probe never runs. The injection bridge's device is
+    purely offscreen anyway (compute + render-to-texture; the GL composite uses VTK's own
+    already-current context via libGL), so it needs neither X nor Wayland from wgpu.
+
+    Linux-only (macOS=Metal, Windows=DX12/Vulkan, where this would remove the only backend).
+    Override with SLICER_WGPU_INSTANCE_BACKENDS. Idempotent; no-op once the instance exists.
+    This is normally already done by SceneRendering / slicer_wgpu import, but is repeated here
+    so this module stays correct if dropped in and reloaded on its own.
     """
     import os
-    _saved = {k: os.environ.pop(k, None) for k in ("WAYLAND_DISPLAY", "DISPLAY")}
+    import sys
+    if not sys.platform.startswith("linux"):
+        return
     try:
-        return _shared_wgpu_device_impl()
-    finally:
-        for _k, _v in _saved.items():
-            if _v is not None:
-                os.environ[_k] = _v
+        if getattr(wgpu, "_slicer_wgpu_instance_extras_set", False):
+            return
+        from wgpu.backends.wgpu_native import _helpers
+        if _helpers._the_instance is not None:
+            return  # too late -- instance already created with all backends
+        backends = [b.strip() for b in
+                    os.environ.get("SLICER_WGPU_INSTANCE_BACKENDS", "Vulkan").split(",")
+                    if b.strip()]
+        from wgpu.backends.wgpu_native.extras import set_instance_extras
+        set_instance_extras(backends=backends)
+        wgpu._slicer_wgpu_instance_extras_set = True
+    except Exception as exc:
+        print(f"wgpu_vtk_inject: could not restrict wgpu instance to Vulkan: {exc}")
+
+
+def _shared_wgpu_device():
+    """Acquire the offscreen wgpu device, with the GL/ES backend disabled on Linux.
+
+    See `_force_vulkan_only_wgpu_instance` for why the GL backend must not be enumerated
+    (it aborts the process on NVIDIA under XWayland).
+    """
+    _force_vulkan_only_wgpu_instance()
+    return _shared_wgpu_device_impl()
 
 
 def _shared_wgpu_device_impl():

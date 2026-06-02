@@ -46,6 +46,45 @@ from slicer.ScriptedLoadableModule import (
 MODULE_NAME = "SceneRendering"
 
 
+def _force_vulkan_only_wgpu_instance():
+    """On Linux, create the wgpu instance with only the Vulkan backend enabled.
+
+    wgpu enumerates EVERY backend when it first creates its instance / requests an
+    adapter. Its OpenGL-ES backend opens an EGL display chosen from the environment
+    (WAYLAND_DISPLAY -> wayland, else DISPLAY -> X11). On NVIDIA under XWayland (a
+    headless / browser-streamed desktop) that EGL probe aborts the whole process --
+    wgpu-hal panics with BadAccess across the C FFI (unrecoverable). Restricting the
+    instance to Vulkan means the GL/ES backend is never created, so the probe never runs.
+    Vulkan WSI still serves offscreen and on-screen surfaces, and DISPLAY is left
+    untouched so VTK/GLX rendering works.
+
+    Linux-only: macOS uses Metal and Windows uses DX12/Vulkan, where this restriction
+    would remove the only available backend. Override the backend list with
+    SLICER_WGPU_INSTANCE_BACKENDS (comma-separated, e.g. "Vulkan,GL"). Idempotent, and a
+    no-op once the instance already exists (then it is too late to choose backends).
+    """
+    import os
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import wgpu
+        if getattr(wgpu, "_slicer_wgpu_instance_extras_set", False):
+            return
+        from wgpu.backends.wgpu_native import _helpers
+        if _helpers._the_instance is not None:
+            return  # too late -- instance already created with all backends
+        backends = [b.strip() for b in
+                    os.environ.get("SLICER_WGPU_INSTANCE_BACKENDS", "Vulkan").split(",")
+                    if b.strip()]
+        from wgpu.backends.wgpu_native.extras import set_instance_extras
+        set_instance_extras(backends=backends)
+        wgpu._slicer_wgpu_instance_extras_set = True
+    except Exception as exc:
+        print(f"slicer_wgpu: could not restrict wgpu instance to Vulkan: {exc}")
+
+
 #
 # SceneRendering
 #
@@ -274,48 +313,19 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
                 self.delayDisplay(f"pip-installing {pkg}", 100)
                 slicer.util.pip_install(pkg)
 
-        # wgpu's GL backend probes the EGL wayland/X11 platform during adapter
-        # enumeration; on NVIDIA under XWayland (headless / browser-streamed desktop)
-        # that aborts the whole process -- eglGetPlatformDisplay returns BAD_ACCESS
-        # (wayland, wl_drm) or NO_DISPLAY-without-error (x11) and wgpu-hal / khronos-egl
-        # panic across the C FFI (unrecoverable; SlicerApp-real exit abnormally). pygfx
-        # creates its default device via wgpu.gpu.request_adapter_sync on first render --
-        # which can run BEFORE slicer_wgpu (and its own copy of this patch) is imported
-        # below. So neutralize the windowing env for OFFSCREEN (no-canvas) adapter
-        # requests HERE, before pygfx, so the GL backend falls back to surfaceless/device
-        # -> Vulkan. Idempotent (flag); on-screen (canvas) requests are untouched; no-op
-        # where the vars aren't set (macOS / Windows / real headless).
-        try:
-            import os as _os, functools as _ft, wgpu as _wgpu
-            if not getattr(_wgpu, "_desktopia_offscreen_patched", False):
-                def _wrap(orig, always=False):
-                    @_ft.wraps(orig)
-                    def inner(*a, **k):
-                        if not (always or k.get("canvas", None) is None):
-                            return orig(*a, **k)
-                        saved = {x: _os.environ.pop(x, None)
-                                 for x in ("WAYLAND_DISPLAY", "DISPLAY")}
-                        try:
-                            return orig(*a, **k)
-                        finally:
-                            for x, v in saved.items():
-                                if v is not None:
-                                    _os.environ[x] = v
-                    return inner
-                for _owner in (getattr(_wgpu, "gpu", None), _wgpu):
-                    if _owner is None:
-                        continue
-                    for _n in ("request_adapter_sync", "request_adapter"):
-                        _f = getattr(_owner, _n, None)
-                        if callable(_f):
-                            setattr(_owner, _n, _wrap(_f))
-                    for _n in ("enumerate_adapters_sync", "enumerate_adapters"):
-                        _f = getattr(_owner, _n, None)
-                        if callable(_f):
-                            setattr(_owner, _n, _wrap(_f, always=True))
-                _wgpu._desktopia_offscreen_patched = True
-        except Exception as _e:
-            print(f"wgpu offscreen-adapter patch skipped: {_e}")
+        # When wgpu first creates its instance / requests an adapter it enumerates EVERY
+        # backend. The OpenGL-ES backend opens an EGL display chosen from the environment
+        # (WAYLAND_DISPLAY -> wayland, else DISPLAY -> X11). On NVIDIA under XWayland
+        # (a headless / browser-streamed desktop) that EGL probe aborts the WHOLE process:
+        # wgpu-hal panics with BadAccess across the C FFI (unrecoverable -- SlicerApp-real
+        # exit abnormally). Clearing the windowing env around the request does NOT help: the
+        # GL backend is enumerated regardless of when the env is clear, and WGPU_BACKEND only
+        # changes adapter *selection*, not which backends get enumerated. The fix is to create
+        # the instance with ONLY the Vulkan backend so the GL/ES backend is never enumerated.
+        # Vulkan WSI still serves offscreen and on-screen surfaces, and DISPLAY is left
+        # untouched so Slicer's VTK/GLX rendering is unaffected. Must run before the wgpu
+        # instance is created (i.e. before pygfx imports / renders below).
+        _force_vulkan_only_wgpu_instance()
 
         try:
             import pygfx
