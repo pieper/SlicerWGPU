@@ -410,24 +410,27 @@ def _adapter_backend(adapter):
 
 
 def _shared_wgpu_device():
-    """Acquire the offscreen wgpu device with DISPLAY unset during enumeration.
+    """Acquire the offscreen wgpu device with the windowing-system env unset.
 
     wgpu enumerates ALL backends when requesting an adapter, and its OpenGL backend
-    probes the EGL X11 platform whenever DISPLAY is set. On NVIDIA under XWayland (a
-    headless / browser-streamed desktop) eglGetPlatformDisplay returns NO_DISPLAY
-    *without* setting an EGL error, and khronos-egl panics on its unwrap -> the whole
-    process aborts (SlicerApp-real exit abnormally). The injection bridge's device is
-    purely offscreen (compute + render-to-texture; the GL composite uses VTK's own
-    already-current context via libGL), so it never needs X. Unset DISPLAY for the
-    duration so the GL backend falls back to surfaceless and Vulkan is selected.
+    picks an EGL *platform* from the environment: WAYLAND_DISPLAY -> wayland platform,
+    else DISPLAY -> X11 platform. On NVIDIA under XWayland (a headless / browser-streamed
+    desktop) BOTH of those crash the process during enumeration:
+      - wayland: eglGetPlatformDisplay -> EGL_BAD_ACCESS (wl_drm) -> wgpu-hal egl.rs panic
+      - x11:     eglGetPlatformDisplay -> NO_DISPLAY w/o error  -> khronos-egl panic
+    so SlicerApp-real aborts. The injection bridge's device is purely offscreen (compute +
+    render-to-texture; the GL composite uses VTK's own already-current context via libGL),
+    so it needs neither X nor Wayland. Clear both for the duration of enumeration so the GL
+    backend falls back to the surfaceless/device platform and Vulkan is selected.
     """
     import os
-    _saved_display = os.environ.pop("DISPLAY", None)
+    _saved = {k: os.environ.pop(k, None) for k in ("WAYLAND_DISPLAY", "DISPLAY")}
     try:
         return _shared_wgpu_device_impl()
     finally:
-        if _saved_display is not None:
-            os.environ["DISPLAY"] = _saved_display
+        for _k, _v in _saved.items():
+            if _v is not None:
+                os.environ[_k] = _v
 
 
 def _shared_wgpu_device_impl():
