@@ -591,9 +591,16 @@ struct FragmentOutput { @location(0) color: vec4<f32>, };
 struct Camera {
     proj_inv: mat4x4<f32>,
     view_inv: mat4x4<f32>,
+    // size.xy = (viewport_w, viewport_h)
+    // size.zw = (jitter_ndc_x, jitter_ndc_y) -- per-frame sub-pixel
+    //          camera jitter for temporal anti-aliasing. Range ~ (-1/w, 1/w).
     size: vec4<f32>,
     proj: mat4x4<f32>,
     view: mat4x4<f32>,
+    // taa.x = frame_index modulo something, for hash-seeding the per-ray
+    //         dt jitter so the noise pattern shifts each frame and TAA
+    //         can average it out.
+    taa: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> u_cam: Camera;
 
@@ -628,6 +635,21 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> Varyings {
     return v;
 }
 """
+
+
+def _halton_2_3(i):
+    """Return the (Halton-base-2, Halton-base-3) value for index i, in [0, 1).
+    Used to drive sub-pixel jitter for TAA. The 2D Halton sequence is the
+    standard low-discrepancy choice for camera jitter (Karis 2014 TAA)."""
+    def halton(idx, base):
+        f = 1.0
+        r = 0.0
+        while idx > 0:
+            f = f / base
+            r = r + f * (idx % base)
+            idx = idx // base
+        return r
+    return halton(i + 1, 2), halton(i + 1, 3)
 
 
 def _mat_struct_wgsl(n, m, k):
@@ -1205,8 +1227,12 @@ def _main_wgsl(n, m, k, has_fragments=False, frag_binding=0, K=32):
 @fragment
 fn fs_main(v: Varyings) -> FragmentOutput {{
     var out: FragmentOutput;
-    let ndc_x = (v.position.x / u_cam.size.x) * 2.0 - 1.0;
-    let ndc_y = 1.0 - (v.position.y / u_cam.size.y) * 2.0;
+    // Sub-pixel camera jitter for TAA. size.zw carries the per-frame
+    // jitter offset in NDC units (typically a Halton(2,3) sequence
+    // scaled by 1/viewport). After the main render, a TAA composite
+    // pass blends with a history buffer so the jitter averages out.
+    let ndc_x = (v.position.x / u_cam.size.x) * 2.0 - 1.0 + u_cam.size.z;
+    let ndc_y = 1.0 - (v.position.y / u_cam.size.y) * 2.0 + u_cam.size.w;
     let wn = ndc_to_world(vec4<f32>(ndc_x, ndc_y, 0.0, 1.0));
     let wf = ndc_to_world(vec4<f32>(ndc_x, ndc_y, 1.0, 1.0));
     let ro = wn;
@@ -1236,7 +1262,12 @@ fn fs_main(v: Varyings) -> FragmentOutput {{
         out.color = integrated;
         return out;
     }}
-    var t = t_near + fract(sin(dot(v.position.xy, vec2<f32>(12.9898,78.233))) * 43758.5453) * step;
+    // dt-jitter the ray-march start by a per-pixel-per-frame hash so
+    // each frame samples a different sub-step alignment. TAA averages
+    // out the resulting noise and removes the regular banding that
+    // appears at TF discontinuities under low sample rate.
+    let _seed = v.position.xy + vec2<f32>(u_cam.taa.x * 0.12387, u_cam.taa.x * 0.7351);
+    var t = t_near + fract(sin(dot(_seed, vec2<f32>(12.9898,78.233))) * 43758.5453) * step;
     var safety: i32 = 0;
     loop {{
         if (t >= t_far) {{ break; }}
@@ -1852,11 +1883,13 @@ class WgpuVolumeBridge:
         self._aligned_bpr = 0
         self._fields = []
         # Camera UBO: proj_inv (64) + view_inv (64) + size (16) +
-        # proj (64) + view (64) = 272, rounded to 16 = 272.
+        # proj (64) + view (64) + taa (16) = 288.
         # The forward proj/view are needed by FragmentField's depth
         # comparisons during the ray-march fragment-integration loop.
+        # taa carries the TAA frame index for shader-side noise seeding;
+        # size.zw carries the sub-pixel jitter offset (NDC units).
         self._cam_ubo = self.device.create_buffer(
-            size=272,
+            size=288,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
         self._mat_ubo = None
 
@@ -1878,6 +1911,20 @@ class WgpuVolumeBridge:
         self._vtk_depth_sampler = None
         self._vtk_depth_size = (0, 0)
         self._vtk_depth_buf = None  # numpy staging buffer reused across frames
+
+        # TAA state. _taa_frame indexes the Halton(2,3) jitter sequence; it
+        # increments each rendered frame and resets to 0 when the camera or
+        # scene changes so the history buffer doesn't accumulate stale data.
+        # _taa_prev_pv is the previous frame's (proj * view) for change
+        # detection. _taa_history_tex is the per-pixel accumulator.
+        self._taa_frame = 0
+        self._taa_prev_pv = None
+        self._taa_history_tex = None
+        self._taa_history_view = None
+        self._taa_output_tex = None
+        self._taa_output_view = None
+        self._taa_pipeline = None
+        self._taa_bgl = None
 
         # Grid transform: one scene-wide displacement field. None when no grid
         # is attached -- the shader short-circuits via u_mat.grid_enabled.x.
@@ -3616,25 +3663,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     # ---------------------------------------------------------------------
 
     _STRAND_RASTER_WGSL = """
-// Strip-based polyline rasterization. Per polyline-point we emit two
-// vertices (top + bot of the tube); adjacent sub-segments are wired up
-// via an INDEX BUFFER that shares the joint vertices, so the
-// rasterization mesh is watertight by construction (no per-joint
-// billboard boundary, no rasterization gap from edge tile mismatch).
+// Quadratic-Bezier-tube rasterization. Each polyline kink p_i (interior
+// vertex) becomes ONE rendered piece, parameterized as a quadratic
+// Bezier with control points:
+//     B0 = midpoint(p_{i-1}, p_i)
+//     B1 = p_i
+//     B2 = midpoint(p_i, p_{i+1})
+// The tangent at B0 is 2(B1-B0) = p_i - p_{i-1} (incoming edge dir);
+// the tangent at B2 is 2(B2-B1) = p_{i+1} - p_i (outgoing edge dir).
+// Adjacent pieces share both their endpoint and their tangent direction
+// at the joint midpoint -- the rendered strand is C0 + tangent-C1
+// continuous across EVERY original polyline kink, even very sharp ones.
 //
-// Each vertex carries its own polyline neighborhood (prev_p0, pos,
-// next_p1) so it can compute a bisector tangent at its own point and
-// deflect to ±r along the perpendicular to (bisector, view ray). The
-// LEFT vertex of every segment also forwards p0/p1/prev_p0 in world
-// space via `@interpolate(flat)` so the fragment shader can run the
-// analytic cylinder + sphere intersection against the correct segment.
+// Heads/tails of strands use degenerate Beziers with B0=B1 (head) or
+// B1=B2 (tail), which collapses the tube to a hemispherical cap at the
+// strand endpoint.
+//
+// Fragment shader does a true analytic ray vs swept-tube intersection:
+// 1) Solve the cubic d/dt |u(t)|^2 = 0 (where u(t) is the curve point
+//    projected perpendicular to the ray) via Cardano to find t* where
+//    the centerline is closest to the ray.
+// 2) Approximate the tube near c(t*) as a local cylinder along c'(t*)
+//    for the surface-point + entry-depth resolution.
+// 3) Use c'(t*) as tangent and (hit - c(t*))_perp_c'(t*) as the normal
+//    -- both are smooth functions of t, with no per-segment jumps.
+//
+// Reference: Reshetov & Luebke, "Phantom Ray-Hair Intersector"
+// (SIGGRAPH 2018) uses the same construction for hair rendering.
 
 struct Camera {
     proj_inv: mat4x4<f32>,
     view_inv: mat4x4<f32>,
-    size: vec4<f32>,        // (w, h, _, _)
+    // size.xy = (w, h); size.zw = TAA jitter in NDC units
+    size: vec4<f32>,
     proj: mat4x4<f32>,
     view: mat4x4<f32>,
+    taa: vec4<f32>,           // .x = frame index for hash seeding
 };
 
 struct StrandParams {
@@ -3656,90 +3720,83 @@ struct StrandParams {
 @group(0) @binding(5) var<storage, read_write> u_fragments: array<atomic<u32>>;
 
 struct VsIn {
-    @location(0) pos_local: vec3<f32>,
-    @location(1) prev_p0_local: vec3<f32>,
-    @location(2) next_p1_local: vec3<f32>,
-    @location(3) side_sign: f32,    // -1 = bot, +1 = top
-    @location(4) bundle_id: f32,
-    @location(5) is_head: f32,
+    @location(0) B0_local: vec3<f32>,
+    @location(1) B1_local: vec3<f32>,
+    @location(2) B2_local: vec3<f32>,
+    @location(3) side_sign: f32,    // -1 or +1 (perpendicular sign)
+    @location(4) end_t: f32,        // 0.0 = anchor at B0, 1.0 = anchor at B2
+    @location(5) bundle_id: f32,
+    @location(6) is_head: f32,      // 1.0 if this piece is a strand head/tail
 };
 
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
-    // p0/p1/prev_p0 of the segment THIS fragment belongs to. Sourced
-    // from the LEFT vertex of each triangle (provoking-vertex-first +
-    // @interpolate(flat)). The LEFT vertex's pos_local is segment K's
-    // p0; its next_p1_local is segment K's p1; its prev_p0_local is
-    // segment K-1's p0 (used for the inside-prev-cylinder check).
-    @location(0) @interpolate(flat) p0_world: vec3<f32>,
-    @location(1) @interpolate(flat) p1_world: vec3<f32>,
-    @location(2) @interpolate(flat) bundle_id: f32,
-    @location(3) @interpolate(flat) is_head: f32,
-    @location(4) @interpolate(flat) prev_p0_world: vec3<f32>,
+    // The 3 Bezier control points (world space), flat-interpolated so
+    // the fragment shader gets the same piece data regardless of which
+    // triangle vertex the rasterizer uses for the provoking vertex.
+    @location(0) @interpolate(flat) B0_world: vec3<f32>,
+    @location(1) @interpolate(flat) B1_world: vec3<f32>,
+    @location(2) @interpolate(flat) B2_world: vec3<f32>,
+    @location(3) @interpolate(flat) bundle_id: f32,
+    @location(4) @interpolate(flat) is_head: f32,
 };
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
-    // pos_local always = segment K's p0; next_p1_local = K's p1;
-    // prev_p0_local = K-1's p0 (for inside_prev sphere check).
-    // bundle_id encodes (whole part = bundle ID, fractional = endpoint
-    // selector: 0.0 = position vertex at p0, 0.5 = at p1).
     let bid_whole = floor(in.bundle_id);
-    let endpoint = in.bundle_id - bid_whole;  // 0.0 or 0.5
-    let endpoint_t = step(0.25, endpoint);    // 0.0 or 1.0
+    let B0w = (u_field.world_from_local * vec4<f32>(in.B0_local, 1.0)).xyz;
+    let B1w = (u_field.world_from_local * vec4<f32>(in.B1_local, 1.0)).xyz;
+    let B2w = (u_field.world_from_local * vec4<f32>(in.B2_local, 1.0)).xyz;
 
-    let p0_w4 = u_field.world_from_local * vec4<f32>(in.pos_local, 1.0);
-    let p0_w = p0_w4.xyz / max(p0_w4.w, 1e-6);
-    let p1_w4 = u_field.world_from_local * vec4<f32>(in.next_p1_local, 1.0);
-    let p1_w = p1_w4.xyz / max(p1_w4.w, 1e-6);
-    let prev_w4 = u_field.world_from_local * vec4<f32>(in.prev_p0_local, 1.0);
-    let prev_w = prev_w4.xyz / max(prev_w4.w, 1e-6);
+    // Anchor at B0 or B2 (the curve's endpoints).
+    let anchor = mix(B0w, B2w, in.end_t);
 
-    // Anchor the vertex at p0 or p1 depending on endpoint flag.
-    let anchor = mix(p0_w, p1_w, endpoint_t);
+    // Endpoint tangents.
+    let tan0 = 2.0 * (B1w - B0w);
+    let tan1 = 2.0 * (B2w - B1w);
+    let tan_raw = mix(tan0, tan1, in.end_t);
+    var tan_n = vec3<f32>(1.0, 0.0, 0.0);
+    let tan_l = length(tan_raw);
+    if (tan_l > 1e-6) { tan_n = tan_raw / tan_l; }
 
-    // Bisector tangent at the ANCHOR vertex. For a vertex at p0:
-    // bisector = average of prev_axis and current axis. For a vertex
-    // at p1: bisector = current axis (we don't have next's-next info,
-    // and for the LAST segment of a strand p1 is the tail anyway).
-    // Adjacent segments at the joint will compute the SAME bisector
-    // there: K's p1 vertex uses K's axis only; K+1's p0 vertex uses
-    // average(K's axis, K+1's axis). These differ for kinked joints
-    // -- but for collinear sub-segments they coincide.
-    let cur_axis = p1_w - p0_w;
-    let cur_l = length(cur_axis);
-    let prev_axis = p0_w - prev_w;
-    let prev_l = length(prev_axis);
-
-    var bis_p0 = vec3<f32>(1.0, 0.0, 0.0);
-    if (cur_l > 1e-6) { bis_p0 = cur_axis / cur_l; }
-    if (prev_l > 1e-6 && cur_l > 1e-6) {
-        let s = prev_axis / prev_l + cur_axis / cur_l;
-        let sl = length(s);
-        if (sl > 1e-6) { bis_p0 = s / sl; }
-    }
-    var bis_p1 = vec3<f32>(1.0, 0.0, 0.0);
-    if (cur_l > 1e-6) { bis_p1 = cur_axis / cur_l; }
-
-    let bis = mix(bis_p0, bis_p1, endpoint_t);
-
+    // Screen-perpendicular side direction (in world space).
     let cam_pos = u_cam.view_inv[3].xyz;
     let view_v = anchor - cam_pos;
-    let side_raw = cross(bis, view_v);
+    let side_raw = cross(tan_n, view_v);
     var side = vec3<f32>(0.0, 1.0, 0.0);
-    let sl = length(side_raw);
-    if (sl > 1e-6) { side = side_raw / sl; }
+    let side_l = length(side_raw);
+    if (side_l > 1e-6) { side = side_raw / side_l; }
 
     let r = u_field.tube_radius_mm + max(u_field.pad_world_mm, 0.0);
-    let p_world = anchor + (r * in.side_sign) * side;
+
+    // Bezier convex hull bulge perpendicular to the chord. The curve
+    // stays inside the convex hull of (B0, B1, B2), so the maximum
+    // side excursion is the perpendicular distance from B1 to the
+    // B0-B2 chord. Extending the billboard sideways by this amount
+    // ensures we cover the entire visible tube even for sharp kinks.
+    let chord = B2w - B0w;
+    let chord_l = length(chord);
+    var chord_n = tan_n;
+    if (chord_l > 1e-6) { chord_n = chord / chord_l; }
+    let b1_off = B1w - B0w;
+    let b1_along = dot(b1_off, chord_n);
+    let b1_perp_vec = b1_off - b1_along * chord_n;
+    let b1_perp = length(b1_perp_vec);
+
+    // Axial extension at the endpoint side (by r along the endpoint
+    // tangent direction, outward from the curve). Plus an extra chord-
+    // axis push at the B0 end to also cover B1 when the kink is sharp.
+    let axial = mix(-r * tan_n, r * tan_n, in.end_t);
+    let r_side = r + b1_perp;
+    let p_world = anchor + axial + (r_side * in.side_sign) * side;
 
     var out: VsOut;
     out.clip = u_cam.proj * u_cam.view * vec4<f32>(p_world, 1.0);
-    out.p0_world = p0_w;
-    out.p1_world = p1_w;
-    out.bundle_id = bid_whole;     // strip the endpoint encoding
+    out.B0_world = B0w;
+    out.B1_world = B1w;
+    out.B2_world = B2w;
+    out.bundle_id = bid_whole;
     out.is_head = in.is_head;
-    out.prev_p0_world = prev_w;
     return out;
 }
 
@@ -3766,142 +3823,205 @@ fn fs_main(in: VsOut) -> FsOut {
     let ro = wn;
     let rd = normalize(wf - wn);
 
-    // Ray-cylinder body + ray-sphere(p0). Pick the closest hit. The
-    // "owner" rule for shared endpoints: cylinder body uses strict
-    // along < axis_len so a segment doesn't render its downstream
-    // endpoint -- the *next* segment's p0 sphere covers it. No p1
-    // sphere on this segment, so no doubling. The closest-hit pick
-    // ensures one fragment per pixel even where the sphere overlaps
-    // the cylinder body near p0.
-    let axis = in.p1_world - in.p0_world;
-    let axis_len = length(axis);
-    if (axis_len < 1e-6) { discard; }
-    let axis_n = axis / axis_len;
+    // Ray vs quadratic-Bezier tube of radius r.
+    //
+    // Bezier centerline (offset by ro for the per-pixel ray test):
+    //   c(t) - ro = alpha + beta * t + gamma * t^2
+    // with alpha = B0 - ro, beta = 2(B1-B0), gamma = B0 - 2 B1 + B2.
+    //
+    // Project these onto the plane perpendicular to rd:
+    //   u(t) = c(t)_perp - ro_perp = a_p + b_p * t + g_p * t^2
+    // where x_p = x - (x . rd) rd. The closest point on the centerline
+    // to the ray is the t* that minimizes |u(t)|^2.
+    //
+    // d/dt |u|^2 = 2 u . u' = 0 -> a cubic in t. Closed form via
+    // Cardano's formula.
     let r = u_field.tube_radius_mm;
+    let alpha_v = in.B0_world - ro;
+    let beta_v = 2.0 * (in.B1_world - in.B0_world);
+    let gamma_v = in.B0_world - 2.0 * in.B1_world + in.B2_world;
+    let a_p = alpha_v - dot(alpha_v, rd) * rd;
+    let b_p = beta_v - dot(beta_v, rd) * rd;
+    let g_p = gamma_v - dot(gamma_v, rd) * rd;
+    let gg = dot(g_p, g_p);
+    let gb = dot(g_p, b_p);
+    let ga = dot(g_p, a_p);
+    let bb = dot(b_p, b_p);
+    let ba = dot(b_p, a_p);
 
-    var best_t: f32 = 1e30;
-    var best_hit = vec3<f32>(0.0);
-    var best_normal = vec3<f32>(0.0);
+    // Strict ownership across joints. Adjacent pieces share endpoint
+    // midpoints, so we'd otherwise see duplicate fragments on every
+    // joint (bubbles). The clean rule:
+    //   - Interior pieces accept ONLY natural cubic roots in [0, 1).
+    //     Strict on the right (1.0 excluded) means the next piece's
+    //     t=0 owns the joint uniquely. Clamping the cubic root to a
+    //     boundary is NOT accepted -- that's a hit for the neighbor.
+    //   - Head pieces (B0==B1) additionally accept t=0 unconditionally
+    //     (the spherical-cap tip).
+    //   - Tail pieces (B1==B2) accept t=1 unconditionally and extend
+    //     the upper bound to inclusive 1.0.
+    let is_head = length(in.B1_world - in.B0_world) < 1e-6;
+    let is_tail = length(in.B2_world - in.B1_world) < 1e-6;
+    let t_upper = select(1.0 - 1e-5, 1.0, is_tail);
 
-    // Cylinder body (along ∈ [0, axis_len), strict on the right).
-    // Ownership convention: each interior joint is owned by the NEXT
-    // segment (via its `along >= 0` accept). The strict-`<` bound on
-    // the right prevents adjacent segments' cylinders from both
-    // emitting at the joint -- doubled fragments would alpha-modulate
-    // translucent tubes (joints visibly more opaque than the body).
-    // The next segment's billboard back-extension by r ensures the
-    // joint pixel is rasterized even when the top-left rule gives the
-    // boundary to the previous segment.
-    let oc = ro - in.p0_world;
-    let rd_along = dot(rd, axis_n);
-    let rd_perp = rd - rd_along * axis_n;
-    let oc_along = dot(oc, axis_n);
-    let oc_perp = oc - oc_along * axis_n;
-    let a = dot(rd_perp, rd_perp);
-    if (a > 1e-9) {
-        let b = 2.0 * dot(oc_perp, rd_perp);
-        let c = dot(oc_perp, oc_perp) - r * r;
-        let disc = b * b - 4.0 * a * c;
-        if (disc >= 0.0) {
-            let sd = sqrt(disc);
-            let tc = (-b - sd) / (2.0 * a);
-            if (tc >= 0.0) {
-                let hit_c = ro + tc * rd;
-                let along_c = dot(hit_c - in.p0_world, axis_n);
-                // The cylinder hit's along_c can substantially overshoot
-                // [0, axis_len] under perspective foreshortening: a ray
-                // through a pixel near a segment quad's edge can hit
-                // the *infinite* cylinder at a position that's
-                // physically inside the next segment's body. With
-                // per-segment quads (no sharing across segments) and
-                // top-left rule guaranteeing one triangle per pixel,
-                // accepting a generous tolerance is safe -- adjacent
-                // segments can't both emit at the same pixel. Tolerance
-                // = axis_len covers the typical perspective offset
-                // (~0.25 axis_len in close views; 1x axis_len gives
-                // headroom for steep camera angles).
-                let eps_axis = max(axis_len, 1e-4);
-                if (along_c >= -eps_axis && along_c <= axis_len + eps_axis) {
-                    best_t = tc;
-                    best_hit = hit_c;
-                    let perp_c = (hit_c - in.p0_world) - along_c * axis_n;
-                    best_normal = normalize(perp_c);
+    var best_d2: f32 = 1e30;
+    var t_star: f32 = 0.0;
+    var found: bool = false;
+
+    if (gg < 1e-12) {
+        // Degenerate (linear) Bezier -- the cubic collapses to a
+        // linear equation in t.
+        if (bb > 1e-12) {
+            let t_lin = -ba / bb;
+            if (t_lin >= 0.0 && t_lin <= t_upper) {
+                let u_lin = a_p + b_p * t_lin;
+                let d2 = dot(u_lin, u_lin);
+                if (d2 < best_d2) {
+                    best_d2 = d2; t_star = t_lin; found = true;
                 }
             }
         }
-    }
-
-    // p0 sphere. Always tested, but rejected if the hit lies inside
-    // either THIS segment's cylinder (would double the cylinder
-    // fragment) or the PREVIOUS segment's cylinder (collinear case --
-    // would alpha-modulate joints on translucent tubes). Heads bypass
-    // the prev-cylinder check (no previous segment exists). Net
-    // effect: for collinear interiors, the sphere never emits; for
-    // kinks, the sphere fills the convex wedge; for heads, full
-    // hemisphere cap.
-    {
-        let oc0 = ro - in.p0_world;
-        let b0 = 2.0 * dot(rd, oc0);
-        let c0 = dot(oc0, oc0) - r * r;
-        let disc0 = b0 * b0 - 4.0 * c0;
-        if (disc0 >= 0.0) {
-            let sd0 = sqrt(disc0);
-            let t0 = (-b0 - sd0) * 0.5;
-            if (t0 >= 0.0 && t0 < best_t) {
-                let hit_0 = ro + t0 * rd;
-                let to_hit = hit_0 - in.p0_world;
-
-                // Inside this segment's cylinder?
-                let along_self = dot(to_hit, axis_n);
-                let perp_self = to_hit - along_self * axis_n;
-                let inside_self =
-                    along_self >= 0.0 && along_self <= axis_len
-                    && dot(perp_self, perp_self) <= r * r + 1e-5;
-
-                // Inside the previous segment's cylinder? (Skip for heads.)
-                var inside_prev = false;
-                if (in.is_head < 0.5) {
-                    let prev_axis_v = in.p0_world - in.prev_p0_world;
-                    let prev_len = length(prev_axis_v);
-                    if (prev_len > 1e-6) {
-                        let prev_dir = prev_axis_v / prev_len;
-                        let to_hit_prev = hit_0 - in.prev_p0_world;
-                        let along_prev = dot(to_hit_prev, prev_dir);
-                        let perp_prev = to_hit_prev - along_prev * prev_dir;
-                        inside_prev =
-                            along_prev >= 0.0 && along_prev <= prev_len
-                            && dot(perp_prev, perp_prev) <= r * r + 1e-5;
+    } else {
+        // Real cubic: A t^3 + B t^2 + C t + D = 0, with
+        //   A = 2 |g|^2, B = 3 g.b, C = 2 g.a + |b|^2, D = b.a.
+        let A = 2.0 * gg;
+        let B = 3.0 * gb;
+        let C = 2.0 * ga + bb;
+        let D = ba;
+        // Depress: substitute t = u - B/(3A) so the t^2 term vanishes.
+        let inv_A = 1.0 / A;
+        let b_over_a = B * inv_A;
+        let c_over_a = C * inv_A;
+        let d_over_a = D * inv_A;
+        let p_dep = c_over_a - b_over_a * b_over_a / 3.0;
+        let q_dep = (2.0 / 27.0) * b_over_a * b_over_a * b_over_a
+                  - (b_over_a * c_over_a) / 3.0 + d_over_a;
+        let disc = -4.0 * p_dep * p_dep * p_dep - 27.0 * q_dep * q_dep;
+        let shift = -b_over_a / 3.0;
+        if (disc > 0.0) {
+            // Three real roots: trigonometric form.
+            let m = 2.0 * sqrt(max(-p_dep / 3.0, 0.0));
+            let arg = clamp(3.0 * q_dep / (p_dep * m), -1.0, 1.0);
+            let theta = acos(arg) / 3.0;
+            let tau = 2.0943951;     // 2*pi/3
+            let u0 = m * cos(theta);
+            let u1 = m * cos(theta - tau);
+            let u2 = m * cos(theta - 2.0 * tau);
+            for (var i = 0; i < 3; i = i + 1) {
+                var u_root = u0;
+                if (i == 1) { u_root = u1; }
+                if (i == 2) { u_root = u2; }
+                let t_root = u_root + shift;
+                if (t_root >= 0.0 && t_root <= t_upper) {
+                    let u_c = a_p + b_p * t_root + g_p * (t_root * t_root);
+                    let d2 = dot(u_c, u_c);
+                    if (d2 < best_d2) {
+                        best_d2 = d2; t_star = t_root; found = true;
                     }
                 }
-
-                if (in.is_head > 0.5 || (!inside_self && !inside_prev)) {
-                    best_t = t0;
-                    best_hit = hit_0;
-                    best_normal = normalize(hit_0 - in.p0_world);
+            }
+        } else {
+            // One real root: Cardano.
+            let half_q = q_dep * 0.5;
+            let third_p = p_dep / 3.0;
+            let sq_arg = half_q * half_q + third_p * third_p * third_p;
+            let sq = sqrt(max(sq_arg, 0.0));
+            let uu = -half_q + sq;
+            let vv = -half_q - sq;
+            let cu = sign(uu) * pow(abs(uu), 1.0 / 3.0);
+            let cv = sign(vv) * pow(abs(vv), 1.0 / 3.0);
+            let u_root = cu + cv;
+            let t_root = u_root + shift;
+            if (t_root >= 0.0 && t_root <= t_upper) {
+                let u_c = a_p + b_p * t_root + g_p * (t_root * t_root);
+                let d2 = dot(u_c, u_c);
+                if (d2 < best_d2) {
+                    best_d2 = d2; t_star = t_root; found = true;
                 }
             }
         }
     }
 
-    if (best_t > 1e29) { discard; }
-    let hit = best_hit;
-    let tangent = axis_n;
+    // Head/tail cap endpoint candidates -- always allowed for the
+    // actual strand ends, never for interior pieces.
+    if (is_head) {
+        let u0 = a_p;
+        let d2 = dot(u0, u0);
+        if (d2 < best_d2) {
+            best_d2 = d2; t_star = 0.0; found = true;
+        }
+    }
+    if (is_tail) {
+        let u1 = a_p + b_p + g_p;
+        let d2 = dot(u1, u1);
+        if (d2 < best_d2) {
+            best_d2 = d2; t_star = 1.0; found = true;
+        }
+    }
 
-    // Kajiya-Kay headlight shading. textureLoad on the 1D palette (no
-    // sampler filtering -- bundle_id is integer, no need for interp).
+    if (!found || best_d2 > r * r) { discard; }
+
+    // Centerline point + tangent at t*.
+    let ts = t_star;
+    let c_t = in.B0_world + beta_v * ts + gamma_v * (ts * ts);
+    let c_prime = beta_v + 2.0 * gamma_v * ts;
+    let c_prime_l = length(c_prime);
+    var tangent = vec3<f32>(0.0, 0.0, 1.0);
+    if (c_prime_l > 1e-6) { tangent = c_prime / c_prime_l; }
+
+    // Resolve the surface entry point via a local-cylinder
+    // approximation around c(t*) along c'(t*). This is exact when
+    // the curve is locally straight (which it is, to first order, in
+    // any neighborhood of t*); the second-order error is O(curvature
+    // * r^2), which is well below a pixel for typical fiber radii.
+    // For the cap region (t* = 0 or t* = 1 with c'(t*) -> 0 at a
+    // degenerate Bezier endpoint), the local-cylinder degenerates to
+    // a sphere and gives the correct hemispherical cap automatically.
+    let oc = ro - c_t;
+    let rd_along_t = dot(rd, tangent);
+    let oc_along_t = dot(oc, tangent);
+    let rd_perp_t = rd - rd_along_t * tangent;
+    let oc_perp_t = oc - oc_along_t * tangent;
+    let cyl_a = dot(rd_perp_t, rd_perp_t);
+    var hit = vec3<f32>(0.0);
+    var normal = vec3<f32>(0.0);
+    if (cyl_a > 1e-9) {
+        let cyl_b = 2.0 * dot(oc_perp_t, rd_perp_t);
+        let cyl_c = dot(oc_perp_t, oc_perp_t) - r * r;
+        let cyl_disc = cyl_b * cyl_b - 4.0 * cyl_a * cyl_c;
+        if (cyl_disc < 0.0) { discard; }
+        let sd = sqrt(cyl_disc);
+        let s_hit = (-cyl_b - sd) / (2.0 * cyl_a);
+        if (s_hit < 0.0) { discard; }
+        hit = ro + s_hit * rd;
+        let perp = hit - c_t;
+        let perp_along = dot(perp, tangent);
+        let perp_n_v = perp - perp_along * tangent;
+        let perp_n_l = length(perp_n_v);
+        if (perp_n_l > 1e-6) { normal = perp_n_v / perp_n_l; } else { discard; }
+    } else {
+        // Ray nearly parallel to tangent: fall back to sphere at c(t*).
+        let oc_l = ro - c_t;
+        let bs = 2.0 * dot(rd, oc_l);
+        let cs = dot(oc_l, oc_l) - r * r;
+        let ds = bs * bs - 4.0 * cs;
+        if (ds < 0.0) { discard; }
+        let s_hit = (-bs - sqrt(ds)) * 0.5;
+        if (s_hit < 0.0) { discard; }
+        hit = ro + s_hit * rd;
+        normal = normalize(hit - c_t);
+    }
+
+    // Shading: same Lambertian + Kajiya-Kay as before, but now
+    // tangent + normal are smooth functions of t along the strand,
+    // so the per-segment shading discontinuity vanishes.
     let bid_clamped = clamp(i32(in.bundle_id), 0, 255);
     let pal = textureLoad(t_pal, bid_clamped, 0);
     let base_color = pal.rgb;
     let bundle_alpha = pal.a;
-
-    // Hybrid shading. Lambertian on the SURFACE NORMAL (perpendicular
-    // to axis at the hit point) gives the cylinder's cross-section
-    // curvature -- bright in the middle of the visible side, dark at
-    // the silhouettes. Kajiya-Kay specular on the TANGENT (along the
-    // axis) gives the anisotropic streak characteristic of hair/fibres.
-    let nl = max(dot(-rd, best_normal), 0.0);
+    let nl = max(dot(-rd, normal), 0.0);
     let ct = dot(rd, tangent);
-    let st = sqrt(max(1.0 - ct * ct, 0.0));     // sin(angle(rd, T))
+    let st = sqrt(max(1.0 - ct * ct, 0.0));
     let shade = u_field.shade;
     var lit = base_color * (shade.x + shade.y * nl)
             + vec3<f32>(shade.z * pow(st, max(shade.w, 1.0)) * nl);
@@ -4043,10 +4163,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         # Render pass writes a dummy output; the actual visible work is the
         # atomic-append into the A-buffer. Color target format must match
         # whatever begin_render_pass binds, but we use a 1x1 throwaway view.
-        # Vertex layout (48 bytes): pos_local(12) + prev_p0_local(12)
-        # + next_p1_local(12) + side_sign(4) + bundle_id(4) + is_head(4).
+        # Vertex layout (52 bytes): B0_local(12) + B1_local(12)
+        # + B2_local(12) + side_sign(4) + end_t(4) + bundle_id(4)
+        # + is_head(4). Each piece is one quadratic Bezier in 3D and
+        # one of 4 corners of a billboard quad around it.
         vertex_buffer_layout = {
-            "array_stride": 48,
+            "array_stride": 52,
             "step_mode": wgpu.VertexStepMode.vertex,
             "attributes": [
                 {"format": wgpu.VertexFormat.float32x3, "offset":  0, "shader_location": 0},
@@ -4055,6 +4177,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 {"format": wgpu.VertexFormat.float32,   "offset": 36, "shader_location": 3},
                 {"format": wgpu.VertexFormat.float32,   "offset": 40, "shader_location": 4},
                 {"format": wgpu.VertexFormat.float32,   "offset": 44, "shader_location": 5},
+                {"format": wgpu.VertexFormat.float32,   "offset": 48, "shader_location": 6},
             ],
         }
         self._strand_pipeline = self.device.create_render_pipeline(
@@ -4098,6 +4221,74 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self._fragment_sort_ubo = self.device.create_buffer(
             size=16,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+
+        # ---- TAA composite compute pipeline ----
+        # The 7-yr-old AMD adapter on the dev machine doesn't expose the
+        # read_write storage-texture access mode for rgba8unorm, so we
+        # split the history into read (sampled texture_2d) and write
+        # (write-only storage_texture) bindings and copy the output back
+        # to the history texture after the pass.
+        taa_shader = self.device.create_shader_module(code=self._TAA_WGSL)
+        self._taa_bgl = self.device.create_bind_group_layout(entries=[
+            # current frame, sampled as texture
+            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE,
+             "texture": {
+                "sample_type": wgpu.TextureSampleType.float,
+                "view_dimension": wgpu.TextureViewDimension.d2,
+                "multisampled": False,
+             }},
+            # history accumulator (previous frame), sampled as texture
+            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE,
+             "texture": {
+                "sample_type": wgpu.TextureSampleType.float,
+                "view_dimension": wgpu.TextureViewDimension.d2,
+                "multisampled": False,
+             }},
+            # output texture, write-only storage image
+            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE,
+             "storage_texture": {
+                "access": wgpu.StorageTextureAccess.write_only,
+                "format": wgpu.TextureFormat.rgba8unorm,
+                "view_dimension": wgpu.TextureViewDimension.d2,
+             }},
+            # params UBO: blend factor + viewport size
+            {"binding": 3, "visibility": wgpu.ShaderStage.COMPUTE,
+             "buffer": {"type": wgpu.BufferBindingType.uniform}},
+        ])
+        self._taa_pipeline = self.device.create_compute_pipeline(
+            layout=self.device.create_pipeline_layout(
+                bind_group_layouts=[self._taa_bgl]),
+            compute={"module": taa_shader, "entry_point": "main"})
+        self._taa_ubo = self.device.create_buffer(
+            size=16,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+
+    _TAA_WGSL = """
+struct TaaParams {
+    // .x = blend factor for current frame (1.0 = pure current = reset);
+    //      typical sustained value ~0.1 .
+    // .y, .z = viewport (w, h) so we can bounds-check.
+    params: vec4<f32>,
+};
+
+@group(0) @binding(0) var t_current: texture_2d<f32>;
+@group(0) @binding(1) var t_history: texture_2d<f32>;
+@group(0) @binding(2) var t_output:  texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(3) var<uniform> u_p: TaaParams;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = u32(u_p.params.y);
+    let h = u32(u_p.params.z);
+    if (gid.x >= w || gid.y >= h) { return; }
+    let xy = vec2<i32>(i32(gid.x), i32(gid.y));
+    let cur = textureLoad(t_current, xy, 0);
+    let hist = textureLoad(t_history, xy, 0);
+    let mixf = u_p.params.x;
+    let blended = mix(hist, cur, mixf);
+    textureStore(t_output, xy, blended);
+}
+"""
 
     def add_colorize_volume(self, volume_node, segmentation_node,
                             sigma_voxels=1.5, window_level=None,
@@ -4444,12 +4635,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         # sub-segments share their joint vertex INDEX, so the
         # rasterization mesh is watertight by construction (no per-
         # joint billboard tiling, no edge precision artifacts).
-        verts_pos: list = []           # vec3 per vertex
-        verts_prev: list = []          # vec3: the polyline point BEFORE this one (= self for heads)
-        verts_next: list = []          # vec3: the polyline point AFTER this one (= self for tails)
-        verts_side: list = []          # f32: -1 or +1
+        verts_b0: list = []            # vec3 per vertex
+        verts_b1: list = []            # vec3
+        verts_b2: list = []            # vec3
+        verts_side: list = []          # f32: -1 or +1 (billboard side sign)
+        verts_end_t: list = []         # f32: 0 = anchor at B0, 1 = anchor at B2
         verts_bid: list = []           # f32: bundle id
-        verts_head: list = []          # f32: 1 if this point is a polyline head, else 0
+        verts_head: list = []          # f32: 1 if this piece is a strand head, else 0
         indices: list = []             # u32 triangle list, 6 indices per sub-segment
         # AABB tracking.
         all_min = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
@@ -4515,57 +4707,58 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             all_min = np.minimum(all_min, dense_pts.min(axis=0))
             all_max = np.maximum(all_max, dense_pts.max(axis=0))
 
-            # Per-segment 4 vertices (NO sharing across segments). At
-            # each shared joint we have duplicate vertex pairs: for
-            # segment K-1 (whose right endpoint is the joint) and for
-            # segment K (whose left endpoint is the joint). All 4
-            # vertices of segment K's quad carry segment K's own
-            # (pos=p0, next=p1, prev=prev_p0) data, so flat-interp
-            # delivers correct segment data regardless of provoking
-            # vertex (works whether the backend uses spec-mandated
-            # "first" or Metal-native "last"). Duplicate joint
-            # vertices project to identical clip coords for collinear
-            # joints -> rasterization is still watertight.
+            # One quadratic-Bezier piece per polyline vertex i. The
+            # piece's control points are:
+            #   B0 = midpoint(pts[i-1], pts[i])
+            #   B1 = pts[i]
+            #   B2 = midpoint(pts[i], pts[i+1])
+            # Adjacent pieces share B0/B2 (the midpoints) and have
+            # matching tangent directions there by construction
+            # (Bezier tangent at B0 = 2(B1-B0) = pts[i]-pts[i-1],
+            # at B2 = 2(B2-B1) = pts[i+1]-pts[i]) -- so the rendered
+            # tube is C0 + C1-direction smooth across every joint
+            # regardless of the kink angle.
             #
-            # We add an EndpointFlag (0 = use p0, 1 = use p1) packed
-            # into bundle_id's fractional bit to position the vertex
-            # at the correct end without requiring a separate
-            # attribute. (Vertex layout has 6 attribs; adding a 7th
-            # would mean a layout change.) Concretely: bundle_id_f =
-            # bundle_id (whole) + 0.5 if endpoint==1 else 0.0.
+            # Strand head (i=0) and tail (i=n-1) use degenerate
+            # Beziers with B0=B1 (head) or B1=B2 (tail), which the
+            # ray-tube intersection naturally reduces to a sphere at
+            # the strand endpoint -> hemispherical cap.
             n_dense = len(dense_pts)
-            for i in range(n_dense - 1):
-                p0 = dense_pts[i]
-                p1 = dense_pts[i + 1]
-                prev = dense_pts[i - 1] if i > 0 else p0
-                is_head = 1.0 if i == 0 else 0.0
-                # 4 vertices per segment quad, each with all of segment
-                # K's data. Endpoint flag distinguishes p0 vs p1 vertex.
-                # Vertex 0: top@p0 (side=+1, endpoint=0)
-                # Vertex 1: bot@p0 (side=-1, endpoint=0)
-                # Vertex 2: top@p1 (side=+1, endpoint=1)
-                # Vertex 3: bot@p1 (side=-1, endpoint=1)
-                base_v = len(verts_pos)
+            for i in range(n_dense):
+                p_cur = dense_pts[i]
+                if i > 0:
+                    mid_prev = 0.5 * (dense_pts[i - 1] + p_cur)
+                else:
+                    mid_prev = p_cur          # head: degenerate
+                if i + 1 < n_dense:
+                    mid_next = 0.5 * (p_cur + dense_pts[i + 1])
+                else:
+                    mid_next = p_cur          # tail: degenerate
+                B0 = mid_prev
+                B1 = p_cur
+                B2 = mid_next
+                is_head = 1.0 if (i == 0 or i == n_dense - 1) else 0.0
+                # 4 vertices per piece quad:
+                # Vertex 0: side=+1 anchor@B0
+                # Vertex 1: side=-1 anchor@B0
+                # Vertex 2: side=+1 anchor@B2
+                # Vertex 3: side=-1 anchor@B2
+                base_v = len(verts_b0)
                 for sign, ep in [(+1.0, 0.0), (-1.0, 0.0),
                                  (+1.0, 1.0), (-1.0, 1.0)]:
-                    verts_pos.append(p0)         # always seg K's p0
-                    verts_prev.append(prev)
-                    verts_next.append(p1)        # always seg K's p1
+                    verts_b0.append(B0)
+                    verts_b1.append(B1)
+                    verts_b2.append(B2)
                     verts_side.append(sign)
-                    # Pack endpoint flag into bundle_id field:
-                    # whole part = bundle_id, fractional = endpoint.
-                    verts_bid.append(float(bid) + 0.5 * ep)
+                    verts_end_t.append(ep)
+                    verts_bid.append(float(bid))
                     verts_head.append(is_head)
                 # Triangle indices: standard quad split.
-                # Both triangles' first vertex is at p0 (vertex 0 or 1)
-                # so flat-interp from FIRST vertex also yields seg K's
-                # data -- redundant safety with the all-4-store
-                # approach.
                 indices.extend([base_v + 0, base_v + 1, base_v + 2])
                 indices.extend([base_v + 1, base_v + 3, base_v + 2])
                 num_segments += 1
 
-        if not verts_pos:
+        if not verts_b0:
             raise ValueError("polydata has Lines but no usable segments")
 
         # --- Build the FiberStrandField + GPU resources. ---
@@ -4602,16 +4795,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         sf._bounds = ((cw.min(axis=0) - pad).astype(np.float32),
                       (cw.max(axis=0) + pad).astype(np.float32))
 
-        # Vertex buffer: per-vertex strip data (48 bytes each).
+        # Vertex buffer: per-vertex Bezier-piece data (52 bytes each).
         # Layout matches the pipeline's vertex_buffer_layout.
-        n_verts = len(verts_pos)
-        vbuf = np.zeros((n_verts, 12), dtype=np.float32)
-        vbuf[:, 0:3] = np.asarray(verts_pos, dtype=np.float32)
-        vbuf[:, 3:6] = np.asarray(verts_prev, dtype=np.float32)
-        vbuf[:, 6:9] = np.asarray(verts_next, dtype=np.float32)
-        vbuf[:, 9] = np.asarray(verts_side, dtype=np.float32)
-        vbuf[:, 10] = np.asarray(verts_bid, dtype=np.float32)
-        vbuf[:, 11] = np.asarray(verts_head, dtype=np.float32)
+        n_verts = len(verts_b0)
+        vbuf = np.zeros((n_verts, 13), dtype=np.float32)
+        vbuf[:, 0:3]  = np.asarray(verts_b0, dtype=np.float32)
+        vbuf[:, 3:6]  = np.asarray(verts_b1, dtype=np.float32)
+        vbuf[:, 6:9]  = np.asarray(verts_b2, dtype=np.float32)
+        vbuf[:, 9]    = np.asarray(verts_side,  dtype=np.float32)
+        vbuf[:, 10]   = np.asarray(verts_end_t, dtype=np.float32)
+        vbuf[:, 11]   = np.asarray(verts_bid,   dtype=np.float32)
+        vbuf[:, 12]   = np.asarray(verts_head,  dtype=np.float32)
         sf.vertex_buffer = self.device.create_buffer(
             size=vbuf.nbytes,
             usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.COPY_DST)
@@ -4788,11 +4982,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     def _ensure_target(self, w, h):
         if self._size == (w, h) and self._color_tex is not None:
             return
+        # _color_tex is the main pipeline's render target; we also bind it
+        # as a sampled texture in the TAA composite pass, so it needs
+        # TEXTURE_BINDING and COPY_DST (to receive history afterward).
         self._color_tex = self.device.create_texture(
             size=(w, h, 1),
             format=wgpu.TextureFormat.rgba8unorm,
-            usage=wgpu.TextureUsage.RENDER_ATTACHMENT | wgpu.TextureUsage.COPY_SRC,
+            usage=(wgpu.TextureUsage.RENDER_ATTACHMENT
+                   | wgpu.TextureUsage.TEXTURE_BINDING
+                   | wgpu.TextureUsage.COPY_SRC
+                   | wgpu.TextureUsage.COPY_DST),
         )
+        # TAA history accumulator (sampled read-only). Written each frame
+        # via copy_texture_to_texture from _taa_output_tex so we never
+        # rely on the optional read_write storage access mode.
+        self._taa_history_tex = self.device.create_texture(
+            size=(w, h, 1),
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=(wgpu.TextureUsage.TEXTURE_BINDING
+                   | wgpu.TextureUsage.COPY_DST),
+        )
+        self._taa_history_view = self._taa_history_tex.create_view()
+        # TAA compute output (write-only storage). One copy out to the
+        # history texture (for next frame's input) and one copy out to
+        # _color_tex (for the VTK readback path).
+        self._taa_output_tex = self.device.create_texture(
+            size=(w, h, 1),
+            format=wgpu.TextureFormat.rgba8unorm,
+            usage=(wgpu.TextureUsage.STORAGE_BINDING
+                   | wgpu.TextureUsage.COPY_SRC),
+        )
+        self._taa_output_view = self._taa_output_tex.create_view()
+        self._taa_frame = 0          # reset accumulator on resize
         bpr = w * 4
         self._aligned_bpr = (bpr + 255) & ~255
         self._readback_buf = self.device.create_buffer(
@@ -4809,16 +5030,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             return np.zeros((h, w, 4), dtype=np.uint8)
         self._ensure_target(w, h)
 
-        # Cam UBO layout (272 bytes):
-        #   proj_inv (mat4 col-major)  bytes  0..64
-        #   view_inv (mat4)            bytes 64..128
-        #   size      (vec4 w,h,_,_)   bytes 128..144
+        # Cam UBO layout (288 bytes):
+        #   proj_inv (mat4 col-major)  bytes   0..64
+        #   view_inv (mat4)            bytes  64..128
+        #   size      (vec4 w,h,jx,jy) bytes 128..144  (jx/jy = TAA NDC jitter)
         #   proj      (mat4)           bytes 144..208
         #   view      (mat4)           bytes 208..272
-        cbuf = np.zeros(68, dtype=np.float32)
+        #   taa       (vec4 frame,_,_,_) bytes 272..288
+        cbuf = np.zeros(72, dtype=np.float32)
         cbuf[0:16] = proj_inv.T.ravel()
         cbuf[16:32] = view_inv.T.ravel()
         cbuf[32] = float(w); cbuf[33] = float(h)
+        # TAA jitter: Halton(2, 3) sequence scaled so the offset is one
+        # pixel in NDC (= 2/viewport). Cycled every 8 frames. If the
+        # camera changed since the last render, reset the index so the
+        # history buffer (which is keyed on the jitter pattern) starts
+        # fresh and we don't ghost across a camera move.
+        pv = (proj_fwd @ view_fwd) if (proj_fwd is not None
+                                       and view_fwd is not None) else None
+        if (self._taa_prev_pv is None or pv is None
+                or not np.allclose(pv, self._taa_prev_pv, atol=1e-4)):
+            self._taa_frame = 0
+        else:
+            self._taa_frame = (self._taa_frame + 1) & 0x7FFFFFFF
+        self._taa_prev_pv = pv
+        taa_frame = self._taa_frame
+        jx_n, jy_n = _halton_2_3(taa_frame % 8)
+        cbuf[34] = (jx_n - 0.5) * 2.0 / float(w)
+        cbuf[35] = (jy_n - 0.5) * 2.0 / float(h)
         if proj_fwd is not None:
             cbuf[36:52] = np.asarray(proj_fwd, dtype=np.float32).T.ravel()
         else:
@@ -4827,6 +5066,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             cbuf[52:68] = np.asarray(view_fwd, dtype=np.float32).T.ravel()
         else:
             cbuf[52:68] = np.eye(4, dtype=np.float32).T.ravel()
+        cbuf[68] = float(taa_frame)   # taa.x
         self.device.queue.write_buffer(self._cam_ubo, 0, cbuf.tobytes())
 
         visible_fields = [f for f in self._fields if f.visible]
@@ -4958,6 +5198,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         rp.set_bind_group(0, self._bind_group, [], 0, 0)
         rp.draw(3)
         rp.end()
+
+        # TAA composite: blend the just-rendered _color_tex with the
+        # previous frame's history into _taa_output_tex, then copy that
+        # output into both _taa_history_tex (for next frame's input) and
+        # _color_tex (for the existing readback path). On a camera/scene
+        # reset (_taa_frame == 0) the blend factor is 1.0 which discards
+        # stale history -- the still-uninitialized history texture is
+        # then overwritten by the first frame's output via the copy.
+        import struct as _st2
+        taa_buf = bytearray(16)
+        mixf = 1.0 if self._taa_frame == 0 else 0.10
+        _st2.pack_into("<f", taa_buf, 0, mixf)
+        _st2.pack_into("<f", taa_buf, 4, float(w))
+        _st2.pack_into("<f", taa_buf, 8, float(h))
+        self.device.queue.write_buffer(self._taa_ubo, 0, bytes(taa_buf))
+        taa_bg = self.device.create_bind_group(
+            layout=self._taa_bgl, entries=[
+                {"binding": 0, "resource": self._color_tex.create_view()},
+                {"binding": 1, "resource": self._taa_history_view},
+                {"binding": 2, "resource": self._taa_output_view},
+                {"binding": 3, "resource": {
+                    "buffer": self._taa_ubo, "offset": 0, "size": 16}},
+            ])
+        taa_pass = enc.begin_compute_pass()
+        taa_pass.set_pipeline(self._taa_pipeline)
+        taa_pass.set_bind_group(0, taa_bg, [], 0, 0)
+        taa_pass.dispatch_workgroups((w + 7) // 8, (h + 7) // 8, 1)
+        taa_pass.end()
+        # Update history for the next frame.
+        enc.copy_texture_to_texture(
+            {"texture": self._taa_output_tex,
+             "mip_level": 0, "origin": (0, 0, 0)},
+            {"texture": self._taa_history_tex,
+             "mip_level": 0, "origin": (0, 0, 0)},
+            (w, h, 1))
+        # And expose the composited result to the readback path.
+        enc.copy_texture_to_texture(
+            {"texture": self._taa_output_tex,
+             "mip_level": 0, "origin": (0, 0, 0)},
+            {"texture": self._color_tex,
+             "mip_level": 0, "origin": (0, 0, 0)},
+            (w, h, 1))
+
         enc.copy_texture_to_buffer(
             {"texture": self._color_tex, "mip_level": 0, "origin": (0, 0, 0)},
             {"buffer": self._readback_buf, "offset": 0,
