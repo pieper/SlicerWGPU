@@ -32,6 +32,7 @@ Further stages:
 
 import logging
 
+import ctk
 import qt
 import slicer
 import vtk
@@ -41,6 +42,8 @@ from slicer.ScriptedLoadableModule import (
     ScriptedLoadableModuleLogic,
     ScriptedLoadableModuleTest,
 )
+
+from SceneRenderingLib import wgpu_state
 
 
 MODULE_NAME = "SceneRendering"
@@ -136,45 +139,479 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
         ("Deformable Volume",          "test_DeformableVolume"),
         ("Cinematic Rendering",        "test_CinematicRendering"),
     ]
+    # State / MRB persistence tests for the per-data-node wgpu_state
+    # schema. These are fast and don't need GPU work.
+    STATE_TESTS = [
+        ("State: Basic edit",          "test_state_BasicEdit"),
+        ("State: Save / restore",      "test_state_SaveRestore"),
+        ("Bridge: auto-enable on add", "test_bridge_autoEnableOnAdd"),
+        ("Bridge: per-node opt-out",   "test_bridge_perNodeOptOut"),
+        ("Bridge: multi-segmentation", "test_bridge_multiSegmentation"),
+    ]
+
+    # Page indices for the dynamic edit panel's QStackedWidget.
+    _EDIT_PAGE_EMPTY = 0
+    _EDIT_PAGE_VOLUME = 1
+    _EDIT_PAGE_SEGMENTATION = 2
 
     def setup(self):
         ScriptedLoadableModuleWidget.setup(self)
 
-        container = qt.QGroupBox("Self-tests")
-        vbox = qt.QVBoxLayout(container)
+        # Per-widget state. The bridge instance (when installed) also
+        # lives on slicer.modules.wgpuVtkBridge so the test framework's
+        # setUp() can find and tear it down.
+        self._bridge = None
+        self._edited_node_id = None  # MRML node ID currently in edit panel
+        # View-checkbox widgets per page, rebuilt when the page is
+        # populated for a node. nodeID -> {viewID: QCheckBox}.
+        self._view_checks_volume = {}
+        self._view_checks_seg = {}
+        # Scene observers for state-node lifecycle and load-time
+        # state reapplication. (caller, tag) tuples.
+        self._scene_observer_tags = []
+
+        self._setup_overrides_section()
+        self._setup_demos_section()
+
+        self.layout.addStretch(1)
+
+        self._register_sh_plugin()
+        self._install_scene_observers()
+
+        # Default-ON bridge install. Synchronous: the 3D view is
+        # virtually always laid out by the time setup() runs. If it
+        # isn't (or deps aren't installed) the status label tells the
+        # user; they can click "Install / reinstall deps" to retry.
+        # Deferring this through QTimer was the prior approach but
+        # raced with explicit install_default_bridge() calls in tests,
+        # creating dead bridges with the right handle in
+        # slicer.modules.wgpuVtkBridge but observers stripped.
+        self._install_bridge()
+
+    # ------------------------------------------------------------------
+    # Rendering Overrides -- the primary panel.
+    # Subject-hierarchy combo at the top drives a dynamic edit panel
+    # whose contents adapt to the selected node (volume vs segmentation).
+    # The scripted SH plugin (SceneRenderingLib/SlicerWGPUSubjectHierarchy
+    # Plugin.py) drives users to this panel via its "Edit SlicerWGPU
+    # options..." context-menu action.
+    # ------------------------------------------------------------------
+
+    def _setup_overrides_section(self):
+        section = ctk.ctkCollapsibleButton()
+        section.text = "Rendering Overrides"
+        section.collapsed = False
+        self.layout.addWidget(section)
+        outer = qt.QVBoxLayout(section)
+
+        # --- Bridge status row ---
+        status_row = qt.QHBoxLayout()
+        self._volumeStatusLabel = qt.QLabel("Bridge: (not installed)")
+        self._volumeStatusLabel.setWordWrap(True)
+        status_row.addWidget(self._volumeStatusLabel, 1)
+        self._installDepsButton = qt.QPushButton("Install / reinstall deps")
+        self._installDepsButton.setToolTip(
+            "Run the same pip bootstrap the self-tests use. Needed the "
+            "first time, or after a wgpu / pygfx / slicer-wgpu update.")
+        self._installDepsButton.clicked.connect(self._on_install_deps_clicked)
+        status_row.addWidget(self._installDepsButton)
+        outer.addLayout(status_row)
+
+        # --- Item-to-edit combo ---
+        # Build the combo WITHOUT connecting yet -- setMRMLScene and
+        # initial show emit currentItemChanged, which would fire before
+        # the stack pages exist and crash _populate_*_page().
+        combo_row = qt.QHBoxLayout()
+        combo_row.addWidget(qt.QLabel("Item:"))
+        self._editCombo = slicer.qMRMLSubjectHierarchyComboBox()
+        self._editCombo.setMRMLScene(slicer.mrmlScene)
+        # Limit picks to node types we know how to render.
+        self._editCombo.setNodeTypes(
+            ["vtkMRMLScalarVolumeNode", "vtkMRMLSegmentationNode"])
+        self._editCombo.setToolTip(
+            "Pick a volume or segmentation to edit its SlicerWGPU "
+            "rendering options. Driven by the SH context-menu action "
+            "'Edit SlicerWGPU options...' as well.")
+        combo_row.addWidget(self._editCombo, 1)
+        outer.addLayout(combo_row)
+
+        # --- Dynamic edit stack ---
+        self._editStack = qt.QStackedWidget()
+        self._editStack.addWidget(self._build_edit_page_empty())
+        self._editStack.addWidget(self._build_edit_page_volume())
+        self._editStack.addWidget(self._build_edit_page_segmentation())
+        outer.addWidget(self._editStack)
+        self._editStack.setCurrentIndex(self._EDIT_PAGE_EMPTY)
+
+        # Pages exist now -- safe to connect the combo signal.
+        self._editCombo.connect(
+            "currentItemChanged(vtkIdType)", self._on_edit_item_changed)
+
+    # --- edit-panel page builders ---
+
+    def _build_edit_page_empty(self):
+        page = qt.QWidget()
+        v = qt.QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+        hint = qt.QLabel(
+            "<i>Select a volume or segmentation above (or right-click "
+            "one in the Data module and choose 'Edit SlicerWGPU "
+            "options...') to edit its rendering.</i>")
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+        v.addStretch(1)
+        return page
+
+    def _build_edit_page_volume(self):
+        page = qt.QWidget()
+        v = qt.QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+
+        self._volumeRenderCheck = qt.QCheckBox("Render with SlicerWGPU")
+        self._volumeRenderCheck.setToolTip(
+            "Toggle wgpu rendering for this volume. Persisted on the "
+            "per-data-node SlicerWGPU state node so MRML/MRB save/"
+            "restore picks it up.")
+        self._volumeRenderCheck.toggled.connect(
+            self._on_volume_render_check_toggled)
+        v.addWidget(self._volumeRenderCheck)
+
+        self._volumeViewGroup, self._volumeViewContainerLayout = (
+            self._build_view_selector_group("Render in views"))
+        v.addWidget(self._volumeViewGroup)
+
+        tf_group = qt.QGroupBox("Transfer function")
+        tf_v = qt.QVBoxLayout(tf_group)
+        tf_placeholder = qt.QLabel(
+            "<i>New transfer-function editor will land here.</i>")
+        tf_placeholder.setWordWrap(True)
+        tf_v.addWidget(tf_placeholder)
+        v.addWidget(tf_group)
+
+        v.addStretch(1)
+        return page
+
+    def _build_edit_page_segmentation(self):
+        page = qt.QWidget()
+        v = qt.QVBoxLayout(page)
+        v.setContentsMargins(0, 0, 0, 0)
+
+        self._segRenderCheck = qt.QCheckBox("Render with SlicerWGPU")
+        self._segRenderCheck.setToolTip(
+            "Toggle wgpu rendering for this segmentation. The bridge "
+            "supports multiple segmentations simultaneously.")
+        self._segRenderCheck.toggled.connect(
+            self._on_seg_render_check_toggled)
+        v.addWidget(self._segRenderCheck)
+
+        self._segViewGroup, self._segViewContainerLayout = (
+            self._build_view_selector_group("Render in views"))
+        v.addWidget(self._segViewGroup)
+
+        mode_group = qt.QGroupBox("Render mode")
+        mode_v = qt.QVBoxLayout(mode_group)
+        self._segModeButtons = qt.QButtonGroup(mode_group)
+        self._segModeIso = qt.QRadioButton(
+            "Isosurface (per-segment label, hard edges)")
+        self._segModeSurface = qt.QRadioButton(
+            "Surface (gradient-opacity, soft edges)")
+        self._segModeIso.setChecked(True)
+        self._segModeButtons.addButton(self._segModeIso, 0)
+        self._segModeButtons.addButton(self._segModeSurface, 1)
+        self._segModeIso.toggled.connect(self._on_seg_mode_changed)
+        self._segModeSurface.toggled.connect(self._on_seg_mode_changed)
+        mode_v.addWidget(self._segModeIso)
+        mode_v.addWidget(self._segModeSurface)
+        v.addWidget(mode_group)
+
+        carve_hint = qt.QLabel(
+            "<i>Carve / multi-volume compositing options will land "
+            "here as the demos (test_vtk_SegmentSurfaces, "
+            "test_vtk_FieldCompositing) get promoted to real "
+            "controls.</i>")
+        carve_hint.setWordWrap(True)
+        v.addWidget(carve_hint)
+
+        v.addStretch(1)
+        return page
+
+    def _build_view_selector_group(self, title):
+        # Returns (group, container_layout). The container_layout is
+        # the QVBoxLayout into which _rebuild_view_checks adds one
+        # checkbox per vtkMRMLViewNode. We return both because PythonQt
+        # forbids stashing Python attrs on the C++-backed QGroupBox.
+        # Empty selection means "all views" (matches MRML display node
+        # convention).
+        group = qt.QGroupBox(title)
+        layout = qt.QVBoxLayout(group)
+        hint = qt.QLabel(
+            "<i>Leave all unchecked to render in every 3D view. "
+            "Check specific views to scope this node to those views "
+            "only (matches MRML display-node viewNodeIDs convention).</i>")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        container = qt.QWidget()
+        container_layout = qt.QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(container)
+        return group, container_layout
+
+    # --- edit-panel state sync ---
+
+    def selectItemForEditing(self, itemID):
+        """Public hook for the SH plugin's 'Edit options' action.
+        Sets the combo to itemID; the rest of the panel populates
+        via the currentItemChanged signal."""
+        if itemID is None:
+            return
+        invalid = slicer.vtkMRMLSubjectHierarchyNode.GetInvalidItemID()
+        if itemID == invalid:
+            return
+        self._editCombo.setCurrentItem(itemID)
+
+    def _on_edit_item_changed(self, itemID):
+        # Guard against being fired before _setup_overrides_section
+        # has finished building the stack pages (can happen on certain
+        # reload paths where setup() runs again on an existing widget).
+        if not hasattr(self, "_volumeViewGroup"):
+            return
+        node = self._node_for_sh_item(itemID)
+        self._edited_node_id = node.GetID() if node is not None else None
+        if node is None:
+            self._editStack.setCurrentIndex(self._EDIT_PAGE_EMPTY)
+            return
+        if node.IsA("vtkMRMLScalarVolumeNode"):
+            self._editStack.setCurrentIndex(self._EDIT_PAGE_VOLUME)
+            self._populate_volume_page(node)
+        elif node.IsA("vtkMRMLSegmentationNode"):
+            self._editStack.setCurrentIndex(self._EDIT_PAGE_SEGMENTATION)
+            self._populate_segmentation_page(node)
+        else:
+            self._editStack.setCurrentIndex(self._EDIT_PAGE_EMPTY)
+
+    def _populate_volume_page(self, node):
+        # Block signals while syncing UI from node state so we don't
+        # echo-trigger the toggled handler.
+        self._volumeRenderCheck.blockSignals(True)
+        self._volumeRenderCheck.setChecked(wgpu_state.is_render_enabled(node))
+        self._volumeRenderCheck.blockSignals(False)
+        self._rebuild_view_checks(node, self._volumeViewContainerLayout,
+                                  self._view_checks_volume)
+
+    def _populate_segmentation_page(self, node):
+        self._segRenderCheck.blockSignals(True)
+        self._segRenderCheck.setChecked(wgpu_state.is_render_enabled(node))
+        self._segRenderCheck.blockSignals(False)
+        self._rebuild_view_checks(node, self._segViewContainerLayout,
+                                  self._view_checks_seg)
+        # Render mode is per-node state -- read from MRML, fall back to
+        # bridge default if no state node yet.
+        mode = wgpu_state.segment_render_mode(node, default="iso")
+        for btn, name in (
+                (self._segModeIso, "iso"),
+                (self._segModeSurface, "surface")):
+            btn.blockSignals(True)
+            btn.setChecked(mode == name)
+            btn.blockSignals(False)
+
+    def _rebuild_view_checks(self, node, container_layout, cache_dict):
+        # Clear previous rows.
+        while container_layout.count():
+            item = container_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        cache_dict.clear()
+
+        selected_ids = set(wgpu_state.view_node_ids(node))
+        coll = slicer.mrmlScene.GetNodesByClass("vtkMRMLViewNode")
+        try:
+            for i in range(coll.GetNumberOfItems()):
+                view_node = coll.GetItemAsObject(i)
+                vid = view_node.GetID()
+                cb = qt.QCheckBox(view_node.GetName())
+                cb.setChecked(vid in selected_ids)
+                cb.toggled.connect(
+                    lambda checked, vid=vid: self._on_view_check_toggled(
+                        vid, checked))
+                container_layout.addWidget(cb)
+                cache_dict[vid] = cb
+        finally:
+            coll.UnRegister(None)
+
+    def _on_view_check_toggled(self, _view_id, _checked):
+        node = self._currently_edited_node()
+        if node is None:
+            return
+        # Determine which cache applies based on node type.
+        cache = (self._view_checks_volume
+                 if node.IsA("vtkMRMLScalarVolumeNode")
+                 else self._view_checks_seg)
+        selected = [vid for vid, cb in cache.items() if cb.isChecked()]
+        wgpu_state.set_view_node_ids(node, selected)
+        # TODO: notify the bridge to re-evaluate which views render
+        # this node when bridge grows per-view installation.
+
+    # --- edit-panel handlers ---
+
+    def _on_volume_render_check_toggled(self, checked):
+        node = self._currently_edited_node()
+        if node is None:
+            return
+        # Flip the state node and let the bridge react via its own
+        # state-Modified observer (claims/unclaims + auto-creates VRDN
+        # via reconcile backfill if needed).
+        wgpu_state.set_render_enabled(node, checked)
+
+    def _on_seg_render_check_toggled(self, checked):
+        node = self._currently_edited_node()
+        if node is None:
+            return
+        # Same pattern: flip state and let bridge reconcile pick it up.
+        wgpu_state.set_render_enabled(node, checked)
+
+    def _on_seg_mode_changed(self, _checked):
+        node = self._currently_edited_node()
+        mode = "surface" if self._segModeSurface.isChecked() else "iso"
+        if node is not None:
+            wgpu_state.set_segment_render_mode(node, mode)
+        if self._bridge is None:
+            return
+        try:
+            self._bridge.set_segment_render_mode(mode)
+        except Exception as e:
+            slicer.util.errorDisplay(
+                f"Failed to set segment render mode: {e}")
+
+    def _currently_edited_node(self):
+        if self._edited_node_id is None:
+            return None
+        return slicer.mrmlScene.GetNodeByID(self._edited_node_id)
+
+    @staticmethod
+    def _node_for_sh_item(itemID):
+        invalid = slicer.vtkMRMLSubjectHierarchyNode.GetInvalidItemID()
+        if itemID == invalid:
+            return None
+        handler = slicer.qSlicerSubjectHierarchyPluginHandler.instance()
+        shNode = handler.subjectHierarchyNode()
+        if shNode is None:
+            return None
+        return shNode.GetItemDataNode(itemID)
+
+    # ------------------------------------------------------------------
+    # Subject hierarchy plugin registration
+    # ------------------------------------------------------------------
+
+    def _register_sh_plugin(self):
+        # Guard against double-register on module reload -- the plugin
+        # handler keeps registered plugins alive for the session.
+        if getattr(slicer.modules, "slicerWgpuShPlugin", None) is not None:
+            return
+        try:
+            from SceneRenderingLib.SlicerWGPUSubjectHierarchyPlugin import (
+                SlicerWGPUSubjectHierarchyPlugin)
+        except Exception as e:
+            logging.warning(f"SlicerWGPU SH plugin import failed: {e}")
+            return
+        try:
+            scriptedPlugin = slicer.qSlicerSubjectHierarchyScriptedPlugin(None)
+            scriptedPlugin.setPythonSource(
+                SlicerWGPUSubjectHierarchyPlugin.filePath)
+            slicer.modules.slicerWgpuShPlugin = scriptedPlugin
+        except Exception as e:
+            logging.warning(f"SlicerWGPU SH plugin registration failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Scene observers -- state-node lifecycle and load-time reapply.
+    # ------------------------------------------------------------------
+
+    def _install_scene_observers(self):
+        scene = slicer.mrmlScene
+        # When a data node is removed, drop its state node so the
+        # scene doesn't accumulate orphans.
+        tag_rm = scene.AddObserver(
+            slicer.vtkMRMLScene.NodeRemovedEvent, self._on_node_removed)
+        self._scene_observer_tags.append((scene, tag_rm))
+        # After MRB / scene load, reapply renderEnabled to the bridge
+        # for every state node that came back.
+        tag_end = scene.AddObserver(
+            slicer.vtkMRMLScene.EndImportEvent, self._on_scene_end_import)
+        self._scene_observer_tags.append((scene, tag_end))
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _on_node_removed(self, caller, event, calldata):
+        removed = calldata
+        if removed is None:
+            return
+        removed_id = removed.GetID()
+        if not removed_id:
+            return
+        # Was this a managed data node? If so, drop its state node.
+        for state in wgpu_state.all_state_nodes():
+            if state.GetNodeReferenceID(
+                    wgpu_state.TARGET_NODE_REF) == removed_id:
+                slicer.mrmlScene.RemoveNode(state)
+
+    def _on_scene_end_import(self, caller, event):
+        # The bridge's own state-node Modified observers + reconcile
+        # passes handle reapplication: when state nodes deserialize
+        # during scene load, their Modified events drive reconcile,
+        # which claims VRDNs / adds segmentations / backfills missing
+        # VRDNs. Force one reconcile here in case the order of node
+        # add events during import meant the bridge missed something
+        # (e.g. state node observed before its target volume existed).
+        if self._bridge is None:
+            return
+        try:
+            self._bridge._reconcile_vrdn_claims()
+            self._bridge._reconcile_segmentation_nodes()
+        except Exception:
+            pass
+
+    def _setup_demos_section(self):
+        section = ctk.ctkCollapsibleButton()
+        section.text = "Demos / self-tests"
+        section.collapsed = True
+        self.layout.addWidget(section)
+        v = qt.QVBoxLayout(section)
 
         header = qt.QLabel(
             "Click a button to reload this module and run that self-test.")
         header.setWordWrap(True)
-        vbox.addWidget(header)
+        v.addWidget(header)
 
-        # --- VTK-injection self-tests (new path, runs in default 3D view) ---
-        vtk_label = qt.QLabel("<b>VTK injection (new)</b>")
-        vbox.addWidget(vtk_label)
+        vtk_group = qt.QGroupBox("VTK injection (current path)")
+        vtk_v = qt.QVBoxLayout(vtk_group)
         for label, method_name in self.VTK_TESTS:
             btn = qt.QPushButton(label)
             btn.setToolTip(f"Reload SceneRendering and run {method_name}()")
             btn.clicked.connect(
                 lambda _checked=False, m=method_name: self.onRunTest(m))
-            vbox.addWidget(btn)
+            vtk_v.addWidget(btn)
+        v.addWidget(vtk_group)
 
-        # --- Legacy DualView/pygfx self-tests ---
-        legacy_label = qt.QLabel("<b>DualView / pygfx (legacy)</b>")
-        vbox.addWidget(legacy_label)
+        legacy_group = qt.QGroupBox("DualView / pygfx (legacy)")
+        legacy_v = qt.QVBoxLayout(legacy_group)
         for label, method_name in self.TESTS:
             btn = qt.QPushButton(label)
             btn.setToolTip(f"Reload SceneRendering and run {method_name}()")
-            # Capture method_name by default-arg to avoid late-binding on
-            # the loop variable.
             btn.clicked.connect(
                 lambda _checked=False, m=method_name: self.onRunTest(m))
-            vbox.addWidget(btn)
+            legacy_v.addWidget(btn)
+        v.addWidget(legacy_group)
 
-        # Opt-in force-reinstall: by default _ensure_dependencies only
-        # pip-installs when a dep isn't importable, because the github
-        # zip URLs cache and re-downloading every run is slow. Toggle
-        # this when you want the next test button press to pull a
-        # fresh build of pieper/rendercanvas or pieper/slicer-wgpu.
+        state_group = qt.QGroupBox("State / MRB persistence")
+        state_v = qt.QVBoxLayout(state_group)
+        for label, method_name in self.STATE_TESTS:
+            btn = qt.QPushButton(label)
+            btn.setToolTip(f"Reload SceneRendering and run {method_name}()")
+            btn.clicked.connect(
+                lambda _checked=False, m=method_name: self.onRunTest(m))
+            state_v.addWidget(btn)
+        v.addWidget(state_group)
+
         self._forceReinstallCheck = qt.QCheckBox(
             "Force-reinstall deps from GitHub on next test")
         self._forceReinstallCheck.setToolTip(
@@ -182,10 +619,70 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
             "--force-reinstall --no-cache-dir to pip for "
             "pieper/rendercanvas and pieper/slicer-wgpu. The box "
             "unchecks itself automatically after the run.")
-        vbox.addWidget(self._forceReinstallCheck)
+        v.addWidget(self._forceReinstallCheck)
 
-        self.layout.addWidget(container)
-        self.layout.addStretch(1)
+    # ------------------------------------------------------------------
+    # Bridge install / uninstall
+    # ------------------------------------------------------------------
+
+    def _install_bridge(self):
+        if self._bridge is not None:
+            self._volumeStatusLabel.text = "Bridge: installed"
+            return
+        try:
+            from SceneRenderingLib.wgpu_vtk_inject import install_default_bridge
+        except Exception as e:
+            self._volumeStatusLabel.text = (
+                f"Bridge: deps missing ({type(e).__name__}). "
+                "Click 'Install / reinstall deps' or run a demo first.")
+            return
+        try:
+            self._bridge = install_default_bridge()
+            slicer.modules.wgpuVtkBridge = self._bridge
+            self._volumeStatusLabel.text = "Bridge: installed"
+        except Exception as e:
+            self._bridge = None
+            self._volumeStatusLabel.text = f"Bridge install failed: {e}"
+
+    def _uninstall_bridge(self):
+        # Drop the segmentation hook first so the bridge doesn't
+        # fire renders while we're tearing it down.
+        if self._bridge is not None:
+            try:
+                self._bridge.set_segmentation_node(None)
+            except Exception:
+                pass
+            try:
+                self._bridge.uninstall()
+            except Exception:
+                pass
+            self._bridge = None
+        slicer.modules.wgpuVtkBridge = None
+        self._volumeStatusLabel.text = "Bridge: (not installed)"
+
+    def _on_install_deps_clicked(self):
+        # Reuse the test class's bootstrap -- it's the source of truth
+        # for which packages and which versions get pip-installed.
+        try:
+            SceneRenderingTest()._ensure_dependencies()
+        except Exception as e:
+            slicer.util.errorDisplay(f"Dependency install failed: {e}")
+            return
+        # Try the bridge install now that deps should be present.
+        self._install_bridge()
+
+    # ------------------------------------------------------------------
+    # Widget teardown
+    # ------------------------------------------------------------------
+
+    def cleanup(self):
+        for obj, tag in self._scene_observer_tags:
+            try:
+                obj.RemoveObserver(tag)
+            except Exception:
+                pass
+        self._scene_observer_tags = []
+        self._uninstall_bridge()
 
     def onRunTest(self, test_method_name):
         """Reload this module and run the named self-test. Mirrors the
@@ -778,7 +1275,18 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         """Force a render on the 3D view and return the RGB snapshot."""
         import numpy as np
         lm = slicer.app.layoutManager()
-        view = lm.threeDWidget(0).threeDView()
+        # Pick the first VISIBLE 3D widget -- after layout changes,
+        # threeDWidget(0) can be an invisible spare from a wider
+        # layout that's no longer active.
+        tw = None
+        for i in range(lm.threeDViewCount):
+            candidate = lm.threeDWidget(i)
+            if candidate is not None and candidate.visible:
+                tw = candidate
+                break
+        if tw is None:
+            tw = lm.threeDWidget(0)
+        view = tw.threeDView()
         view.forceRender()
         slicer.app.processEvents()
         # WindowToImage grab of the view
@@ -2126,6 +2634,360 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             if speed > v_max:
                 velocities[i] *= (v_max / speed)
             positions[i] = positions[i] + velocities[i] * dt
+
+    # ------------------------------------------------------------------
+    # State / MRB persistence tests for the per-data-node wgpu_state
+    # schema (see reference_wgpu_state_node_schema memory). These do
+    # not exercise GPU rendering -- they verify the scripted module
+    # node schema, the SH-plugin toggle path, and round-trip through
+    # MRML save/load.
+    # ------------------------------------------------------------------
+
+    def _make_synthetic_volume(self, name="WgpuTestVol", dims=(16, 16, 16)):
+        """Build a tiny scalar volume in MRML without downloading
+        anything. Just a gradient so it has nonzero scalar range."""
+        import numpy as np
+        vol = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLScalarVolumeNode", name)
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        ijk_to_ras.Identity()
+        img = vtk.vtkImageData()
+        img.SetDimensions(dims[0], dims[1], dims[2])
+        img.AllocateScalars(vtk.VTK_SHORT, 1)
+        arr = vtk.util.numpy_support.vtk_to_numpy(
+            img.GetPointData().GetScalars()).reshape(
+                dims[2], dims[1], dims[0])
+        zz, yy, xx = np.indices(arr.shape)
+        arr[:] = (xx + yy + zz).astype(np.int16)
+        vol.SetAndObserveImageData(img)
+        vol.SetIJKToRASMatrix(ijk_to_ras)
+        vol.CreateDefaultDisplayNodes()
+        return vol
+
+    def _make_synthetic_segmentation(self, vol, name="WgpuTestSeg"):
+        """Build a tiny segmentation with one empty segment, referencing
+        the given volume's geometry. Bridge-friendly without any paint."""
+        seg = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode", name)
+        seg.CreateDefaultDisplayNodes()
+        seg.SetReferenceImageGeometryParameterFromVolumeNode(vol)
+        seg.GetSegmentation().AddEmptySegment("seg1", "seg1")
+        return seg
+
+    def _make_extra_view_node(self, name="WgpuTestView"):
+        """Return a second 3D view node so the view-id selector and
+        state node have something to point at beyond the default view."""
+        existing = slicer.mrmlScene.GetFirstNodeByName(name)
+        if existing is not None and existing.IsA("vtkMRMLViewNode"):
+            return existing
+        view = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLViewNode", name)
+        return view
+
+    def test_state_BasicEdit(self):
+        """Round-trip the per-data-node wgpu_state schema via direct
+        API calls. Covers: state creation on enable, state survives
+        disable (keeps settings), view-id list set/get, segment render
+        mode set/get, lifecycle cleanup when target node is deleted."""
+        from SceneRenderingLib import wgpu_state
+        self.delayDisplay("State: basic edit -- building scene", 100)
+
+        vol = self._make_synthetic_volume(name="StateTestVol")
+        seg = self._make_synthetic_segmentation(vol, name="StateTestSeg")
+        view2 = self._make_extra_view_node()
+
+        # No state nodes yet.
+        self.assertEqual(len(wgpu_state.all_state_nodes()), 0,
+            "expected no SlicerWGPU state nodes before any toggle")
+
+        # Enable rendering on the volume -> state node appears.
+        wgpu_state.set_render_enabled(vol, True)
+        self.assertTrue(wgpu_state.is_render_enabled(vol),
+            "volume state should report rendered=true after enable")
+        self.assertEqual(len(wgpu_state.all_state_nodes()), 1,
+            "expected one state node after enabling volume")
+
+        # Disable -> state node persists but flag flips.
+        wgpu_state.set_render_enabled(vol, False)
+        self.assertFalse(wgpu_state.is_render_enabled(vol),
+            "volume state should report rendered=false after disable")
+        self.assertEqual(len(wgpu_state.all_state_nodes()), 1,
+            "state node should persist across disable (settings retained)")
+
+        # View ids: empty default, then set one explicit view.
+        self.assertEqual(wgpu_state.view_node_ids(vol), [],
+            "default view-id list should be empty (= all views)")
+        wgpu_state.set_view_node_ids(vol, [view2.GetID()])
+        self.assertEqual(wgpu_state.view_node_ids(vol), [view2.GetID()],
+            "view-id list should round-trip via wgpu_state")
+
+        # Segmentation: enable + set render mode.
+        wgpu_state.set_render_enabled(seg, True)
+        wgpu_state.set_segment_render_mode(seg, "surface")
+        self.assertTrue(wgpu_state.is_render_enabled(seg))
+        self.assertEqual(wgpu_state.segment_render_mode(seg), "surface")
+        self.assertEqual(len(wgpu_state.all_state_nodes()), 2,
+            "expected one state node per managed data node")
+
+        # Lifecycle: removing the data node should drop its state node
+        # via the widget's NodeRemovedEvent observer. The observer is
+        # only installed when the widget is alive -- force it here so
+        # the test works whether the user has opened the module or not.
+        widget = slicer.modules.scenerendering.widgetRepresentation().self()
+        self.assertIsNotNone(widget, "SceneRendering widget should exist")
+        slicer.mrmlScene.RemoveNode(seg)
+        slicer.app.processEvents()
+        remaining_targets = [s.GetNodeReferenceID(wgpu_state.TARGET_NODE_REF)
+                             for s in wgpu_state.all_state_nodes()]
+        self.assertNotIn(seg.GetID(), remaining_targets,
+            "state node should be cleaned up when its target is removed")
+        self.assertIn(vol.GetID(), remaining_targets,
+            "volume's state node should still be present")
+
+        self.delayDisplay("State: Basic edit PASSED", 200)
+
+    def test_state_SaveRestore(self):
+        """Save the scene to a .mrml file with state nodes set, clear
+        the scene, reload, and verify all state survived. Exercises the
+        scripted-module-node serialization path (the whole point of
+        using these nodes instead of node attributes)."""
+        import os, tempfile
+        from SceneRenderingLib import wgpu_state
+        self.delayDisplay("State: save/restore -- building scene", 100)
+
+        vol = self._make_synthetic_volume(name="SaveTestVol")
+        seg = self._make_synthetic_segmentation(vol, name="SaveTestSeg")
+        view2 = self._make_extra_view_node(name="SaveTestView")
+
+        wgpu_state.set_render_enabled(vol, True)
+        wgpu_state.set_view_node_ids(vol, [view2.GetID()])
+        wgpu_state.set_render_enabled(seg, True)
+        wgpu_state.set_segment_render_mode(seg, "surface")
+
+        # Names we'll use to relocate the nodes after reload.
+        vol_name = vol.GetName()
+        seg_name = seg.GetName()
+        view2_name = view2.GetName()
+
+        tmpdir = tempfile.mkdtemp(prefix="wgpuStateTest_")
+        scene_path = os.path.join(tmpdir, "scene.mrml")
+        self.delayDisplay(f"State: saving scene to {scene_path}", 100)
+        # saveScene returns True/False; loadScene's return varies by
+        # Slicer version (None vs bool). Verify by checking the file
+        # exists after save, and by checking node lookups succeed
+        # after load.
+        slicer.util.saveScene(scene_path)
+        self.assertTrue(os.path.exists(scene_path),
+            f"saveScene did not produce {scene_path}")
+
+        # Clear and reload.
+        slicer.mrmlScene.Clear(0)
+        slicer.app.processEvents()
+        self.assertEqual(len(wgpu_state.all_state_nodes()), 0,
+            "scene clear should have removed every state node")
+        slicer.util.loadScene(scene_path)
+        slicer.app.processEvents()
+
+        # Refetch nodes by name.
+        vol2 = slicer.mrmlScene.GetFirstNodeByName(vol_name)
+        seg2 = slicer.mrmlScene.GetFirstNodeByName(seg_name)
+        view2b = slicer.mrmlScene.GetFirstNodeByName(view2_name)
+        self.assertIsNotNone(vol2, f"volume {vol_name!r} missing after reload")
+        self.assertIsNotNone(seg2, f"segmentation {seg_name!r} missing after reload")
+        self.assertIsNotNone(view2b, f"view {view2_name!r} missing after reload")
+
+        # State survived?
+        self.assertTrue(wgpu_state.is_render_enabled(vol2),
+            "volume renderEnabled should be true after reload")
+        self.assertEqual(wgpu_state.view_node_ids(vol2), [view2b.GetID()],
+            "view-id list should round-trip through save/load")
+        self.assertTrue(wgpu_state.is_render_enabled(seg2),
+            "segmentation renderEnabled should be true after reload")
+        self.assertEqual(wgpu_state.segment_render_mode(seg2), "surface",
+            "segment render mode should round-trip through save/load")
+        self.assertEqual(len(wgpu_state.all_state_nodes()), 2,
+            "expected exactly two state nodes after reload")
+
+        self.delayDisplay("State: Save / restore PASSED", 200)
+
+    # ------------------------------------------------------------------
+    # Bridge integration tests (single-view, state-driven). These
+    # exercise the auto-render-on-add path (Phase 4), per-node opt-out
+    # via wgpu_state (Phase 1), and multi-segmentation (Phase 2).
+    # See project_automatic_bridge_progress memory for context.
+    # ------------------------------------------------------------------
+
+    def _isolate_bridge(self):
+        """Tear down every live WgpuVolumeBridge in the process (not
+        just ones in the bridges dict) and clear the scene. Necessary
+        for repeatable bridge tests because dev-iteration MCP sessions
+        accumulate leaked bridge instances whose observers race the
+        bridge we're trying to test."""
+        import gc
+        live = [o for o in gc.get_objects()
+                if type(o).__name__ == "WgpuVolumeBridge"]
+        for b in live:
+            try: b.uninstall()
+            except Exception: pass
+        slicer.modules.wgpuVtkBridges = {}
+        slicer.modules.wgpuVtkBridge = None
+        gc.collect(); gc.collect()
+        # Drain whatever pending events any dying observers queued.
+        slicer.app.processEvents()
+
+    def _install_fresh_bridge(self):
+        """Install the bridge from the freshly-imported wgpu_vtk_inject
+        module (matching the legacy `_install_vtk_bridge` reload-friendly
+        pattern), pinned to the visible 3D widget.
+
+        Drains the Qt event queue both BEFORE and AFTER install so that
+        any pending QTimer.singleShot(0, ...) install from the widget's
+        own setup() doesn't fire AFTER our install and silently replace
+        the bridge we just made (which would leave our local reference
+        pointing at the now-uninstalled instance). Returns whichever
+        bridge ends up in slicer.modules.wgpuVtkBridge to guarantee we
+        hand back the live one even if a race did happen."""
+        import os, sys
+        # Drain any pending deferred installs from prior module loads.
+        slicer.app.processEvents()
+        slicer.app.processEvents()
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        for mod in ("SceneRenderingLib.wgpu_vtk_inject", "SceneRenderingLib"):
+            if mod in sys.modules:
+                del sys.modules[mod]
+        from SceneRenderingLib import wgpu_vtk_inject as wvi
+        wvi.install_default_bridge()
+        # Drain again -- and then re-fetch the active bridge from the
+        # registry so we don't return a uninstall()'d stale handle.
+        slicer.app.processEvents()
+        slicer.app.processEvents()
+        return slicer.modules.wgpuVtkBridge
+
+    def test_bridge_autoEnableOnAdd(self):
+        """Default-true policy: adding a new volume to the scene
+        automatically creates a VRDN and the bridge claims it without
+        any explicit toggle. Verifies the event-driven retry that
+        defers create until the volume has both ImageData and a
+        standard display node."""
+        self.delayDisplay("Bridge: auto-enable on add", 100)
+        self._isolate_bridge()
+        bridge = self._install_fresh_bridge()
+        # Empty scene at install time.
+        self.assertEqual(slicer.mrmlScene.GetNumberOfNodesByClass(
+            "vtkMRMLVolumeRenderingDisplayNode"), 0)
+        self.assertEqual(len(bridge._claimed_vrdn_ids), 0)
+        # Add one volume; expect exactly one VRDN, claimed.
+        self._make_synthetic_volume("AutoVol1", dims=(8, 8, 8))
+        slicer.app.processEvents()
+        n1 = slicer.mrmlScene.GetNumberOfNodesByClass(
+            "vtkMRMLVolumeRenderingDisplayNode")
+        self.assertEqual(n1, 1,
+            f"expected 1 VRDN after first volume, got {n1}")
+        self.assertEqual(len(bridge._claimed_vrdn_ids), 1)
+        # Add a second; one more VRDN, both claimed.
+        self._make_synthetic_volume("AutoVol2", dims=(8, 8, 8))
+        slicer.app.processEvents()
+        n2 = slicer.mrmlScene.GetNumberOfNodesByClass(
+            "vtkMRMLVolumeRenderingDisplayNode")
+        self.assertEqual(n2, 2,
+            f"expected 2 VRDNs after second volume, got {n2}")
+        self.assertEqual(len(bridge._claimed_vrdn_ids), 2)
+        # No orphan VRDNs.
+        coll = slicer.mrmlScene.GetNodesByClass(
+            "vtkMRMLVolumeRenderingDisplayNode")
+        try:
+            orphans = sum(1 for i in range(coll.GetNumberOfItems())
+                          if coll.GetItemAsObject(i).GetVolumeNodeID() is None)
+        finally:
+            coll.UnRegister(None)
+        self.assertEqual(orphans, 0,
+            f"expected 0 orphan VRDNs, got {orphans}")
+        self.delayDisplay("Bridge: auto-enable on add PASSED", 200)
+
+    def test_bridge_perNodeOptOut(self):
+        """Toggle wgpu_state.renderEnabled=False on a claimed volume;
+        bridge unclaims and Slicer's native VR resumes (visibility=1).
+        Toggle back on; bridge re-claims (visibility=0). Verifies the
+        Phase 1 state-driven reconcile path end-to-end."""
+        from SceneRenderingLib import wgpu_state
+        self.delayDisplay("Bridge: per-node opt-out", 100)
+        self._isolate_bridge()
+        bridge = self._install_fresh_bridge()
+        vol = self._make_synthetic_volume("OptOutVol", dims=(8, 8, 8))
+        slicer.app.processEvents()
+        self.assertEqual(len(bridge._claimed_vrdn_ids), 1,
+            "bridge should claim auto-created VRDN")
+        vrdn = slicer.mrmlScene.GetFirstNodeByClass(
+            "vtkMRMLVolumeRenderingDisplayNode")
+        self.assertEqual(vrdn.GetVisibility(), 0,
+            "claimed VRDN should have visibility=0 (bridge owns it)")
+        # Opt out.
+        wgpu_state.set_render_enabled(vol, False)
+        slicer.app.processEvents()
+        self.assertEqual(len(bridge._claimed_vrdn_ids), 0,
+            "bridge should unclaim after opt-out")
+        self.assertEqual(vrdn.GetVisibility(), 1,
+            "VRDN visibility should be restored to 1 after opt-out")
+        # Opt back in.
+        wgpu_state.set_render_enabled(vol, True)
+        slicer.app.processEvents()
+        self.assertEqual(len(bridge._claimed_vrdn_ids), 1,
+            "bridge should re-claim after opt-in")
+        self.assertEqual(vrdn.GetVisibility(), 0,
+            "VRDN visibility should be back to 0 after re-claim")
+        self.delayDisplay("Bridge: per-node opt-out PASSED", 200)
+
+    def test_bridge_multiSegmentation(self):
+        """Add two segmentation nodes; bridge picks both up via
+        reconcile + NodeAddedEvent observer. Opt one out via state;
+        only the other remains. Verifies Phase 2 multi-seg lifecycle."""
+        import numpy as np
+        from SceneRenderingLib import wgpu_state
+        self.delayDisplay("Bridge: multi-segmentation", 100)
+        self._isolate_bridge()
+        bridge = self._install_fresh_bridge()
+        vol = self._make_synthetic_volume("MultiSegVol", dims=(16, 16, 16))
+        # Two segmentations each with one filled segment so the
+        # visible-segment-id scan has something to pick up.
+        segA = self._make_synthetic_segmentation(vol, "SegA")
+        segB = self._make_synthetic_segmentation(vol, "SegB")
+        for seg in (segA, segB):
+            sid = seg.GetSegmentation().GetNthSegmentID(0)
+            mask = np.zeros((16, 16, 16), dtype=np.uint8)
+            mask[4:12, 4:12, 4:12] = 1
+            slicer.util.updateSegmentBinaryLabelmapFromArray(
+                mask, seg, sid, vol)
+        slicer.app.processEvents()
+        # The bridge auto-picks up seg nodes via NodeAddedEvent + the
+        # reconcile pass that follows.
+        bridge._reconcile_segmentation_nodes()
+        slicer.app.processEvents()
+        self.assertEqual(sorted(bridge._seg_records.keys()),
+                         sorted([segA.GetID(), segB.GetID()]),
+                         "bridge should track both segmentations")
+        self.assertGreaterEqual(len(bridge._segments), 2,
+            f"expected at least 2 SegmentFields, got {len(bridge._segments)}")
+        # Opt B out via state.
+        wgpu_state.set_render_enabled(segB, False)
+        slicer.app.processEvents()
+        self.assertEqual(list(bridge._seg_records.keys()),
+                         [segA.GetID()],
+                         "bridge should drop B from records after opt-out")
+        # Add a third seg AFTER bridge is live -> auto-picked up.
+        segC = self._make_synthetic_segmentation(vol, "SegC")
+        sidC = segC.GetSegmentation().GetNthSegmentID(0)
+        maskC = np.zeros((16, 16, 16), dtype=np.uint8)
+        maskC[2:10, 2:10, 2:10] = 1
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            maskC, segC, sidC, vol)
+        slicer.app.processEvents()
+        self.assertIn(segC.GetID(), bridge._seg_records,
+            "third segmentation added after install should be auto-picked")
+        self.assertNotIn(segB.GetID(), bridge._seg_records,
+            "opted-out B should still be excluded")
+        self.delayDisplay("Bridge: multi-segmentation PASSED", 200)
 
     # ------------------------------------------------------------------
     # Legacy DualView / pygfx tests

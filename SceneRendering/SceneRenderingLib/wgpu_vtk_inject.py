@@ -577,6 +577,13 @@ def _shared_wgpu_device_impl():
 from slicer_wgpu.fields import ImageField
 from slicer_wgpu.displayers.volume import VolumeRenderingDisplayer
 
+# Per-data-node render state (renderEnabled, viewNodeIDs, etc).
+# Imported via SceneRenderingLib package so the bridge can be
+# state-node-aware -- claim only VRDNs whose volume is opt-in (or
+# implicitly opt-in via the default-true policy), and reconcile when
+# state nodes change.
+from SceneRenderingLib import wgpu_state
+
 
 # ---------------------------------------------------------------------------
 # WGSL generation -- matches ImageField's TF + gradient Phong but stripped
@@ -1866,13 +1873,31 @@ class WgpuVolumeBridge:
     ray-march pipeline rendered into Slicer's native 3D view via an
     EndEvent hook + glTexSubImage2D blit."""
 
-    def __init__(self, vtk_renderer, vtk_render_window):
+    def __init__(self, vtk_renderer, vtk_render_window, view_node=None):
         self.vtk_renderer = vtk_renderer
         self.rw = vtk_render_window
         self.device = _shared_wgpu_device()
+        # The vtkMRMLViewNode this bridge renders into. When None the
+        # bridge accepts content with empty view-id lists (the "all
+        # views" default) but rejects content explicitly scoped to a
+        # specific other view. Set via install_bridge_for_view().
+        self.view_node = view_node
+        self.view_node_id = view_node.GetID() if view_node is not None else None
 
         self._displayer = None
         self._claimed_vrdn_ids: set[str] = set()
+        # SlicerWGPU state-node ModifiedEvent observers. nid -> tag.
+        self._state_obs_tags: dict[str, int] = {}
+        # Volume node IDs we already auto-created a VRDN for. Slicer
+        # can re-fire NodeAddedEvent for the same volume within the
+        # same synchronous chunk (the second fire happens before
+        # CreateDefaultVolumeRenderingNodes' new VRDN is visible to a
+        # scene scan), and we don't want a duplicate VRDN per fire.
+        self._auto_vrdn_attempted: set[str] = set()
+        # ModifiedEvent observers on volumes that arrived without
+        # ImageData. When the data shows up we retry the auto-create
+        # and detach the observer. nid -> (node_ref, observer_tag).
+        self._pending_volume_obs: dict[str, tuple] = {}
 
         self._pipeline = None
         self._bgl = None
@@ -1925,6 +1950,7 @@ class WgpuVolumeBridge:
         self._taa_output_view = None
         self._taa_pipeline = None
         self._taa_bgl = None
+        self._taa_ubo = None
 
         # Grid transform: one scene-wide displacement field. None when no grid
         # is attached -- the shader short-circuits via u_mat.grid_enabled.x.
@@ -1938,10 +1964,15 @@ class WgpuVolumeBridge:
         self._grid_node = None          # vtkMRMLGridTransformNode we observe
         self._grid_obs_tags = []        # (node, tag) pairs for teardown
 
-        # Segmentation: per-segment iso-surface fields.
+        # Segmentation: per-segment iso-surface fields. Multi-segmentation
+        # support: _seg_records is a dict keyed by segmentation node ID;
+        # each entry holds the node, its per-segmentation observer tags,
+        # and its current SegmentField list. _segments is a flat
+        # concatenation of all per-node segment lists, regenerated each
+        # time we refresh -- the pipeline / packing / WGSL code consumes
+        # this flat list and doesn't care which node a segment came from.
         self._segments: list[SegmentField] = []
-        self._seg_node = None           # the currently attached vtkMRMLSegmentationNode
-        self._seg_obs_tags = []         # (object, tag) pairs for teardown
+        self._seg_records: dict[str, dict] = {}
         # Segment render mode: "iso" (band-based iso-surface, paint demo) or
         # "surface" (gradient-opacity, thickness-independent polydata-like).
         self._segment_render_mode = "iso"
@@ -1988,7 +2019,14 @@ class WgpuVolumeBridge:
             on_structure_changed=self._on_structure_changed,
             on_field_modified=self._on_field_modified,
         )
-        self._claim_current_vrdns()
+        self._install_state_observers()
+        # One-time backfill: auto-create VRDNs for any scalar volumes
+        # already in the scene. NodeAddedEvent only fires for nodes
+        # added AFTER install; without this pass, volumes loaded
+        # pre-install would never render via wgpu.
+        self._auto_create_missing_vrdns()
+        self._reconcile_vrdn_claims()
+        self._reconcile_segmentation_nodes()
         self._rebuild_pipeline()
 
         # Compute pipelines are compiled lazily on first use. Eager compile
@@ -2005,16 +2043,36 @@ class WgpuVolumeBridge:
 
         # Tear down automatically when the scene is cleared so we don't
         # keep pointers to deleted MRML nodes and don't leave a pipeline
-        # rendering stale content in the 3D view.
+        # rendering stale content in the 3D view. Also observe node
+        # add/remove so we can observe new state nodes as they appear
+        # (NodeAddedEvent) and unobserve them at removal time.
         scene = slicer.mrmlScene
         self._scene_obs_tags = [
             (scene, scene.AddObserver(
                 scene.StartCloseEvent, self._on_scene_start_close)),
             (scene, scene.AddObserver(
                 scene.EndCloseEvent, self._on_scene_end_close)),
+            (scene, scene.AddObserver(
+                scene.NodeAddedEvent, self._on_scene_node_added_for_state)),
+            (scene, scene.AddObserver(
+                scene.NodeRemovedEvent, self._on_scene_node_removed_for_state)),
         ]
 
         self.rw.Render()
+
+    def _auto_create_missing_vrdns(self):
+        coll = slicer.mrmlScene.GetNodesByClass("vtkMRMLScalarVolumeNode")
+        try:
+            for i in range(coll.GetNumberOfItems()):
+                vol = coll.GetItemAsObject(i)
+                self._auto_create_vrdn_if_missing(vol)
+        finally:
+            coll.UnRegister(None)
+
+    def _on_auto_vrdn_volume_removed(self, vol_id):
+        # Drop the dedupe entry when the volume itself goes away so a
+        # re-add (e.g. MRB reload of the same scene) auto-creates again.
+        self._auto_vrdn_attempted.discard(vol_id)
 
     def _on_scene_start_close(self, caller, event):
         """Tear down everything that references MRML nodes BEFORE the scene
@@ -2027,6 +2085,10 @@ class WgpuVolumeBridge:
         try:
             if getattr(slicer.modules, "wgpuVtkBridge", None) is self:
                 slicer.modules.wgpuVtkBridge = None
+            bridges = getattr(slicer.modules, "wgpuVtkBridges", None)
+            if isinstance(bridges, dict) and self.view_node_id in bridges:
+                if bridges[self.view_node_id] is self:
+                    del bridges[self.view_node_id]
         except Exception:
             pass
 
@@ -2041,6 +2103,20 @@ class WgpuVolumeBridge:
     def uninstall(self):
         # Set this first so any EndEvent still in flight short-circuits.
         self._disposed = True
+        # Drop ourselves from the per-view bridges registry so a
+        # subsequent install creates a fresh slot rather than racing
+        # with the dead bridge.
+        try:
+            bridges = getattr(slicer.modules, "wgpuVtkBridges", None)
+            if isinstance(bridges, dict) and self.view_node_id in bridges:
+                if bridges[self.view_node_id] is self:
+                    del bridges[self.view_node_id]
+            if getattr(slicer.modules, "wgpuVtkBridge", None) is self:
+                # Fall back to any remaining bridge as the singular alias.
+                remaining = next(iter(bridges.values()), None) if bridges else None
+                slicer.modules.wgpuVtkBridge = remaining
+        except Exception:
+            pass
         for obj, tag in self._scene_obs_tags:
             try: obj.RemoveObserver(tag)
             except Exception: pass
@@ -2048,6 +2124,11 @@ class WgpuVolumeBridge:
         if self._end_tag is not None:
             self.vtk_renderer.RemoveObserver(self._end_tag)
             self._end_tag = None
+        # Drop the EndEvent callback closure too -- it captures `self`
+        # in a closure cell, which keeps the bridge alive even after
+        # the observer is removed from the renderer. Without this,
+        # uninstall()'d bridges leak in long-running sessions.
+        self._on_end_cb = None
         if self._displayer is not None:
             self._displayer.cleanup()
             self._displayer = None
@@ -2057,16 +2138,27 @@ class WgpuVolumeBridge:
                 try: n.SetVisibility(True)
                 except Exception: pass
         self._claimed_vrdn_ids.clear()
+        # Detach per-state-node Modified observers.
+        for nid, tag in list(self._state_obs_tags.items()):
+            state = slicer.mrmlScene.GetNodeByID(nid)
+            if state is not None:
+                try: state.RemoveObserver(tag)
+                except Exception: pass
+        self._state_obs_tags.clear()
+        # Detach pending-volume Modified observers (volumes that
+        # arrived without ImageData and were waiting for it).
+        for nid in list(self._pending_volume_obs):
+            self._detach_pending_volume_observer(nid)
         for node, tag in self._grid_obs_tags:
             try: node.RemoveObserver(tag)
             except Exception: pass
         self._grid_obs_tags = []
         self._grid_node = None
-        for obj, tag in self._seg_obs_tags:
-            try: obj.RemoveObserver(tag)
-            except Exception: pass
-        self._seg_obs_tags = []
-        self._seg_node = None
+        for record in self._seg_records.values():
+            for obj, tag in record.get("obs_tags", []):
+                try: obj.RemoveObserver(tag)
+                except Exception: pass
+        self._seg_records.clear()
         self._segments = []
         for obj, tag, _cb in self._rgba_obs_tags:
             try: obj.RemoveObserver(tag)
@@ -2109,25 +2201,310 @@ class WgpuVolumeBridge:
             return {}
         return dict(self._displayer.fields_by_nid)
 
-    def _claim_current_vrdns(self):
-        if self._displayer is None:
+    def _node_targets_this_view(self, data_node):
+        """View-scoping check: True if data_node's wgpu_state view-id
+        list is empty (= 'render in all views') OR includes this
+        bridge's view-node-id. A bridge with view_node_id=None accepts
+        only empty view-id lists, so explicit-view content gets
+        skipped (those bridges should target the right view)."""
+        if data_node is None:
+            return True
+        view_ids = wgpu_state.view_node_ids(data_node)
+        if not view_ids:
+            return True
+        if self.view_node_id is None:
+            return False
+        return self.view_node_id in view_ids
+
+    def _volume_render_enabled(self, volume_node):
+        """Should the bridge render this volume? Policy: opt-out via
+        wgpu_state.renderEnabled=false. No state node -> claim. This
+        keeps the bridge automatic by default while honoring explicit
+        opt-out from the SH plugin / edit panel. Also honors view-id
+        scoping so a volume targeted at view A only is skipped by the
+        bridge running in view B."""
+        if volume_node is None:
+            return True
+        state = wgpu_state.state_for(volume_node, create=False)
+        if state is None:
+            return True
+        if not wgpu_state.is_render_enabled(volume_node):
+            return False
+        return self._node_targets_this_view(volume_node)
+
+    def _reconcile_vrdn_claims(self):
+        """Walk every VRDN known to the displayer and bring our claim
+        state in line with wgpu_state. Claims new VRDNs that should
+        render via wgpu; unclaims (restoring Slicer's native VR) any
+        VRDN whose volume was just opted out.
+
+        Also backfills VRDNs: if a state node was just toggled on for
+        a volume that doesn't yet have a VRDN, kick the auto-create
+        flow so the bridge has something to claim. This is the path
+        exercised when the user toggles render ON via the SH plugin
+        for an already-present volume that never had VR set up."""
+        if self._disposed or self._displayer is None:
             return
-        for nid in self._displayer.fields_by_nid:
-            if nid in self._claimed_vrdn_ids:
-                continue
+        known_nids = set(self._displayer.fields_by_nid)
+        for nid in known_nids:
             node = slicer.mrmlScene.GetNodeByID(nid)
-            if node is not None:
+            if node is None:
+                continue
+            volume = node.GetVolumeNode()
+            should_claim = self._volume_render_enabled(volume)
+            currently = nid in self._claimed_vrdn_ids
+            if should_claim and not currently:
                 node.SetVisibility(False)
                 self._claimed_vrdn_ids.add(nid)
+            elif currently and not should_claim:
+                node.SetVisibility(True)
+                self._claimed_vrdn_ids.discard(nid)
+        # Drop any stale entries whose VRDN vanished without our
+        # observer firing (shouldn't happen, but cheap to defend).
+        for nid in list(self._claimed_vrdn_ids - known_nids):
+            self._claimed_vrdn_ids.discard(nid)
+        # Backfill VRDNs for state-enabled volumes that lack one.
+        for state in wgpu_state.all_state_nodes():
+            target = wgpu_state.target_node(state)
+            if target is None or not target.IsA("vtkMRMLScalarVolumeNode"):
+                continue
+            if not self._volume_render_enabled(target):
+                continue
+            self._try_auto_create_or_defer(target)
 
     def _on_structure_changed(self):
-        self._claim_current_vrdns()
+        self._reconcile_vrdn_claims()
         self._rebuild_pipeline()
         self.rw.Render()
 
     def _on_field_modified(self, field):
-        self._claim_current_vrdns()
+        self._reconcile_vrdn_claims()
         self.rw.Render()
+
+    # ------------------------------------------------------------------
+    # State-node observation. Each SlicerWGPU state node (one per
+    # managed data node) fires ModifiedEvent when renderEnabled or
+    # viewNodeIDs change; we reconcile on every such change. Scene
+    # NodeAddedEvent / NodeRemovedEvent track the lifetime of state
+    # nodes themselves so we observe/unobserve at the right moments.
+    # ------------------------------------------------------------------
+
+    def _install_state_observers(self):
+        for state in wgpu_state.all_state_nodes():
+            self._observe_state_node(state)
+
+    def _observe_state_node(self, state_node):
+        nid = state_node.GetID()
+        if nid in self._state_obs_tags:
+            return
+        tag = state_node.AddObserver(
+            vtk.vtkCommand.ModifiedEvent, self._on_state_node_modified)
+        self._state_obs_tags[nid] = tag
+
+    def _on_state_node_modified(self, caller, event):
+        if self._disposed:
+            return
+        self._reconcile_vrdn_claims()
+        self._reconcile_segmentation_nodes()
+        # Pick up per-node segmentRenderMode changes by syncing the
+        # bridge-wide mode to whatever a currently-rendered seg node
+        # reports. (Bridge is single-mode today; the per-node value in
+        # MRML is the source of truth, last-applied wins.)
+        for nid in list(self._seg_records):
+            n = slicer.mrmlScene.GetNodeByID(nid)
+            if n is None:
+                continue
+            mode = wgpu_state.segment_render_mode(n, default=None)
+            if mode and mode != self._segment_render_mode:
+                try:
+                    self.set_segment_render_mode(mode)
+                except Exception:
+                    pass
+                break
+        try:
+            self.rw.Render()
+        except Exception:
+            pass
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _on_scene_node_added_for_state(self, caller, event, calldata):
+        if self._disposed:
+            return
+        node = calldata
+        if node is None:
+            return
+        # New state node -> observe it so subsequent param edits drive
+        # a reconcile. Also reconcile now so default-true policy picks
+        # up the state node's initial renderEnabled value.
+        if (node.IsA("vtkMRMLScriptedModuleNode")
+                and node.GetAttribute("ModuleName") == wgpu_state.MODULE_NAME):
+            self._observe_state_node(node)
+            self._reconcile_vrdn_claims()
+            self._reconcile_segmentation_nodes()
+        # New segmentation node -> default-true policy means the bridge
+        # picks it up automatically.
+        elif node.IsA("vtkMRMLSegmentationNode"):
+            self._reconcile_segmentation_nodes()
+        # New volume node -> try to auto-create a VRDN so the bridge
+        # has something to claim. If the volume already has ImageData
+        # we can do it immediately; otherwise observe ModifiedEvent
+        # and retry once the data lands. We do NOT defer via a timer
+        # -- the bridge stays purely event-driven.
+        elif node.IsA("vtkMRMLScalarVolumeNode"):
+            self._try_auto_create_or_defer(node)
+
+    def _try_auto_create_or_defer(self, volume_node):
+        """Auto-create the VRDN now if the volume is ready, else
+        attach observers to retry when ImageData arrives AND a
+        standard display node is added. Slicer initializes scalar
+        volumes in beats -- AddNewNodeByClass, then SetAndObserveImageData,
+        then CreateDefaultDisplayNodes -- and a VRDN created before the
+        third beat ends up as an orphan (volume-node-id never linked).
+        We observe both Modified (covers ImageData) and DisplayModifiedEvent
+        (covers display-node-list changes)."""
+        if self._is_volume_ready_for_vrdn(volume_node):
+            self._auto_create_vrdn_if_missing(volume_node)
+            return
+        nid = volume_node.GetID()
+        if nid in self._pending_volume_obs:
+            return  # already waiting
+        tags = []
+        tags.append(volume_node.AddObserver(
+            vtk.vtkCommand.ModifiedEvent, self._on_pending_volume_modified))
+        try:
+            ev_disp = slicer.vtkMRMLDisplayableNode.DisplayModifiedEvent
+            tags.append(volume_node.AddObserver(
+                ev_disp, self._on_pending_volume_modified))
+        except Exception:
+            pass
+        self._pending_volume_obs[nid] = (volume_node, tags)
+
+    def _on_pending_volume_modified(self, caller, event):
+        if self._disposed:
+            return
+        # caller is the volume node that fired. We could iterate the
+        # whole pending dict instead, but using `caller` directly
+        # avoids the dict scan on every Modified event.
+        vol = caller
+        if not self._is_volume_ready_for_vrdn(vol):
+            return
+        self._auto_create_vrdn_if_missing(vol)
+        self._detach_pending_volume_observer(vol.GetID())
+
+    def _detach_pending_volume_observer(self, vol_id):
+        entry = self._pending_volume_obs.pop(vol_id, None)
+        if entry is None:
+            return
+        node, tags = entry
+        for tag in tags:
+            try:
+                node.RemoveObserver(tag)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _is_volume_ready_for_vrdn(volume_node):
+        """A scalar volume is 'ready' for VRDN creation when:
+          * it has ImageData with non-zero dimensions, AND
+          * it has at least one non-VR display node.
+
+        AddNewNodeByClass leaves the volume with an empty (0,0,0)
+        placeholder, and a typical Slicer setup sequence is
+        AddNewNodeByClass -> SetAndObserveImageData -> CreateDefaultDisplayNodes.
+        If we call CreateDefaultVolumeRenderingNodes before the standard
+        display node exists, the resulting VRDN is an orphan -- its
+        volume-node-id never gets linked. Waiting for both signals
+        avoids the race."""
+        if volume_node is None:
+            return False
+        try:
+            img = volume_node.GetImageData()
+            if img is None:
+                return False
+            dims = img.GetDimensions()
+            if not (dims[0] > 0 and dims[1] > 0 and dims[2] > 0):
+                return False
+            # At least one display node that isn't a VR display node.
+            has_standard_dn = False
+            for i in range(volume_node.GetNumberOfDisplayNodes()):
+                dn = volume_node.GetNthDisplayNode(i)
+                if dn is None:
+                    continue
+                if dn.IsA("vtkMRMLVolumeRenderingDisplayNode"):
+                    continue
+                has_standard_dn = True
+                break
+            return has_standard_dn
+        except Exception:
+            return False
+
+    def _auto_create_vrdn_if_missing(self, volume_node):
+        vol_id = volume_node.GetID()
+        # Dedupe: Slicer re-fires NodeAddedEvent for the same volume
+        # within the same chunk (a second event arrives BEFORE
+        # CreateDefaultVolumeRenderingNodes' new VRDN is queryable via
+        # GetNodesByClass / GetFirstVolumeRenderingDisplayNode). Without
+        # this guard the second fire creates an orphan VRDN.
+        if vol_id in self._auto_vrdn_attempted:
+            return
+        # Skip if any VRDN in the scene already targets this volume.
+        coll = slicer.mrmlScene.GetNodesByClass(
+            "vtkMRMLVolumeRenderingDisplayNode")
+        try:
+            for i in range(coll.GetNumberOfItems()):
+                vrdn = coll.GetItemAsObject(i)
+                if vrdn.GetVolumeNodeID() == vol_id:
+                    self._auto_vrdn_attempted.add(vol_id)
+                    return
+        finally:
+            coll.UnRegister(None)
+        # Honor an explicit opt-out via wgpu_state -- the user might
+        # have created a state node with renderEnabled=false BEFORE
+        # adding the volume (rare but possible during MRB load
+        # ordering).
+        state = wgpu_state.state_for(volume_node, create=False)
+        if state is not None and not wgpu_state.is_render_enabled(volume_node):
+            self._auto_vrdn_attempted.add(vol_id)
+            return
+        self._auto_vrdn_attempted.add(vol_id)
+        try:
+            vrLogic = slicer.modules.volumerendering.logic()
+            vrdn = vrLogic.CreateDefaultVolumeRenderingNodes(volume_node)
+            try:
+                vrLogic.UpdateDisplayNodeFromVolumeNode(vrdn, volume_node)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"WgpuVolumeBridge auto-VRDN: {e}")
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _on_scene_node_removed_for_state(self, caller, event, calldata):
+        if self._disposed:
+            return
+        node = calldata
+        if node is None:
+            return
+        nid = node.GetID()
+        if nid in self._state_obs_tags:
+            # Observer was attached to a node now being removed; tag is
+            # invalid post-removal but the dict entry would leak.
+            self._state_obs_tags.pop(nid, None)
+        # Forget any auto-VRDN dedup state for a removed volume so a
+        # re-add later (MRB reload) is treated fresh. Also drop a
+        # pending Modified observer if one was still waiting.
+        if node.IsA("vtkMRMLScalarVolumeNode"):
+            self._on_auto_vrdn_volume_removed(nid)
+            self._detach_pending_volume_observer(nid)
+        # A removed seg node needs its record + observers torn down
+        # eagerly so the next reconcile doesn't try to AddObserver to a
+        # dangling node. _remove_segmentation_by_id is idempotent.
+        if nid in self._seg_records:
+            self._remove_segmentation_by_id(nid)
+        # A state node going away re-eligible-s a VRDN for claim (or,
+        # less commonly, a volume node going away leaves a stale VRDN --
+        # the displayer's own observers handle that case).
+        self._reconcile_vrdn_claims()
+        self._reconcile_segmentation_nodes()
 
     def _rebuild_pipeline(self):
         self._fields = [
@@ -2142,6 +2519,10 @@ class WgpuVolumeBridge:
             self._pipeline = None
             self._bind_group = None
             return
+
+        # Any content path runs through TAA composite, so make sure
+        # the TAA pipeline is built before _wgpu_render needs it.
+        self._ensure_taa_pipeline()
 
         for img_f in self._fields:
             for tex in (img_f._volume_tex, img_f._lut_tex, img_f._grad_lut_tex):
@@ -2639,28 +3020,71 @@ class WgpuVolumeBridge:
         self._rebuild_pipeline()
         self.rw.Render()
 
-    def set_segmentation_node(self, seg_node):
-        """Attach a vtkMRMLSegmentationNode. One SegmentField is created per
-        visible segment; the bridge observes the internal vtkSegmentation for
-        SourceRepresentationModified events so paint strokes in the Segment
-        Editor trigger immediate GPU re-uploads. Pass None to detach."""
-        # Tear down old observers
-        for obj, tag in self._seg_obs_tags:
-            try:
-                obj.RemoveObserver(tag)
-            except Exception:
-                pass
-        self._seg_obs_tags = []
-        self._segments = []
-        self._seg_node = seg_node
+    # ------------------------------------------------------------------
+    # Multi-segmentation API. add_segmentation_node / remove_segmentation
+    # _node manage a dict of per-node records (node + observer tags +
+    # SegmentField list). set_segmentation_node is a back-compat shim
+    # that clears existing and adds the new one. _segments is regenerated
+    # from per-node lists after every refresh so the pipeline / packing
+    # code keeps consuming a flat list.
+    # ------------------------------------------------------------------
 
-        if seg_node is None:
-            self._rebuild_pipeline()
-            self.rw.Render()
+    def add_segmentation_node(self, seg_node):
+        """Register seg_node so its visible segments render via wgpu.
+        Idempotent: re-adding an already-known node is a no-op (callers
+        can use this safely from reconcile loops)."""
+        if self._disposed or seg_node is None:
             return
+        nid = seg_node.GetID()
+        if nid in self._seg_records:
+            return
+        record = {
+            "node": seg_node,
+            "obs_tags": [],
+            "segments": [],
+        }
+        self._seg_records[nid] = record
+        self._install_seg_observers(record)
+        self._refresh_segments_for_record(record)
+        self._regenerate_flat_segments()
+        self._rebuild_pipeline()
+        try:
+            self.rw.Render()
+        except Exception:
+            pass
 
-        self._refresh_segments(rebuild=False)
+    def remove_segmentation_node(self, seg_node):
+        """Detach seg_node. Idempotent. Slicer's stock segmentation
+        displayable manager (if visible) resumes rendering it."""
+        if seg_node is None:
+            return
+        self._remove_segmentation_by_id(seg_node.GetID())
 
+    def _remove_segmentation_by_id(self, nid):
+        record = self._seg_records.pop(nid, None)
+        if record is None:
+            return
+        for obj, tag in record.get("obs_tags", []):
+            try: obj.RemoveObserver(tag)
+            except Exception: pass
+        self._regenerate_flat_segments()
+        self._rebuild_pipeline()
+        try:
+            self.rw.Render()
+        except Exception:
+            pass
+
+    def set_segmentation_node(self, seg_node):
+        """Back-compat shim: clear all registered seg nodes and add this
+        one. Pass None to detach everything."""
+        for nid in list(self._seg_records):
+            self._remove_segmentation_by_id(nid)
+        if seg_node is not None:
+            self.add_segmentation_node(seg_node)
+
+    def _install_seg_observers(self, record):
+        seg_node = record["node"]
+        obs_tags = record["obs_tags"]
         # Mirror what vtkMRMLSegmentationsDisplayableManager3D observes
         # (Modules/Loadable/Segmentations/MRMLDM/
         #  vtkMRMLSegmentationsDisplayableManager3D.cxx ~L784-815):
@@ -2674,58 +3098,46 @@ class WgpuVolumeBridge:
             import vtkSegmentationCorePython as vtkSegCore
             segmentation = seg_node.GetSegmentation()
             VSEG = vtkSegCore.vtkSegmentation
-            content_events = [
-                # Fires continuously during Segment Editor paint / erase.
-                VSEG.SegmentModified,
-                # Fires when any representation is rebuilt / converted.
-                VSEG.RepresentationModified,
-            ]
-            structure_events = [
-                VSEG.SegmentAdded,
-                VSEG.SegmentRemoved,
-            ]
+            content_events = [VSEG.SegmentModified, VSEG.RepresentationModified]
+            structure_events = [VSEG.SegmentAdded, VSEG.SegmentRemoved]
             for ev in content_events:
-                self._seg_obs_tags.append((segmentation, segmentation.AddObserver(
-                    ev, self._on_segmentation_content_modified)))
+                obs_tags.append((segmentation, segmentation.AddObserver(
+                    ev, lambda c, e, n=seg_node:
+                        self._on_seg_content_modified(n))))
             for ev in structure_events:
-                self._seg_obs_tags.append((segmentation, segmentation.AddObserver(
-                    ev, self._on_segmentation_structure_modified)))
+                obs_tags.append((segmentation, segmentation.AddObserver(
+                    ev, lambda c, e, n=seg_node:
+                        self._on_seg_structure_modified(n))))
         except Exception as e:
             print(f"WgpuVolumeBridge segmentation observers: {e}")
-        # Node-level events: ModifiedEvent covers the segmentation object
-        # being swapped out; TransformModifiedEvent covers re-parenting;
-        # DisplayModifiedEvent is re-fired from the display node.
-        self._seg_obs_tags.append((seg_node, seg_node.AddObserver(
+        obs_tags.append((seg_node, seg_node.AddObserver(
             vtk.vtkCommand.ModifiedEvent,
-            self._on_segmentation_content_modified)))
+            lambda c, e, n=seg_node: self._on_seg_content_modified(n))))
         try:
             ev_tx = slicer.vtkMRMLDisplayableNode.TransformModifiedEvent
-            self._seg_obs_tags.append((seg_node, seg_node.AddObserver(
-                ev_tx, self._on_segmentation_content_modified)))
+            obs_tags.append((seg_node, seg_node.AddObserver(
+                ev_tx,
+                lambda c, e, n=seg_node: self._on_seg_content_modified(n))))
         except Exception:
             pass
         try:
             ev_disp = slicer.vtkMRMLDisplayableNode.DisplayModifiedEvent
-            self._seg_obs_tags.append((seg_node, seg_node.AddObserver(
-                ev_disp, self._on_segmentation_display_modified)))
+            obs_tags.append((seg_node, seg_node.AddObserver(
+                ev_disp,
+                lambda c, e, n=seg_node: self._on_seg_display_modified(n))))
         except Exception:
             pass
-        # Display node: color / opacity / visibility changes just re-pack
-        # uniforms (no texture upload).
         dn = seg_node.GetDisplayNode()
         if dn is not None:
-            self._seg_obs_tags.append((dn, dn.AddObserver(
+            obs_tags.append((dn, dn.AddObserver(
                 vtk.vtkCommand.ModifiedEvent,
-                self._on_segmentation_display_modified)))
+                lambda c, e, n=seg_node: self._on_seg_display_modified(n))))
 
-        self._rebuild_pipeline()
-        self.rw.Render()
-
-    def _visible_segment_ids(self):
-        if self._seg_node is None:
+    def _visible_segment_ids(self, seg_node):
+        if seg_node is None:
             return []
-        segmentation = self._seg_node.GetSegmentation()
-        dn = self._seg_node.GetDisplayNode()
+        segmentation = seg_node.GetSegmentation()
+        dn = seg_node.GetDisplayNode()
         ids = vtk.vtkStringArray()
         segmentation.GetSegmentIDs(ids)
         result = []
@@ -2735,17 +3147,14 @@ class WgpuVolumeBridge:
                 result.append(sid)
         return result
 
-    def _refresh_segments(self, rebuild=True):
-        """Re-sync the per-segment field list with the node's visible segments.
-        Uploads each segment's current labelmap. Returns True if the segment
-        count changed (or any texture was reallocated) -- caller decides
-        whether to rebuild the pipeline or just the bind group."""
-        if self._seg_node is None:
-            return False
-        want = self._visible_segment_ids()
-        seg_node_id = self._seg_node.GetID()
-
-        existing = {s.segment_id: s for s in self._segments}
+    def _refresh_segments_for_record(self, record):
+        """Re-sync this record's SegmentField list with its node's
+        visible segments. Returns True if structure or texture allocation
+        changed."""
+        seg_node = record["node"]
+        want = self._visible_segment_ids(seg_node)
+        seg_node_id = seg_node.GetID()
+        existing = {s.segment_id: s for s in record["segments"]}
         new_segments = []
         realloc = False
         for sid in want:
@@ -2755,61 +3164,103 @@ class WgpuVolumeBridge:
                 realloc = True
             if s.refresh():
                 realloc = True
-            # Separable Gaussian on the GPU -- turns the binary r8unorm
-            # labelmap into a smoothly low-passed rgba16float field.
             self._smooth_segment(s)
             new_segments.append(s)
-        structure_changed = (len(new_segments) != len(self._segments))
-        self._segments = new_segments
-        if rebuild:
-            if structure_changed:
-                self._rebuild_pipeline()
-            elif realloc:
-                self._rebuild_bind_group()
+        structure_changed = len(new_segments) != len(record["segments"])
+        record["segments"] = new_segments
         return structure_changed or realloc
 
-    def _on_segmentation_content_modified(self, caller, event):
-        """Segment voxels changed -- typically a Segment Editor brush
-        stroke (SegmentModified) or a representation rebuild
-        (RepresentationModified). Re-upload affected segments. We don't
-        have per-segment granularity without parsing callData, so we
-        re-refresh all visible segments; full-texture upload is cheap at
-        typical segmentation sizes."""
+    def _regenerate_flat_segments(self):
+        """Flatten per-node segment lists into self._segments. The
+        pipeline / packing / WGSL code consumes this flat list."""
+        flat = []
+        for record in self._seg_records.values():
+            flat.extend(record["segments"])
+        self._segments = flat
+
+    # Per-record observer callbacks ----------------------------------
+
+    def _on_seg_content_modified(self, seg_node):
         if self._disposed:
             return
+        record = self._seg_records.get(seg_node.GetID())
+        if record is None:
+            return
         try:
-            self._refresh_segments(rebuild=True)
+            self._refresh_segments_for_record(record)
+            self._regenerate_flat_segments()
+            self._rebuild_pipeline()
             self.rw.Render()
         except Exception as e:
             print(f"WgpuVolumeBridge segmentation content-modified: {e}")
 
-    def _on_segmentation_structure_modified(self, caller, event):
-        """Segment added/removed. Rebuild pipeline + bind group against the
-        new segment list."""
+    def _on_seg_structure_modified(self, seg_node):
         if self._disposed:
             return
+        record = self._seg_records.get(seg_node.GetID())
+        if record is None:
+            return
         try:
-            self._refresh_segments(rebuild=False)
+            self._refresh_segments_for_record(record)
+            self._regenerate_flat_segments()
             self._rebuild_pipeline()
             self.rw.Render()
         except Exception as e:
             print(f"WgpuVolumeBridge segmentation structure-modified: {e}")
 
-    def _on_segmentation_display_modified(self, caller, event):
-        """Display props (color/opacity/visibility) changed. We treat a
-        visibility flip as a structural change (number of visible segments
-        changes) and everything else as a uniform repack by calling
-        _refresh_segments."""
+    def _on_seg_display_modified(self, seg_node):
         if self._disposed:
             return
+        record = self._seg_records.get(seg_node.GetID())
+        if record is None:
+            return
         try:
-            before = len(self._segments)
-            self._refresh_segments(rebuild=False)
-            if len(self._segments) != before:
+            before = len(record["segments"])
+            self._refresh_segments_for_record(record)
+            self._regenerate_flat_segments()
+            if len(record["segments"]) != before:
                 self._rebuild_pipeline()
             self.rw.Render()
         except Exception as e:
             print(f"WgpuVolumeBridge segmentation display-modified: {e}")
+
+    # Reconcile all segmentations against wgpu_state. Default policy
+    # mirrors volumes: implicit opt-in (no state node -> claim), only
+    # explicit renderEnabled=false opts out.
+    def _seg_render_enabled(self, seg_node):
+        if seg_node is None:
+            return False
+        state = wgpu_state.state_for(seg_node, create=False)
+        if state is None:
+            return True
+        if not wgpu_state.is_render_enabled(seg_node):
+            return False
+        return self._node_targets_this_view(seg_node)
+
+    def _reconcile_segmentation_nodes(self):
+        if self._disposed:
+            return
+        coll = slicer.mrmlScene.GetNodesByClass("vtkMRMLSegmentationNode")
+        try:
+            scene_segs = {}
+            for i in range(coll.GetNumberOfItems()):
+                n = coll.GetItemAsObject(i)
+                scene_segs[n.GetID()] = n
+        finally:
+            coll.UnRegister(None)
+        for nid, n in scene_segs.items():
+            should = self._seg_render_enabled(n)
+            present = nid in self._seg_records
+            if should and not present:
+                self.add_segmentation_node(n)
+            elif present and not should:
+                self._remove_segmentation_by_id(nid)
+        # Drop records whose seg node vanished without our observer
+        # firing (defensive; the scene NodeRemovedEvent should normally
+        # catch this).
+        for nid in list(self._seg_records):
+            if nid not in scene_segs:
+                self._remove_segmentation_by_id(nid)
 
     # ---------------- GPU-side Gaussian smoothing of segments ----------------
 
@@ -4222,7 +4673,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             size=16,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
-        # ---- TAA composite compute pipeline ----
+        # TAA pipeline used to live here; relocated to
+        # _ensure_taa_pipeline so it runs for any content (volumes,
+        # segmentations, rgba volumes), not only when strands exist.
+
+    def _ensure_taa_pipeline(self):
+        # Idempotent: any rebuild calls this; first call wins.
+        if self._taa_pipeline is not None:
+            return
         # The 7-yr-old AMD adapter on the dev machine doesn't expose the
         # read_write storage-texture access mode for rgba8unorm, so we
         # split the history into read (sampled texture_2d) and write
@@ -5304,11 +5762,62 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             import traceback; traceback.print_exc()
 
 
-def install_default_bridge():
-    lm = slicer.app.layoutManager()
-    tw = lm.threeDWidget(0)
-    rw = tw.threeDView().renderWindow()
+def install_bridge_for_view(view_widget):
+    """Install a WgpuVolumeBridge into the given qMRMLThreeDWidget /
+    qMRMLThreeDView. The bridge is scoped to that view's vtkMRMLViewNode
+    via view-id filtering -- it will only render content whose
+    wgpu_state.view_node_ids list is empty or includes this view's ID.
+
+    Idempotent: if a bridge already exists for this view's node-ID, it
+    is uninstalled first. This avoids the dual-bridge race condition
+    where two bridges both fire NodeAddedEvent observers and both try
+    to auto-create VRDNs for newly-added volumes.
+
+    Stashed on slicer.modules.wgpuVtkBridges (dict keyed by view-node-ID).
+    For convenience the FIRST installed bridge is also aliased to
+    slicer.modules.wgpuVtkBridge (singular) so legacy code keeps working.
+    """
+    view = (view_widget.threeDView()
+            if hasattr(view_widget, "threeDView") else view_widget)
+    rw = view.renderWindow()
     renderer = rw.GetRenderers().GetFirstRenderer()
-    bridge = WgpuVolumeBridge(renderer, rw)
+    view_node = view.mrmlViewNode() if hasattr(view, "mrmlViewNode") else None
+    bridges = getattr(slicer.modules, "wgpuVtkBridges", None)
+    if not isinstance(bridges, dict):
+        bridges = {}
+        slicer.modules.wgpuVtkBridges = bridges
+    # Uninstall any existing bridge for this view so we don't end up
+    # with two bridges firing observers on the same renderer/scene.
+    if view_node is not None:
+        existing = bridges.get(view_node.GetID())
+        if existing is not None:
+            try:
+                existing.uninstall()
+            except Exception:
+                pass
+    bridge = WgpuVolumeBridge(renderer, rw, view_node=view_node)
     bridge.install()
+    if view_node is not None:
+        bridges[view_node.GetID()] = bridge
+    if getattr(slicer.modules, "wgpuVtkBridge", None) is None:
+        slicer.modules.wgpuVtkBridge = bridge
     return bridge
+
+
+def install_default_bridge():
+    """Convenience: install into the first visible 3D view. For
+    multi-view setups call install_bridge_for_view(view_widget) per
+    view. Picking the first VISIBLE widget rather than index 0 matters
+    because Slicer keeps spare 3D widgets around when you shrink the
+    layout (e.g. dual -> oneup), and threeDWidget(0) may be an invisible
+    leftover."""
+    lm = slicer.app.layoutManager()
+    tw = None
+    for i in range(lm.threeDViewCount):
+        candidate = lm.threeDWidget(i)
+        if candidate is not None and candidate.visible:
+            tw = candidate
+            break
+    if tw is None:
+        tw = lm.threeDWidget(0)
+    return install_bridge_for_view(tw)
