@@ -122,19 +122,22 @@ def _patch_rendercanvas_pythonqt_qt6():
     """Fix a pieper/rendercanvas fork incompatibility under PythonQt + Qt6.
 
     The fork guards PythonQt property-access -- under PythonQt, a QWidget's
-    width/height/rect are int PROPERTIES, not methods -- with
+    width/height/rect are int/QRect PROPERTIES, not methods -- with
     `is_pythonqt and qt_version_info[0] < 6`. Slicer is now PythonQt on Qt6,
     where they are STILL properties, so on Qt6 the guard falls through to the
     method form (`self.width()`) and raises "'int' object is not callable" in
     the canvas resizeEvent; the canvas never sizes, cascading to
     "'NoneType' object has no attribute 'renderer'" in the legacy DualView /
-    Bouncing-Head demos. The correct condition is simply `is_pythonqt`.
+    Bouncing-Head demos.
 
-    Rewrite the installed fork's qt.py, then (if it changed) drop the stale
-    cached modules and rebind pygfx's captured BaseRenderCanvas -- the same
-    dance the fork-install path does. Only the legacy pygfx-Qt-surface path
-    touches these, so the raw-wgpu VTK-injection features are unaffected.
-    Idempotent: a no-op once the file is already correct.
+    Fixed upstream in pieper/rendercanvas (pythonqt-support); this self-heals
+    an already-installed older fork. Only the two WIDGET property sites are
+    corrected -- the wheel-event pos()/position() site keeps its version
+    check, because QWheelEvent.pos() really was removed in Qt6. After editing,
+    drop the stale cached modules and rebind pygfx's captured BaseRenderCanvas
+    (the same dance the fork-install path does). Only the legacy pygfx-Qt
+    surface path uses these, so the raw-wgpu VTK-injection features are
+    unaffected. Idempotent: a no-op once the file is already correct.
     """
     import os
     import sys
@@ -142,15 +145,23 @@ def _patch_rendercanvas_pythonqt_qt6():
         import rendercanvas
     except Exception:
         return
-    bad = "is_pythonqt and qt_version_info[0] < 6"
+    fixes = [
+        ("self.rect if is_pythonqt and qt_version_info[0] < 6 else self.rect()",
+         "self.rect if is_pythonqt else self.rect()"),
+        ("if is_pythonqt and qt_version_info[0] < 6:\n            lsize = float(self.width)",
+         "if is_pythonqt:\n            lsize = float(self.width)"),
+    ]
     try:
         qt_path = os.path.join(os.path.dirname(rendercanvas.__file__), "qt.py")
         with open(qt_path) as f:
             src = f.read()
-        if bad not in src:
+        new = src
+        for old, repl in fixes:
+            new = new.replace(old, repl)
+        if new == src:
             return
         with open(qt_path, "w") as f:
-            f.write(src.replace(bad, "is_pythonqt"))
+            f.write(new)
         for mod_name in [m for m in list(sys.modules)
                          if m == "rendercanvas" or m.startswith("rendercanvas.")]:
             sys.modules.pop(mod_name, None)
