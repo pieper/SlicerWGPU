@@ -175,6 +175,31 @@ def _patch_rendercanvas_pythonqt_qt6():
         print(f"slicer_wgpu: rendercanvas PythonQt-Qt6 patch skipped: {exc}")
 
 
+def _rebind_module_panel(name):
+    """Work around a Qt6 quirk: reloadScriptedModule rebuilds the widget but
+    leaves the just-reloaded module's panel BLANK until the module selector is
+    bounced away and back. (re-selecting the SAME module -- which
+    reloadScriptedModule already does -- is not enough; the panel only
+    re-displays after a switch to a different module.) Bounce to a standard
+    always-present module and back. No-op if the module isn't currently shown.
+    """
+    try:
+        sel = slicer.util.moduleSelector()
+        if sel is None or sel.selectedModule != name:
+            return
+        for other in ("Welcome", "Data", "Markups", "Models"):
+            if other == name:
+                continue
+            try:
+                sel.selectModule(other)
+            except Exception:
+                continue
+            sel.selectModule(name)
+            return
+    except Exception:
+        pass
+
+
 #
 # SceneRendering
 #
@@ -915,6 +940,15 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
         self._scene_observer_tags = []
         self._uninstall_bridge()
 
+    def onReload(self):
+        """Reload (Reload / Reload-and-Test buttons), then rebind the module
+        panel -- reloadScriptedModule otherwise leaves it blank on Qt6 until
+        the module selector is bounced. Deferred so it runs after a following
+        Reload-and-Test actually finishes."""
+        name = self.moduleName
+        ScriptedLoadableModuleWidget.onReload(self)
+        qt.QTimer.singleShot(0, lambda n=name: _rebind_module_panel(n))
+
     def onRunTest(self, test_method_name):
         """Reload this module and run the named self-test. Mirrors the
         built-in `Reload and Test` mechanism: reload first so on-disk
@@ -949,6 +983,9 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
             # One-shot: unchecking avoids re-running the slow path
             # on the next button press unless the user opts in again.
             self._forceReinstallCheck.setChecked(False)
+            # Rebind the panel (reloadScriptedModule above left it blank).
+            qt.QTimer.singleShot(
+                0, lambda n=self.moduleName: _rebind_module_panel(n))
 
 
 #
