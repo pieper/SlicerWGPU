@@ -1914,10 +1914,24 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
             tdn.SetEditorRotationEnabled(True)
             tdn.SetEditorScalingEnabled(False)
 
-        # Now install the bridge -- both VRDNs will be claimed.
-        bridge = self._install_vtk_bridge()
+        # Now install the bridge -- both VRDNs will be claimed. Four-up so
+        # the Red slice (and its foreground-opacity slider) is on screen.
+        bridge = self._install_vtk_bridge(
+            layout=slicer.vtkMRMLLayoutNode.SlicerLayoutFourUpView)
         self.assertEqual(len(bridge.images_by_vrdn), 2,
             f"expected 2 claimed VRDNs, got {list(bridge.images_by_vrdn.keys())}")
+
+        # Show BOTH volumes via the Red slice composite: cta as background,
+        # pano as foreground. Composite-following then renders both, and the
+        # foreground-opacity slider fades pano in/out -- the demo doubles as a
+        # multi-volume blend control.
+        from SceneRenderingLib.wgpu_volume_displayer import red_slice_composite
+        comp = red_slice_composite()
+        self.assertIsNotNone(comp, "no Red slice composite node found")
+        comp.SetBackgroundVolumeID(cta.GetID())
+        comp.SetForegroundVolumeID(pano.GetID())
+        comp.SetForegroundOpacity(1.0)
+        slicer.app.processEvents()
 
         lm = slicer.app.layoutManager()
         view = lm.threeDWidget(0).threeDView()
@@ -1934,8 +1948,10 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         # Stash so the user can inspect / further manipulate in the console
         self._stash(vtkBridge=bridge, cta=cta, pano=pano, panoTransform=tf)
         self.delayDisplay(
-            "VTK: Multi-Volume PASSED -- drag the Pano handles to move it "
-            "and see the wgpu render update live", 600)
+            "VTK: Multi-Volume PASSED -- both volumes show (cta=Red bg, "
+            "pano=Red fg). Drag the Red foreground-opacity slider to fade "
+            "pano in/out, or drag the Pano handles to move it -- the wgpu "
+            "render tracks both live", 600)
 
     def test_vtk_LandmarkDeform(self):
         """VTK injection + thin-plate-spline grid transform driven by
