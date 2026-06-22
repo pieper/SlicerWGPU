@@ -1036,9 +1036,17 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
 
     @staticmethod
     def _leave_live_bridge():
-        """Install a fresh bridge so the module is immediately usable after a
-        self-test sweep tore everything down. Cheap on an empty scene; it
-        then observes and renders whatever the user loads next."""
+        """Make sure a live bridge exists after a self-test, WITHOUT clobbering
+        one a demo already set up. Interactive demos (TPS landmark deform,
+        segmentation painting, ...) install AND configure their bridge -- grid
+        transform, segmentation hooks, clip planes -- and leave it live for the
+        user to keep playing with. Replacing it with a fresh install would
+        discard that state (e.g. the TPS grid transform, so the volume stops
+        deforming). Only install when there is no live bridge -- the case after
+        a sweep whose last test cleared the scene and tore the bridge down."""
+        b = getattr(slicer.modules, "wgpuVtkBridge", None)
+        if b is not None and not getattr(b, "_disposed", False):
+            return
         try:
             from SceneRenderingLib.wgpu_vtk_inject import install_default_bridge
             slicer.modules.wgpuVtkBridge = install_default_bridge()
