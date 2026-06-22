@@ -118,6 +118,52 @@ def _force_vulkan_only_wgpu_instance():
         print(f"slicer_wgpu: could not restrict wgpu instance to Vulkan: {exc}")
 
 
+def _patch_rendercanvas_pythonqt_qt6():
+    """Fix a pieper/rendercanvas fork incompatibility under PythonQt + Qt6.
+
+    The fork guards PythonQt property-access -- under PythonQt, a QWidget's
+    width/height/rect are int PROPERTIES, not methods -- with
+    `is_pythonqt and qt_version_info[0] < 6`. Slicer is now PythonQt on Qt6,
+    where they are STILL properties, so on Qt6 the guard falls through to the
+    method form (`self.width()`) and raises "'int' object is not callable" in
+    the canvas resizeEvent; the canvas never sizes, cascading to
+    "'NoneType' object has no attribute 'renderer'" in the legacy DualView /
+    Bouncing-Head demos. The correct condition is simply `is_pythonqt`.
+
+    Rewrite the installed fork's qt.py, then (if it changed) drop the stale
+    cached modules and rebind pygfx's captured BaseRenderCanvas -- the same
+    dance the fork-install path does. Only the legacy pygfx-Qt-surface path
+    touches these, so the raw-wgpu VTK-injection features are unaffected.
+    Idempotent: a no-op once the file is already correct.
+    """
+    import os
+    import sys
+    try:
+        import rendercanvas
+    except Exception:
+        return
+    bad = "is_pythonqt and qt_version_info[0] < 6"
+    try:
+        qt_path = os.path.join(os.path.dirname(rendercanvas.__file__), "qt.py")
+        with open(qt_path) as f:
+            src = f.read()
+        if bad not in src:
+            return
+        with open(qt_path, "w") as f:
+            f.write(src.replace(bad, "is_pythonqt"))
+        for mod_name in [m for m in list(sys.modules)
+                         if m == "rendercanvas" or m.startswith("rendercanvas.")]:
+            sys.modules.pop(mod_name, None)
+        if "pygfx" in sys.modules:
+            import importlib
+            rc = importlib.import_module("rendercanvas")
+            pgr = importlib.import_module(
+                "pygfx.renderers.wgpu.engine.renderer")
+            pgr.BaseRenderCanvas = rc.BaseRenderCanvas
+    except Exception as exc:
+        print(f"slicer_wgpu: rendercanvas PythonQt-Qt6 patch skipped: {exc}")
+
+
 #
 # SceneRendering
 #
@@ -1129,6 +1175,12 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
                         pgr.BaseRenderCanvas = rc.BaseRenderCanvas
                     except Exception as e:
                         print(f"pygfx BaseRenderCanvas rebind failed: {e}")
+
+        # The fork still mis-handles PythonQt property access on Qt6 (the
+        # legacy DualView / Bouncing-Head demos otherwise fail with
+        # "'int' object is not callable"). Patch it whether or not we just
+        # reinstalled the fork.
+        _patch_rendercanvas_pythonqt_qt6()
 
         # slicer-wgpu's version is pinned at 0.1.0 and never bumps, so
         # pip considers any cached wheel of the GitHub main.zip URL to
