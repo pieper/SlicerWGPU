@@ -27,6 +27,7 @@ import weakref
 from ctypes import cdll, c_ubyte
 
 import numpy as np
+import qt
 import slicer
 import vtk
 import wgpu
@@ -583,6 +584,12 @@ from slicer_wgpu.displayers.volume import VolumeRenderingDisplayer
 # implicitly opt-in via the default-true policy), and reconcile when
 # state nodes change.
 from SceneRenderingLib import wgpu_state
+# Independent (non-VRDN) volume-render path. Its own state nodes +
+# displayer; the bridge runs it alongside the legacy VRDN path and
+# merges both sets of ImageFields at pipeline-build time.
+from SceneRenderingLib import wgpu_volume_render
+from SceneRenderingLib.wgpu_volume_displayer import (
+    WgpuVolumeStateDisplayer, red_slice_composite, composite_opacity)
 
 
 # ---------------------------------------------------------------------------
@@ -766,7 +773,10 @@ fn sample_v_c_{i}(wp: vec3<f32>) -> f32 {{
     return textureSampleLevel(t_vol{i}, s_vol{i}, t, 0.0).r;
 }}
 fn sample_field_{i}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
-    if (u_mat.img{i}_step_unit.z < 0.5) {{ return vec4<f32>(0.0); }}
+    // step_unit.z is a continuous render-opacity in [0,1] (0 = hidden).
+    // Driven for independent fields by the Red slice bg/fg + opacity slider.
+    let vis{i} = u_mat.img{i}_step_unit.z;
+    if (vis{i} <= 0.0) {{ return vec4<f32>(0.0); }}
     let wpw = warp(wp);
     let t4 = u_mat.img{i}_p2t * vec4<f32>(wpw, 1.0);
     if (any(t4.xyz < vec3<f32>(0.0)) || any(t4.xyz > vec3<f32>(1.0))) {{
@@ -801,7 +811,10 @@ fn sample_field_{i}(wp: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {{
               + vec3<f32>(u_mat.img{i}_shade.z * pow(rdv, max(u_mat.img{i}_shade.w, 1.0)));
     }}
     lit = clamp(lit, vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(lit * op, op);
+    // Scale the premultiplied colour AND alpha by render-opacity so the
+    // foreground-opacity slider fades the field correctly under OVER
+    // compositing.
+    return vec4<f32>(lit * op, op) * vis{i};
 }}
 """
 
@@ -1390,10 +1403,14 @@ def _pack_material(fields, segments, rgba_volumes, bmin, bmax, step,
         arr[off+16:off+18] = fld.clim
         arr[off+20:off+24] = [fld.k_ambient, fld.k_diffuse, fld.k_specular,
                               max(fld.shininess, 1.0)]
-        # Force visible=1 since the bridge hides the VRDN to silence
-        # Slicer's native VR mapper; we always want to render our fields.
+        # step_unit.z carries render-opacity in [0,1]. Legacy VRDN-backed
+        # fields leave render_opacity unset -> 1.0 (the bridge hides the
+        # VRDN to silence Slicer's native VR, so we always render those
+        # fully). Independent fields set render_opacity from the Red slice
+        # bg/fg selection + foreground-opacity slider.
+        render_opacity = float(getattr(fld, "render_opacity", 1.0))
         arr[off+24:off+28] = [fld.sample_step_mm, fld.opacity_unit_distance,
-                              1.0, 0.0]
+                              render_opacity, 0.0]
     for j, s in enumerate(segments):
         off = (_SCENE_BYTES // 4) + n * (_PER_FIELD_BYTES // 4) \
               + j * (_PER_SEG_BYTES // 4)
@@ -1885,6 +1902,20 @@ class WgpuVolumeBridge:
         self.view_node_id = view_node.GetID() if view_node is not None else None
 
         self._displayer = None
+        # Independent (non-VRDN) volume-render displayer; built in install().
+        self._indep_displayer = None
+        # Red slice composite node observation -- drives independent-field
+        # render-opacity from the slice bg/fg selection + opacity slider.
+        self._red_composite = None
+        self._composite_obs_tag = None
+        # TAA settle: follow-up renders scheduled after a content change so
+        # the temporal accumulator converges to the new scene without the
+        # user having to move the camera. See _render_content_change.
+        self._taa_settle_remaining = 0
+        self._taa_settle_scheduled = False
+        # (n_fields, n_segments, n_rgba, has_strands) that _bgl/_pipeline were
+        # last built for -- guards bind-group/layout consistency.
+        self._built_shape = None
         self._claimed_vrdn_ids: set[str] = set()
         # SlicerWGPU state-node ModifiedEvent observers. nid -> tag.
         self._state_obs_tags: dict[str, int] = {}
@@ -2019,7 +2050,20 @@ class WgpuVolumeBridge:
             on_structure_changed=self._on_structure_changed,
             on_field_modified=self._on_field_modified,
         )
+        # Independent path: its own state nodes, scoped to this view.
+        # No VRDN claim, no native-VR suppression -- it is the sole
+        # renderer for the volumes it manages, so side-by-side falls out
+        # naturally.
+        self._indep_displayer = WgpuVolumeStateDisplayer(
+            on_structure_changed=self._on_structure_changed,
+            on_field_modified=self._on_field_modified,
+            view_node_id=self.view_node_id,
+        )
         self._install_state_observers()
+        # Observe the Red slice composite so bg/fg selection + the
+        # foreground-opacity slider drive which independent volumes show
+        # in 3D and at what opacity.
+        self._ensure_composite_observed()
         # One-time backfill: auto-create VRDNs for any scalar volumes
         # already in the scene. NodeAddedEvent only fires for nodes
         # added AFTER install; without this pass, volumes loaded
@@ -2058,7 +2102,7 @@ class WgpuVolumeBridge:
                 scene.NodeRemovedEvent, self._on_scene_node_removed_for_state)),
         ]
 
-        self.rw.Render()
+        self._render_content_change()
 
     def _auto_create_missing_vrdns(self):
         coll = slicer.mrmlScene.GetNodesByClass("vtkMRMLScalarVolumeNode")
@@ -2096,13 +2140,16 @@ class WgpuVolumeBridge:
         # Scene has been cleared; force a redraw so the 3D view no longer
         # shows anything our bridge had previously composited.
         try:
-            self.rw.Render()
+            self._render_content_change()
         except Exception:
             pass
 
     def uninstall(self):
         # Set this first so any EndEvent still in flight short-circuits.
         self._disposed = True
+        # Stop any pending TAA settle renders (the singleShot callbacks
+        # also check _disposed, but clear the counter for good measure).
+        self._taa_settle_remaining = 0
         # Drop ourselves from the per-view bridges registry so a
         # subsequent install creates a fresh slot rather than racing
         # with the dead bridge.
@@ -2132,6 +2179,16 @@ class WgpuVolumeBridge:
         if self._displayer is not None:
             self._displayer.cleanup()
             self._displayer = None
+        if self._indep_displayer is not None:
+            self._indep_displayer.cleanup()
+            self._indep_displayer = None
+        if self._red_composite is not None and self._composite_obs_tag is not None:
+            try:
+                self._red_composite.RemoveObserver(self._composite_obs_tag)
+            except Exception:
+                pass
+        self._red_composite = None
+        self._composite_obs_tag = None
         for nid in list(self._claimed_vrdn_ids):
             n = slicer.mrmlScene.GetNodeByID(nid)
             if n is not None:
@@ -2159,41 +2216,73 @@ class WgpuVolumeBridge:
                 try: obj.RemoveObserver(tag)
                 except Exception: pass
         self._seg_records.clear()
-        self._segments = []
         for obj, tag, _cb in self._rgba_obs_tags:
             try: obj.RemoveObserver(tag)
             except Exception: pass
         self._rgba_obs_tags = []
-        self._rgba_volumes = []
-        self._fiber_strand_fields = []
-        self._fragment_field = None
         for obj, tag in self._clip_obs_tags:
             try: obj.RemoveObserver(tag)
             except Exception: pass
         self._clip_obs_tags = []
         self._clip_planes = []
+        # Release GPU resources. Explicitly .destroy() every texture/buffer
+        # (wgpu-py frees the native object immediately) rather than relying on
+        # GC of the bridge -- the bridge sits in reference cycles (observers /
+        # the EndEvent closure both capture self), so refcounting can't reclaim
+        # it and its GPU memory lingers until a cyclic GC pass. Repeated
+        # install/uninstall (live reloads) would otherwise pile up large 3D
+        # volume + Retina-viewport textures and exhaust VRAM; on macOS a GPU
+        # allocation failure can hang the whole display server.
+        self._destroy_gpu_resources()
+
+    def _destroy_gpu_resources(self):
+        # Bridge-owned textures/buffers: destroy() for immediate native free.
+        for attr in ("_color_tex", "_readback_buf", "_cam_ubo", "_mat_ubo",
+                     "_vtk_depth_tex", "_grid_tex",
+                     "_taa_history_tex", "_taa_output_tex", "_taa_ubo"):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    obj.destroy()
+                except Exception:
+                    pass
+        # Per-field / per-segment / per-rgba GPU textures (the big 3D volume
+        # textures live here). Destroy the underlying wgpu object so VRAM is
+        # freed now, not at the owning Field's eventual collection.
+        def _destroy_tex(tex):
+            wo = getattr(tex, "_wgpu_object", None) if tex is not None else None
+            if wo is not None:
+                try: wo.destroy()
+                except Exception: pass
+        for f in self._fields:
+            _destroy_tex(getattr(f, "_volume_tex", None))
+            _destroy_tex(getattr(f, "_lut_tex", None))
+            _destroy_tex(getattr(f, "_grad_lut_tex", None))
+        for s in self._segments:
+            for a in ("smooth_tex", "raw_tex", "scratch_tex"):
+                _destroy_tex(getattr(s, a, None))
+        for r in self._rgba_volumes:
+            _destroy_tex(getattr(r, "tex", None))
+        # Now drop the Field containers (their textures are freed above).
         self._fields = []
-        # Drop wgpu resources so the Python GC can reclaim GPU memory
-        # immediately rather than waiting for the bridge object itself
-        # to be collected.
-        self._pipeline = None
-        self._bgl = None
-        self._bind_group = None
-        self._color_tex = None
-        self._readback_buf = None
-        self._cam_ubo = None
-        self._mat_ubo = None
-        self._vtk_depth_tex = None
-        self._vtk_depth_view = None
-        self._vtk_depth_sampler = None
-        self._vtk_depth_buf = None
-        self._grid_tex = None
-        self._grid_view = None
-        self._grid_sampler = None
-        self._smooth_compute_pipeline = None
-        self._smooth_compute_bgl = None
-        self._smooth_ubos = None
-        self._gl_compositor = None
+        self._segments = []
+        self._rgba_volumes = []
+        self._fiber_strand_fields = []
+        self._fragment_field = None
+        # Null all GPU references (including the TAA set, which the previous
+        # teardown missed entirely) so nothing keeps them alive.
+        for attr in (
+            "_pipeline", "_bgl", "_bind_group",
+            "_color_tex", "_readback_buf", "_cam_ubo", "_mat_ubo",
+            "_vtk_depth_tex", "_vtk_depth_view", "_vtk_depth_sampler",
+            "_vtk_depth_buf", "_grid_tex", "_grid_view", "_grid_sampler",
+            "_taa_history_tex", "_taa_history_view",
+            "_taa_output_tex", "_taa_output_view",
+            "_taa_ubo", "_taa_pipeline", "_taa_bgl",
+            "_smooth_compute_pipeline", "_smooth_compute_bgl", "_smooth_ubos",
+            "_gl_compositor",
+        ):
+            setattr(self, attr, None)
 
     @property
     def images_by_vrdn(self):
@@ -2225,6 +2314,11 @@ class WgpuVolumeBridge:
         bridge running in view B."""
         if volume_node is None:
             return True
+        # Independent path owns this volume -- the legacy path must not
+        # claim it (that would hide native VR for a volume the new path
+        # renders directly, and double-render through both displayers).
+        if wgpu_volume_render.has_independent_node(volume_node):
+            return False
         state = wgpu_state.state_for(volume_node, create=False)
         if state is None:
             return True
@@ -2274,12 +2368,162 @@ class WgpuVolumeBridge:
 
     def _on_structure_changed(self):
         self._reconcile_vrdn_claims()
-        self._rebuild_pipeline()
-        self.rw.Render()
+        self._rebuild_pipeline()   # also recomputes composite visibility
+        self._render_content_change()
 
     def _on_field_modified(self, field):
+        self._sync_field_luts(field)
         self._reconcile_vrdn_claims()
-        self.rw.Render()
+        self._recompute_volume_visibility()
+        self._render_content_change()
+
+    # ------------------------------------------------------------------
+    # Render + TAA settle. Every render triggered by a scene/content change
+    # goes through _render_content_change, which resets the temporal
+    # accumulator (so the new content shows correctly on THIS frame -- the
+    # frame-0 blend factor is 1.0, discarding stale history) and then
+    # schedules a short chain of zero-timeout follow-up renders so the
+    # temporal anti-aliasing re-converges without the user having to move
+    # the camera. Without this, an instant edit (e.g. carving a segment)
+    # leaves the removed content faintly ghosted until the next camera
+    # interaction. The chain is re-entrant: a new edit mid-settle just
+    # resets the accumulator and refills the counter, so rapid edits stay
+    # responsive instead of queueing up.
+    # ------------------------------------------------------------------
+
+    _TAA_SETTLE_FRAMES = 12
+
+    def _render_content_change(self):
+        if self._disposed:
+            return
+        # Force the next frame to _taa_frame == 0 (pure-current blend) so
+        # the changed scene is shown immediately, not faded in.
+        self._taa_prev_pv = None
+        try:
+            self.rw.Render()
+        except Exception:
+            pass
+        self._schedule_taa_settle()
+
+    def _schedule_taa_settle(self, frames=None):
+        if self._disposed:
+            return
+        n = self._TAA_SETTLE_FRAMES if frames is None else frames
+        self._taa_settle_remaining = max(self._taa_settle_remaining, n)
+        if not self._taa_settle_scheduled:
+            self._taa_settle_scheduled = True
+            qt.QTimer.singleShot(0, self._taa_settle_step)
+
+    def _taa_settle_step(self):
+        self._taa_settle_scheduled = False
+        if self._disposed or self._taa_settle_remaining <= 0:
+            self._taa_settle_remaining = 0
+            return
+        self._taa_settle_remaining -= 1
+        try:
+            # Plain render (no TAA reset) so _taa_frame advances and the
+            # accumulator converges frame by frame.
+            self.rw.Render()
+        except Exception:
+            pass
+        if self._taa_settle_remaining > 0:
+            self._taa_settle_scheduled = True
+            qt.QTimer.singleShot(0, self._taa_settle_step)
+
+    # ------------------------------------------------------------------
+    # Red slice composite observation. The slice viewer's background /
+    # foreground selection + foreground-opacity slider become the control
+    # for which independent volumes render in 3D (and at what opacity),
+    # so volumes can be compared one or two at a time instead of all
+    # piling into the 3D view at once.
+    # ------------------------------------------------------------------
+
+    def _ensure_composite_observed(self):
+        """Find the Red slice composite node and observe it. Idempotent;
+        rebinds if the node identity changed (e.g. after a scene import).
+        Applies the current bg/fg state once bound."""
+        if self._disposed:
+            return
+        comp = red_slice_composite()
+        if comp is None:
+            return
+        if comp is self._red_composite and self._composite_obs_tag is not None:
+            return
+        if self._red_composite is not None and self._composite_obs_tag is not None:
+            try:
+                self._red_composite.RemoveObserver(self._composite_obs_tag)
+            except Exception:
+                pass
+        self._red_composite = comp
+        self._composite_obs_tag = comp.AddObserver(
+            vtk.vtkCommand.ModifiedEvent, self._on_slice_composite_modified)
+        self._apply_composite_visibility()
+
+    def _on_slice_composite_modified(self, caller, event):
+        if self._disposed:
+            return
+        self._apply_composite_visibility()
+
+    def _recompute_volume_visibility(self):
+        """Drive EVERY wgpu volume's 3D render-opacity from the Red slice
+        composite (background -> 1.0, foreground -> opacity slider, else
+        hidden), so the 3D view mirrors the slice viewer instead of piling
+        all loaded volumes in at once. Covers both paths:
+
+          * independent fields -- via the displayer (also gated on
+            renderEnabled / view scoping), and
+          * legacy VRDN-backed fields -- here, mapping each field's VRDN to
+            its volume. (Previously legacy fields rendered at a fixed full
+            opacity and ignored the composite entirely.)
+
+        render_opacity is read per-frame by _pack_material, so this needs no
+        pipeline rebuild. Returns True if any opacity changed."""
+        comp = red_slice_composite()
+        changed = False
+        if self._indep_displayer is not None and \
+                self._indep_displayer.refresh_visibility():
+            changed = True
+        if self._displayer is not None:
+            for nid, f in list(self._displayer.fields_by_nid.items()):
+                if not isinstance(f, ImageField):
+                    continue
+                vrdn = slicer.mrmlScene.GetNodeByID(nid)
+                vol = vrdn.GetVolumeNode() if vrdn is not None else None
+                op = composite_opacity(vol.GetID() if vol is not None else None,
+                                       comp)
+                if getattr(f, "render_opacity", 1.0) != op:
+                    changed = True
+                f.render_opacity = op
+                f.visible = op > 0.0
+        return changed
+
+    def _apply_composite_visibility(self):
+        """Recompute every volume's render-opacity from the Red slice
+        composite and redraw if anything changed."""
+        if self._recompute_volume_visibility():
+            # _render_content_change resets the TAA accumulator + settles,
+            # so a slider drag converges immediately instead of ghosting.
+            self._render_content_change()
+
+    def _sync_field_luts(self, field):
+        """Re-upload a field's 1D colour / gradient-opacity LUT textures
+        after an in-place set_data (a TF / preset edit). The expensive 3D
+        volume texture is left alone. No-op when the textures aren't on
+        the GPU yet -- a pending _rebuild_pipeline uploads them then.
+
+        Needed because the per-frame render path repacks the material UBO
+        (clim, shading, visibility) every frame but does NOT re-sync field
+        textures; only _rebuild_pipeline calls update_resource. Without
+        this, a LUT edit that routes through _on_field_modified (no
+        structural change) would never reach the GPU."""
+        for tex in (getattr(field, "_lut_tex", None),
+                    getattr(field, "_grad_lut_tex", None)):
+            if tex is None or tex._wgpu_object is None:
+                continue
+            try:
+                update_resource(tex)
+            except Exception as e:
+                print(f"WgpuVolumeBridge LUT sync: {e}")
 
     # ------------------------------------------------------------------
     # State-node observation. Each SlicerWGPU state node (one per
@@ -2322,7 +2566,7 @@ class WgpuVolumeBridge:
                     pass
                 break
         try:
-            self.rw.Render()
+            self._render_content_change()
         except Exception:
             pass
 
@@ -2332,6 +2576,11 @@ class WgpuVolumeBridge:
             return
         node = calldata
         if node is None:
+            return
+        # A Red slice composite node appearing (e.g. after scene import or
+        # a first slice view) -> bind our opacity-driving observer to it.
+        if node.IsA("vtkMRMLSliceCompositeNode"):
+            self._ensure_composite_observed()
             return
         # New state node -> observe it so subsequent param edits drive
         # a reconcile. Also reconcile now so default-true policy picks
@@ -2440,6 +2689,10 @@ class WgpuVolumeBridge:
 
     def _auto_create_vrdn_if_missing(self, volume_node):
         vol_id = volume_node.GetID()
+        # Independent path owns this volume -- don't auto-create a legacy
+        # VRDN for it.
+        if wgpu_volume_render.has_independent_node(volume_node):
+            return
         # Dedupe: Slicer re-fires NodeAddedEvent for the same volume
         # within the same chunk (a second event arrives BEFORE
         # CreateDefaultVolumeRenderingNodes' new VRDN is queryable via
@@ -2507,10 +2760,18 @@ class WgpuVolumeBridge:
         self._reconcile_segmentation_nodes()
 
     def _rebuild_pipeline(self):
-        self._fields = [
-            f for f in self._displayer.fields()
-            if isinstance(f, ImageField)
-        ] if self._displayer else []
+        # Merge ImageFields from both paths: the legacy VRDN displayer and
+        # the independent state-node displayer. The two never manage the
+        # same volume (the legacy path steps aside for volumes with an
+        # independent node -- see _volume_render_enabled), so there is no
+        # double-render.
+        self._fields = []
+        if self._displayer:
+            self._fields += [f for f in self._displayer.fields()
+                             if isinstance(f, ImageField)]
+        if self._indep_displayer:
+            self._fields += [f for f in self._indep_displayer.fields()
+                             if isinstance(f, ImageField)]
         n = len(self._fields)
         m = len(self._segments)
         k = len(self._rgba_volumes)
@@ -2651,7 +2912,18 @@ class WgpuVolumeBridge:
         # is attached; u_mat.grid_enabled.x guards sampling.
         if self._grid_tex is None:
             self._ensure_grid_placeholder()
+        # Record the field/segment/rgba/strand counts this _bgl + _pipeline
+        # were built for, so _rebuild_bind_group can detect a stale layout.
+        self._built_shape = (n, m, k, has_strands)
         self._rebuild_bind_group()
+        # Make every field (incl. just-rebuilt legacy auto-VRDN volumes)
+        # follow the Red slice composite immediately. Cheap (sets a uniform
+        # value read per frame); no further rebuild.
+        self._recompute_volume_visibility()
+
+    def _current_shape(self):
+        return (len(self._fields), len(self._segments),
+                len(self._rgba_volumes), bool(self._fiber_strand_fields))
 
     def _rebuild_bind_group(self):
         """Assemble bind group from current fields + current depth texture.
@@ -2660,6 +2932,45 @@ class WgpuVolumeBridge:
                                  and not self._rgba_volumes
                                  and not self._fiber_strand_fields):
             return
+        # If the counts changed since _bgl/_pipeline were built (e.g. a
+        # segment was added and a standalone _rebuild_bind_group -- depth
+        # realloc, or the _wgpu_render retry -- ran before _rebuild_pipeline),
+        # the binding indices in `bg` below would disagree with the layout
+        # ("binding N differs in type / not found in layout"). Rebuild the
+        # whole pipeline first so layout and bind group are derived from the
+        # same shape. (_rebuild_pipeline calls back here once, with the shape
+        # matched, so there's no recursion.)
+        if self._current_shape() != getattr(self, "_built_shape", None):
+            self._rebuild_pipeline()
+            return
+        # Bail if any per-field/segment/rgba GPU resource isn't ready yet --
+        # e.g. a SegmentField mid-refresh briefly has tex_view=None while the
+        # user paints/carves. Binding a None resource throws
+        # ("Unexpected resource type NoneType"). Skipping keeps the previous
+        # (valid, same-shape) bind group; the next render rebuilds once the
+        # resource exists. This matters because a render can land inside that
+        # brief not-ready window (TAA settle fires extra renders, and the
+        # depth-texture reallocation path rebuilds mid-frame).
+        # Null the bind group while bailing -- NOT leave the previous one in
+        # place. _rebuild_pipeline has already rebuilt _bgl/_pipeline for the
+        # current field/segment counts, so a stale bind group would mismatch
+        # the new layout ("binding N not found in bind group layout") on every
+        # render until the next rebuild. _wgpu_render skips when _bind_group
+        # is None, so we simply render nothing for the frame or two until the
+        # resource is ready and a later rebuild succeeds.
+        def _not_ready():
+            self._bind_group = None
+            return True
+        for f in self._fields:
+            if (f._volume_tex is None or f._volume_tex._wgpu_object is None
+                    or f._lut_tex is None or f._lut_tex._wgpu_object is None):
+                if _not_ready(): return
+        for s in self._segments:
+            if s.sampler is None or s.tex_view is None:
+                if _not_ready(): return
+        for r in self._rgba_volumes:
+            if r.sampler is None or r.tex_view is None or r._label_tex_view is None:
+                if _not_ready(): return
         bg = [
             {"binding": 0, "resource": {
                 "buffer": self._cam_ubo, "offset": 0, "size": self._cam_ubo.size}},
@@ -2900,14 +3211,14 @@ class WgpuVolumeBridge:
                 self._clip_obs_tags.append((n, tag))
             except Exception:
                 pass
-        self.rw.Render()
+        self._render_content_change()
 
     def _on_clip_modified(self, caller, event):
         if self._disposed:
             return
         try:
             self._refresh_clip_planes()
-            self.rw.Render()
+            self._render_content_change()
         except Exception as e:
             print(f"clip modified: {e}")
 
@@ -2951,7 +3262,7 @@ class WgpuVolumeBridge:
             # Revert to placeholder + disable shader path
             self._ensure_grid_placeholder()
             self._rebuild_bind_group()
-            self.rw.Render()
+            self._render_content_change()
             return
 
         realloc = self._upload_grid_from_node(grid_node)
@@ -2964,7 +3275,7 @@ class WgpuVolumeBridge:
 
         if realloc:
             self._rebuild_bind_group()
-        self.rw.Render()
+        self._render_content_change()
 
     def _on_grid_modified(self, caller, event):
         if self._disposed or self._grid_node is None:
@@ -2973,7 +3284,7 @@ class WgpuVolumeBridge:
             realloc = self._upload_grid_from_node(self._grid_node)
             if realloc:
                 self._rebuild_bind_group()
-            self.rw.Render()
+            self._render_content_change()
         except Exception as e:
             print(f"WgpuVolumeBridge grid-modified: {e}")
 
@@ -2998,7 +3309,7 @@ class WgpuVolumeBridge:
         rgba_field.carve_center_world = np.asarray(
             point_world, dtype=np.float32).reshape(3)
         rgba_field.carve_radius_mm = float(max(radius_mm, 0.0))
-        self.rw.Render()
+        self._render_content_change()
 
     def set_segment_render_mode(self, mode):
         """Switch between the two segment shaders:
@@ -3018,7 +3329,7 @@ class WgpuVolumeBridge:
             return
         self._segment_render_mode = mode
         self._rebuild_pipeline()
-        self.rw.Render()
+        self._render_content_change()
 
     # ------------------------------------------------------------------
     # Multi-segmentation API. add_segmentation_node / remove_segmentation
@@ -3049,7 +3360,7 @@ class WgpuVolumeBridge:
         self._regenerate_flat_segments()
         self._rebuild_pipeline()
         try:
-            self.rw.Render()
+            self._render_content_change()
         except Exception:
             pass
 
@@ -3070,7 +3381,7 @@ class WgpuVolumeBridge:
         self._regenerate_flat_segments()
         self._rebuild_pipeline()
         try:
-            self.rw.Render()
+            self._render_content_change()
         except Exception:
             pass
 
@@ -3190,7 +3501,7 @@ class WgpuVolumeBridge:
             self._refresh_segments_for_record(record)
             self._regenerate_flat_segments()
             self._rebuild_pipeline()
-            self.rw.Render()
+            self._render_content_change()
         except Exception as e:
             print(f"WgpuVolumeBridge segmentation content-modified: {e}")
 
@@ -3204,7 +3515,7 @@ class WgpuVolumeBridge:
             self._refresh_segments_for_record(record)
             self._regenerate_flat_segments()
             self._rebuild_pipeline()
-            self.rw.Render()
+            self._render_content_change()
         except Exception as e:
             print(f"WgpuVolumeBridge segmentation structure-modified: {e}")
 
@@ -3220,7 +3531,7 @@ class WgpuVolumeBridge:
             self._regenerate_flat_segments()
             if len(record["segments"]) != before:
                 self._rebuild_pipeline()
-            self.rw.Render()
+            self._render_content_change()
         except Exception as e:
             print(f"WgpuVolumeBridge segmentation display-modified: {e}")
 
@@ -5034,7 +5345,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             tag = dn_seg.AddObserver(vtk.vtkCommand.ModifiedEvent, cb)
             self._rgba_obs_tags.append((dn_seg, tag, cb))
 
-        self.rw.Render()
+        self._render_content_change()
         return rgba_field
 
     # ---------------------------------------------------------------------
@@ -5310,7 +5621,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         sf.bind_group = self._make_strand_bind_group(sf)
         self._fiber_strand_fields.append(sf)
         self._rebuild_pipeline()
-        self.rw.Render()
+        self._render_content_change()
         return sf
 
     def _update_strand_params_ubo(self, sf, pad_world_mm):
@@ -5369,7 +5680,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 self._bake_palette_ubo, 0,
                 np.ascontiguousarray(palette).tobytes())
             self._run_bake(rgba_field)
-            self.rw.Render()
+            self._render_content_change()
         except Exception as e:
             print(f"_on_rgba_display_modified: {e}")
 
@@ -5482,9 +5793,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     def _wgpu_render(self, w, h, proj_inv, view_inv,
                      proj_fwd=None, view_fwd=None):
-        if self._pipeline is None or (not self._fields and not self._segments
-                                      and not self._rgba_volumes
-                                      and not self._fiber_strand_fields):
+        # If a previous rebuild bailed (resource not ready) it left
+        # _bind_group None; retry now -- it succeeds as soon as the resource
+        # exists, so we self-heal on the next frame without needing a separate
+        # structure-change trigger. _bgl already matches the current counts.
+        if self._bind_group is None and self._pipeline is not None:
+            self._rebuild_bind_group()
+        if self._pipeline is None or self._bind_group is None or (
+                not self._fields and not self._segments
+                and not self._rgba_volumes
+                and not self._fiber_strand_fields):
             return np.zeros((h, w, 4), dtype=np.uint8)
         self._ensure_target(w, h)
 
@@ -5711,6 +6029,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return raw.copy()
 
     def _on_end_event(self, caller):
+        # A torn-down bridge never renders: uninstall() sets _disposed=True as
+        # its very first step (before any line that could throw) and removes
+        # this observer, so this check alone is enough to keep an orphaned
+        # observer from doing GPU work. (An earlier registry-based guard here
+        # silently blanked ALL wgpu content whenever slicer.modules.
+        # wgpuVtkBridges drifted out of sync -- which several paths do -- so
+        # it was removed.)
         if self._disposed:
             return
         try:

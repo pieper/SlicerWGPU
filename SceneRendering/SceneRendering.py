@@ -44,9 +44,39 @@ from slicer.ScriptedLoadableModule import (
 )
 
 from SceneRenderingLib import wgpu_state
+from SceneRenderingLib import wgpu_volume_render
 
 
 MODULE_NAME = "SceneRendering"
+
+
+def _fix_macos_processor_for_rubicon():
+    """Work around a wgpu-init crash on Apple Silicon Slicer builds.
+
+    On this hardware platform.machine() is 'arm64', but Slicer's process
+    spawns its child processes translated (Rosetta), so the `uname -p`
+    that CPython's platform.processor() shells out to returns 'i386'.
+    rubicon-objc -- pulled in by wgpu's Metal backend -- reads processor(),
+    sees 'i386' on a 64-bit build, and concludes the arch is x86_64. It
+    then binds the ObjC symbol objc_msgSendSuper_stret, an x86-only
+    struct-return message variant that macOS 26's libobjc no longer
+    exports; the dlsym lookup fails and aborts the wgpu native-backend
+    import with an AttributeError.
+
+    'arm' is the correct value for this hardware, so this is a fix, not a
+    spoof: rubicon then takes its arm64 path and never references the dead
+    symbol. Must run before rubicon.objc is first imported -- i.e. before
+    the first wgpu adapter/device request -- which is why _ensure_dependencies
+    calls it ahead of importing wgpu. No-op off macOS, when processor() is
+    already arm, or once rubicon is loaded (too late to influence its
+    one-time arch detection).
+    """
+    import sys
+    import platform
+    if sys.platform != "darwin" or "rubicon" in sys.modules:
+        return
+    if platform.machine() == "arm64" and platform.processor() not in ("arm", "arm64"):
+        platform.processor = lambda: "arm"
 
 
 def _force_vulkan_only_wgpu_instance():
@@ -280,12 +310,35 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
             self._build_view_selector_group("Render in views"))
         v.addWidget(self._volumeViewGroup)
 
-        tf_group = qt.QGroupBox("Transfer function")
+        tf_group = qt.QGroupBox("Independent wgpu render (new mode)")
         tf_v = qt.QVBoxLayout(tf_group)
-        tf_placeholder = qt.QLabel(
-            "<i>New transfer-function editor will land here.</i>")
-        tf_placeholder.setWordWrap(True)
-        tf_v.addWidget(tf_placeholder)
+
+        self._volumeIndepCheck = qt.QCheckBox(
+            "Render with independent wgpu mode")
+        self._volumeIndepCheck.setToolTip(
+            "Render this volume through the independent wgpu path -- its "
+            "own state node and control-point transfer function, with no "
+            "volume-rendering display node. While enabled the legacy "
+            "'Render with SlicerWGPU' path steps aside for this volume.")
+        self._volumeIndepCheck.toggled.connect(
+            self._on_volume_indep_toggled)
+        tf_v.addWidget(self._volumeIndepCheck)
+
+        preset_row = qt.QHBoxLayout()
+        preset_row.addWidget(qt.QLabel("Preset:"))
+        self._volumePresetCombo = qt.QComboBox()
+        for name in wgpu_volume_render.PRESETS:
+            self._volumePresetCombo.addItem(name)
+        self._volumePresetCombo.connect(
+            "currentIndexChanged(int)", self._on_volume_preset_changed)
+        preset_row.addWidget(self._volumePresetCombo, 1)
+        tf_v.addLayout(preset_row)
+
+        tf_hint = qt.QLabel(
+            "<i>Preset transfer functions for now; a richer editor will "
+            "replace this dropdown.</i>")
+        tf_hint.setWordWrap(True)
+        tf_v.addWidget(tf_hint)
         v.addWidget(tf_group)
 
         v.addStretch(1)
@@ -397,6 +450,20 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
         self._volumeRenderCheck.blockSignals(False)
         self._rebuild_view_checks(node, self._volumeViewContainerLayout,
                                   self._view_checks_volume)
+        # Independent-mode controls: reflect whether this volume has an
+        # independent state node, and which preset it carries.
+        indep_state = wgpu_volume_render.state_for(node, create=False)
+        self._volumeIndepCheck.blockSignals(True)
+        self._volumeIndepCheck.setChecked(indep_state is not None)
+        self._volumeIndepCheck.blockSignals(False)
+        self._volumePresetCombo.blockSignals(True)
+        if indep_state is not None:
+            idx = self._volumePresetCombo.findText(
+                wgpu_volume_render.preset_name(indep_state))
+            if idx >= 0:
+                self._volumePresetCombo.setCurrentIndex(idx)
+        self._volumePresetCombo.enabled = indep_state is not None
+        self._volumePresetCombo.blockSignals(False)
 
     def _populate_segmentation_page(self, node):
         self._segRenderCheck.blockSignals(True)
@@ -463,6 +530,41 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
         # state-Modified observer (claims/unclaims + auto-creates VRDN
         # via reconcile backfill if needed).
         wgpu_state.set_render_enabled(node, checked)
+
+    @staticmethod
+    def _volume_scalar_range(node):
+        img = node.GetImageData() if node is not None else None
+        if img is None:
+            return (0.0, 1.0)
+        return tuple(float(x) for x in img.GetScalarRange())
+
+    def _on_volume_indep_toggled(self, checked):
+        node = self._currently_edited_node()
+        if node is None:
+            return
+        if checked:
+            # Create the independent state node and seed it with the
+            # currently-selected preset over the volume's scalar range.
+            # The bridge's independent displayer picks it up on NodeAdded.
+            state = wgpu_volume_render.state_for(node, create=True)
+            preset = self._volumePresetCombo.currentText
+            wgpu_volume_render.apply_preset(
+                state, preset, self._volume_scalar_range(node))
+            wgpu_volume_render.set_render_enabled(node, True)
+        else:
+            wgpu_volume_render.remove_state(node)
+        self._volumePresetCombo.enabled = checked
+
+    def _on_volume_preset_changed(self, _index):
+        node = self._currently_edited_node()
+        if node is None:
+            return
+        state = wgpu_volume_render.state_for(node, create=False)
+        if state is None:
+            return  # Preset only matters once independent mode is on.
+        wgpu_volume_render.apply_preset(
+            state, self._volumePresetCombo.currentText,
+            self._volume_scalar_range(node))
 
     def _on_seg_render_check_toggled(self, checked):
         node = self._currently_edited_node()
@@ -539,6 +641,28 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
         tag_end = scene.AddObserver(
             slicer.vtkMRMLScene.EndImportEvent, self._on_scene_end_import)
         self._scene_observer_tags.append((scene, tag_end))
+        # Observe content arriving so a live bridge always exists to render
+        # it -- the bridge gets torn down by tests / scene close / reload and
+        # nothing else brings it back.
+        tag_add = scene.AddObserver(
+            slicer.vtkMRMLScene.NodeAddedEvent, self._on_node_added)
+        self._scene_observer_tags.append((scene, tag_add))
+        # A fresh scene (after Close) also needs a bridge for the next loads.
+        tag_close = scene.AddObserver(
+            slicer.vtkMRMLScene.EndCloseEvent, self._on_scene_end_close)
+        self._scene_observer_tags.append((scene, tag_close))
+
+    @vtk.calldata_type(vtk.VTK_OBJECT)
+    def _on_node_added(self, caller, event, calldata):
+        node = calldata
+        if node is None:
+            return
+        if (node.IsA("vtkMRMLScalarVolumeNode")
+                or node.IsA("vtkMRMLSegmentationNode")):
+            self._schedule_ensure_bridge()
+
+    def _on_scene_end_close(self, caller, event):
+        self._schedule_ensure_bridge()
 
     @vtk.calldata_type(vtk.VTK_OBJECT)
     def _on_node_removed(self, caller, event, calldata):
@@ -626,9 +750,17 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
     # ------------------------------------------------------------------
 
     def _install_bridge(self):
-        if self._bridge is not None:
+        # Reinstall if we're holding a dead bridge -- e.g. a self-test (or any
+        # other uninstall path) tore down the bridge we installed at setup,
+        # leaving self._bridge pointing at a disposed object that renders
+        # nothing. Treat disposed (or a mismatch with the live module bridge)
+        # as "no bridge".
+        live = (self._bridge is not None
+                and not getattr(self._bridge, "_disposed", False))
+        if live:
             self._volumeStatusLabel.text = "Bridge: installed"
             return
+        self._bridge = None
         try:
             from SceneRenderingLib.wgpu_vtk_inject import install_default_bridge
         except Exception as e:
@@ -659,6 +791,48 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
             self._bridge = None
         slicer.modules.wgpuVtkBridge = None
         self._volumeStatusLabel.text = "Bridge: (not installed)"
+
+    def _ensure_bridge(self):
+        """Guarantee a live bridge for interactive use. The bridge gets torn
+        down by self-tests, scene close, and reloads; nothing used to bring
+        it back, so loading a volume / making a segmentation afterwards
+        rendered nothing. Adopt an existing live bridge from
+        slicer.modules.wgpuVtkBridge (e.g. one a test left installed) into
+        self._bridge, else install a fresh one. Cheap + idempotent."""
+        glob = getattr(slicer.modules, "wgpuVtkBridge", None)
+        if glob is not None and not getattr(glob, "_disposed", False):
+            self._bridge = glob
+            self._volumeStatusLabel.text = "Bridge: installed"
+            return
+        self._bridge = None
+        self._install_bridge()
+
+    def _schedule_ensure_bridge(self):
+        # Defer to the next event-loop turn: a NodeAdded handler must not
+        # synchronously install the bridge (install auto-creates VRDN nodes,
+        # re-entering NodeAdded), and rapid adds coalesce into one ensure.
+        if getattr(self, "_ensure_scheduled", False):
+            return
+        self._ensure_scheduled = True
+
+        def _run():
+            self._ensure_scheduled = False
+            # Self-tests manage their own bridge lifecycle; stay out of it.
+            if getattr(slicer.modules, "wgpuSuppressAutoBridge", False):
+                return
+            try:
+                self._ensure_bridge()
+            except Exception:
+                pass
+        qt.QTimer.singleShot(0, _run)
+
+    def enter(self):
+        """Module shown -- a prior test / scene close may have torn the
+        bridge down, so make sure a live one exists."""
+        try:
+            self._ensure_bridge()
+        except Exception:
+            pass
 
     def _on_install_deps_clicked(self):
         # Reuse the test class's bootstrap -- it's the source of truth
@@ -778,20 +952,51 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         slicer.app.processEvents()
 
     def runTest(self):
-        """Slicer's standard entry: run every implemented test in
-        sequence. Invoked by the built-in `Reload & Test` button."""
-        for name in (
-            "test_SingleVolume",
-            "test_VolumeAndFiducials",
-            "test_TransformableVolume",
-        ):
-            self.setUp()
-            getattr(self, name)()
+        """Slicer's standard entry: run the current (VTK-injection) tests in
+        sequence. Invoked by the built-in `Reload & Test` button.
+
+        These exercise the raw-wgpu injection path -- the active development
+        focus -- which needs no rendercanvas-fork Qt surface. The legacy
+        DualView/pygfx demos (test_SingleVolume, test_BouncingHead, ...) are
+        kept as runnable methods but left out of the default sweep because
+        they depend on the pieper/rendercanvas PythonQt fork being installed.
+        """
+        # Tests manage their own bridge lifecycle (setUp tears it down per
+        # test); suppress the widget's observe-and-reinstall so it doesn't
+        # fight them, and restore a live bridge for interactive use after.
+        slicer.modules.wgpuSuppressAutoBridge = True
+        try:
+            for name in (
+                "test_vtk_IndependentVolumeAndSegmentation",
+                "test_vtk_VolumeFollowsComposite",
+                "test_state_SaveRestore",
+            ):
+                self.setUp()
+                getattr(self, name)()
+        finally:
+            slicer.modules.wgpuSuppressAutoBridge = False
+            self._leave_live_bridge()
+
+    @staticmethod
+    def _leave_live_bridge():
+        """Install a fresh bridge so the module is immediately usable after a
+        self-test sweep tore everything down. Cheap on an empty scene; it
+        then observes and renders whatever the user loads next."""
+        try:
+            from SceneRenderingLib.wgpu_vtk_inject import install_default_bridge
+            slicer.modules.wgpuVtkBridge = install_default_bridge()
+        except Exception:
+            pass
 
     def runTestByName(self, test_method_name: str) -> None:
         """Run a single test by name. Used by the module UI buttons."""
-        self.setUp()
-        getattr(self, test_method_name)()
+        slicer.modules.wgpuSuppressAutoBridge = True
+        try:
+            self.setUp()
+            getattr(self, test_method_name)()
+        finally:
+            slicer.modules.wgpuSuppressAutoBridge = False
+            self._leave_live_bridge()
 
     # ----- Dependency bootstrap -----
 
@@ -802,6 +1007,10 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
         pushes files via the MCP /file endpoint isn't clobbered."""
         import importlib
         import sys
+
+        # Apple-Silicon arch-detection fix: must run before wgpu's Metal
+        # backend pulls in rubicon-objc (i.e. before the wgpu import below).
+        _fix_macos_processor_for_rubicon()
 
         for pkg in ("numpy", "wgpu"):
             try:
@@ -1327,6 +1536,180 @@ class SceneRenderingTest(ScriptedLoadableModuleTest):
 
         self._stash(vtkBridge=bridge, volume=vol)
         self.delayDisplay("VTK: Single Volume PASSED", 300)
+
+    def _warm_pixel_count(self):
+        """Count warm/skin-tone pixels (red well above blue) in the active
+        3D view. The wgpu volume (MR skin tones) and the red segment are
+        warm; the 3D view's gradient background is blue and the orientation
+        labels/box are white (R==B) -- so this cleanly measures wgpu content
+        without being saturated by background or annotations the way a plain
+        max/mean would be."""
+        rgb = self._vtk_render_and_snapshot().astype("int64")
+        return int(((rgb[:, :, 0] - rgb[:, :, 2]) > 30).sum())
+
+    def test_vtk_IndependentVolumeAndSegmentation(self):
+        """Target use case, end to end: an independent wgpu volume whose 3D
+        visibility tracks the Red slice composite (background/foreground +
+        opacity slider), composited together with a wgpu-rendered
+        segmentation -- with NO volume-rendering display node.
+
+        Verifies, by counting warm pixels actually rendered into the 3D view:
+          1. the volume renders when it is the Red background,
+          2. it disappears when removed from the composite (the volume
+             *follows* the Red slice composite node),
+          3. a segmentation added afterwards renders on its own, independent
+             of the (hidden) volume.
+        """
+        import numpy as np
+        from SceneRenderingLib import wgpu_volume_render as wvr
+        from SceneRenderingLib import wgpu_volume_displayer as wvd
+        self.delayDisplay("Independent volume + segmentation loading", 150)
+
+        vol = self._load_cached_volume("MRHead")
+        self.assertIsNotNone(vol, "MRHead failed to load")
+        rng = tuple(vol.GetImageData().GetScalarRange())
+        wvr.apply_preset(wvr.state_for(vol, create=True), "MR default", rng)
+        wvr.set_render_enabled(vol, True)
+        self.assertEqual(
+            slicer.mrmlScene.GetNumberOfNodesByClass(
+                "vtkMRMLVolumeRenderingDisplayNode"), 0,
+            "independent path must not create a VR display node")
+
+        # 3D-only layout: the gradient background is blue (so warm-pixel
+        # counting works), and the Red slice composite node still exists in
+        # the scene to drive visibility even with no slice pane shown.
+        bridge = self._install_vtk_bridge()
+        comp = wvd.red_slice_composite()
+        self.assertIsNotNone(comp, "no Red slice composite node found")
+        comp.SetForegroundVolumeID(None)
+
+        lm = slicer.app.layoutManager()
+        view = lm.threeDWidget(0).threeDView()
+        view.renderWindow().GetRenderers().GetFirstRenderer().ResetCamera()
+
+        # Watch for wgpu validation / bind-group errors over the whole test
+        # (e.g. a pipeline/bind-group shape desync when a segment is added).
+        elm = slicer.app.errorLogModel()
+        err_start = elm.logEntryCount()
+
+        # 1) Volume as the Red background -> full opacity, visible in 3D.
+        comp.SetBackgroundVolumeID(vol.GetID())
+        slicer.app.processEvents()
+        self.assertEqual(len(bridge._fields), 1,
+                         f"expected 1 independent field, got {len(bridge._fields)}")
+        self.assertAlmostEqual(bridge._fields[0].render_opacity, 1.0, places=3,
+                               msg="Red-background volume should be full opacity")
+        on = self._warm_pixel_count()
+        self.assertGreater(on, 4000,
+            f"independent volume not visible in 3D -- warm_px={on}")
+
+        # 2) Remove it from the Red background -> hidden (composite-following).
+        comp.SetBackgroundVolumeID(None)
+        slicer.app.processEvents()
+        self.assertAlmostEqual(bridge._fields[0].render_opacity, 0.0, places=3,
+            msg="volume removed from the Red composite should be hidden")
+        off = self._warm_pixel_count()
+        self.assertLess(off, max(300, on // 8),
+            f"volume did NOT follow the Red slice composite (still visible "
+            f"when removed) -- warm_px on={on} off={off}")
+
+        # 3) Add a segmentation AFTER install -> the bridge picks it up and
+        #    renders it, independent of the (still-hidden) volume.
+        seg = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLSegmentationNode", "TestSeg")
+        seg.CreateDefaultDisplayNodes()
+        seg.SetReferenceImageGeometryParameterFromVolumeNode(vol)
+        arr = slicer.util.arrayFromVolume(vol)
+        sid = seg.GetSegmentation().AddEmptySegment("Brain", "Brain")
+        seg.GetSegmentation().GetSegment(sid).SetColor(0.9, 0.2, 0.2)
+        slicer.util.updateSegmentBinaryLabelmapFromArray(
+            ((arr > 40) & (arr < 120)).astype(np.uint8), seg, sid, vol)
+        seg.GetDisplayNode().SetVisibility3D(True)
+        slicer.app.processEvents()
+        self.assertGreater(len(bridge._segments), 0,
+            "segmentation was not picked up by the bridge")
+        seg_warm = self._warm_pixel_count()
+        self.assertGreater(seg_warm, 4000,
+            f"segmentation not rendered in 3D -- warm_px={seg_warm}")
+
+        # 4) Volume AND segmentation visible together -- the combination that
+        #    used to desync the bind group vs its layout. Both must render.
+        comp.SetBackgroundVolumeID(vol.GetID())
+        slicer.app.processEvents()
+        both = self._warm_pixel_count()
+        self.assertGreater(both, on,
+            f"volume+segmentation should add warm pixels over volume-only "
+            f"(volume={on}, both={both})")
+
+        # No wgpu validation / bind-group errors may have been logged.
+        wgpu_errs = []
+        for i in range(err_start, elm.logEntryCount()):
+            try:
+                d = elm.logEntryDescription(i)
+            except Exception:
+                continue
+            if ("WgpuVolumeBridge" in d or "Validation Error" in d
+                    or "bind group" in d.lower() or "binding" in d.lower()):
+                wgpu_errs.append(d.splitlines()[0][:120])
+        self.assertEqual(wgpu_errs, [],
+            f"wgpu validation/bind-group errors during render: {wgpu_errs}")
+
+        self._stash(vtkBridge=bridge, volume=vol, segmentation=seg)
+        self.delayDisplay(
+            "Independent volume + segmentation PASSED -- set MRHead as the "
+            "Red background/foreground and drag the opacity slider; paint "
+            "the segmentation and watch the 3D view update", 600)
+
+    def test_vtk_VolumeFollowsComposite(self):
+        """EVERY wgpu volume must follow the Red slice composite -- including
+        a plain auto-rendered volume with NO independent state node (the
+        legacy VRDN path, which used to render at fixed full opacity and
+        ignore the composite). Verified with a colour-agnostic before/after
+        view diff, since the legacy path uses a grayscale transfer function.
+        """
+        import numpy as np
+        from SceneRenderingLib import wgpu_volume_displayer as wvd
+        self.delayDisplay("Volume-follows-composite loading", 150)
+
+        vol = self._load_cached_volume("MRHead")  # no independent node -> legacy
+        self.assertIsNotNone(vol, "MRHead failed to load")
+        bridge = self._install_vtk_bridge()
+        self.assertGreater(
+            len(bridge._displayer.fields_by_nid) if bridge._displayer else 0, 0,
+            "expected a legacy VRDN-backed field for the plain volume")
+
+        comp = wvd.red_slice_composite()
+        self.assertIsNotNone(comp, "no Red slice composite node found")
+        view = slicer.app.layoutManager().threeDWidget(0).threeDView()
+        view.renderWindow().GetRenderers().GetFirstRenderer().ResetCamera()
+
+        def snap():
+            return self._vtk_render_and_snapshot().astype("int64")
+
+        # Not selected in the Red composite -> hidden.
+        comp.SetForegroundVolumeID(None)
+        comp.SetBackgroundVolumeID(None)
+        slicer.app.processEvents()
+        self.assertAlmostEqual(bridge._fields[0].render_opacity, 0.0, places=3,
+            msg="legacy volume not in Red bg/fg should be hidden")
+        off = snap()
+
+        # Selected as the Red background -> visible.
+        comp.SetBackgroundVolumeID(vol.GetID())
+        slicer.app.processEvents()
+        self.assertAlmostEqual(bridge._fields[0].render_opacity, 1.0, places=3,
+            msg="legacy volume set as Red background should be full opacity")
+        on = snap()
+
+        diff = int((np.abs(on - off).sum(axis=2) > 40).sum())
+        self.assertGreater(diff, 4000,
+            f"legacy volume did NOT appear when set as the Red background "
+            f"(it ignores the composite) -- changed_px={diff}")
+
+        self._stash(vtkBridge=bridge, volume=vol)
+        self.delayDisplay(
+            "Volume-follows-composite PASSED -- only the volume chosen as the "
+            "Red background/foreground renders in 3D", 400)
 
     def test_vtk_VolumeAndFiducials(self):
         """VTK injection + fiducials. The wgpu volume renders via our
