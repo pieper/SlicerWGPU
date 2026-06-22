@@ -1908,11 +1908,11 @@ class WgpuVolumeBridge:
         # render-opacity from the slice bg/fg selection + opacity slider.
         self._red_composite = None
         self._composite_obs_tag = None
-        # TAA settle: follow-up renders scheduled after a content change so
-        # the temporal accumulator converges to the new scene without the
-        # user having to move the camera. See _render_content_change.
-        self._taa_settle_remaining = 0
-        self._taa_settle_scheduled = False
+        # TAA settle: debounced follow-up renders that converge the temporal
+        # accumulator after a content change. The generation counter cancels
+        # an in-flight settle when a newer change arrives. See
+        # _render_content_change.
+        self._taa_settle_gen = 0
         # (n_fields, n_segments, n_rgba, has_strands) that _bgl/_pipeline were
         # last built for -- guards bind-group/layout consistency.
         self._built_shape = None
@@ -2147,9 +2147,9 @@ class WgpuVolumeBridge:
     def uninstall(self):
         # Set this first so any EndEvent still in flight short-circuits.
         self._disposed = True
-        # Stop any pending TAA settle renders (the singleShot callbacks
-        # also check _disposed, but clear the counter for good measure).
-        self._taa_settle_remaining = 0
+        # Cancel any pending TAA settle renders (the singleShot callbacks
+        # also check _disposed, but bump the generation for good measure).
+        self._taa_settle_gen += 1
         # Drop ourselves from the per-view bridges registry so a
         # subsequent install creates a fresh slot rather than racing
         # with the dead bridge.
@@ -2378,20 +2378,26 @@ class WgpuVolumeBridge:
         self._render_content_change()
 
     # ------------------------------------------------------------------
-    # Render + TAA settle. Every render triggered by a scene/content change
-    # goes through _render_content_change, which resets the temporal
-    # accumulator (so the new content shows correctly on THIS frame -- the
-    # frame-0 blend factor is 1.0, discarding stale history) and then
-    # schedules a short chain of zero-timeout follow-up renders so the
-    # temporal anti-aliasing re-converges without the user having to move
-    # the camera. Without this, an instant edit (e.g. carving a segment)
-    # leaves the removed content faintly ghosted until the next camera
-    # interaction. The chain is re-entrant: a new edit mid-settle just
-    # resets the accumulator and refills the counter, so rapid edits stay
-    # responsive instead of queueing up.
+    # Render + DEBOUNCED TAA settle. A scene/content change goes through
+    # _render_content_change, which resets the temporal accumulator (so the
+    # new content shows correctly on THIS frame -- frame-0 blend factor 1.0,
+    # discarding stale history) and renders ONE frame immediately. The extra
+    # AA-convergence passes are then scheduled, but DEBOUNCED: they only run
+    # after a short quiet period. Each new change bumps a generation counter,
+    # cancelling any in-flight settle.
+    #
+    # Why debounce: every render creates a render pass, and render-pass
+    # creation leaks GPU memory on the Metal backend (Apple driver compiler
+    # allocations -- wgpu issue gfx-rs/wgpu#8768, no working fix). During a
+    # continuous drag/paint every tick already renders the correct frame-0
+    # image; firing 8 extra convergence passes per tick on top of that
+    # multiplied render-pass creation ~Nx and accelerated the leak to the
+    # point of exhausting VRAM. Debouncing means the convergence passes fire
+    # once, after interaction stops -- AA still converges, far fewer passes.
     # ------------------------------------------------------------------
 
-    _TAA_SETTLE_FRAMES = 12
+    _TAA_SETTLE_FRAMES = 8
+    _TAA_SETTLE_DELAY_MS = 60
 
     def _render_content_change(self):
         if self._disposed:
@@ -2403,32 +2409,27 @@ class WgpuVolumeBridge:
             self.rw.Render()
         except Exception:
             pass
-        self._schedule_taa_settle()
+        # Supersede any in-flight settle and (re)arm a fresh one after a quiet
+        # period -- so a continuous drag/paint doesn't fire convergence passes
+        # on every tick.
+        self._taa_settle_gen += 1
+        gen = self._taa_settle_gen
+        qt.QTimer.singleShot(
+            self._TAA_SETTLE_DELAY_MS,
+            lambda: self._taa_settle_step(gen, self._TAA_SETTLE_FRAMES))
 
-    def _schedule_taa_settle(self, frames=None):
-        if self._disposed:
+    def _taa_settle_step(self, gen, remaining):
+        # Stop if torn down, superseded by a newer content change, or done.
+        if self._disposed or gen != self._taa_settle_gen or remaining <= 0:
             return
-        n = self._TAA_SETTLE_FRAMES if frames is None else frames
-        self._taa_settle_remaining = max(self._taa_settle_remaining, n)
-        if not self._taa_settle_scheduled:
-            self._taa_settle_scheduled = True
-            qt.QTimer.singleShot(0, self._taa_settle_step)
-
-    def _taa_settle_step(self):
-        self._taa_settle_scheduled = False
-        if self._disposed or self._taa_settle_remaining <= 0:
-            self._taa_settle_remaining = 0
-            return
-        self._taa_settle_remaining -= 1
         try:
             # Plain render (no TAA reset) so _taa_frame advances and the
             # accumulator converges frame by frame.
             self.rw.Render()
         except Exception:
             pass
-        if self._taa_settle_remaining > 0:
-            self._taa_settle_scheduled = True
-            qt.QTimer.singleShot(0, self._taa_settle_step)
+        qt.QTimer.singleShot(
+            0, lambda: self._taa_settle_step(gen, remaining - 1))
 
     # ------------------------------------------------------------------
     # Red slice composite observation. The slice viewer's background /

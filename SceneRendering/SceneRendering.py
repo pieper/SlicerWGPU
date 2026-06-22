@@ -204,6 +204,14 @@ def _rebind_module_panel(name):
 # SceneRendering
 #
 
+# Apply the Apple-Silicon arch-detection fix at import time -- before anything
+# imports rubicon-objc (wgpu's Metal backend). _ensure_dependencies also calls
+# it, but the bridge can be installed from setup()/enter() WITHOUT running the
+# dependency bootstrap, and on a fresh Slicer that path would otherwise hit the
+# objc_msgSendSuper_stret crash during wgpu device acquisition.
+_fix_macos_processor_for_rubicon()
+
+
 class SceneRendering(ScriptedLoadableModule):
     def __init__(self, parent):
         ScriptedLoadableModule.__init__(self, parent)
@@ -843,6 +851,8 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
             self._volumeStatusLabel.text = "Bridge: installed"
             return
         self._bridge = None
+        # Must run before wgpu acquires its Metal device / imports rubicon-objc.
+        _fix_macos_processor_for_rubicon()
         try:
             from SceneRenderingLib.wgpu_vtk_inject import install_default_bridge
         except Exception as e:
