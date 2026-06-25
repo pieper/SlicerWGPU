@@ -201,6 +201,89 @@ def _rebind_module_panel(name):
 
 
 #
+# System memory-pressure watchdog
+#
+# Investigation (June 2026) into repeated whole-machine freezes blamed on
+# SlicerWGPU found they were NOT a wgpu/GPU leak. The wgpu render path holds
+# steady: RSS flat at ~450 MB and wgpu object counts flat across thousands of
+# renders, hundreds of viewport resizes, and pipeline rebuilds (measured live;
+# the main ray-march loop is also hard-capped at 2048 steps, so no GPU hang).
+#
+# The freezes were macOS Jetsam out-of-memory events on a 16 GB machine: at
+# every JetsamEvent the dominant consumers were a virtualization VM (8 GB),
+# Chrome (3 GB), VS Code and cloudcode_cli -- with Slicer either absent or a
+# minor 500-900 MB contributor, never the hog. (See the JetsamEvent reports in
+# /Library/Logs/DiagnosticReports.) So a Slicer-memory gauge is the wrong
+# instrument -- Slicer stays modest while the SYSTEM runs out.
+#
+# The useful safeguard is the OS's own pre-Jetsam signal,
+# kern.memorystatus_vm_pressure_level (1 = normal, 2 = warn, 4 = critical). We
+# poll it and warn the user to save work / free memory BEFORE the freeze --
+# regardless of which app is to blame.
+
+_MEM_WATCH_TIMER = None
+_mem_watch = {"warned_level": 0}
+
+
+def _system_pressure_level():
+    """macOS memory-pressure level: 1 normal, 2 warn, 4 critical (None on error)."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+            capture_output=True, text=True, timeout=2).stdout.strip()
+        return int(out)
+    except Exception:
+        return None
+
+
+def _start_memory_watchdog(interval_ms=10000):
+    """Start the system memory-pressure watchdog (idempotent)."""
+    global _MEM_WATCH_TIMER
+    if _MEM_WATCH_TIMER is not None:
+        return
+    t = qt.QTimer()
+    t.setInterval(interval_ms)
+    t.connect("timeout()", _memory_watch_tick)
+    t.start()
+    _MEM_WATCH_TIMER = t
+
+
+def _memory_watch_tick():
+    level = _system_pressure_level()
+    if level is None:
+        return
+    s = _mem_watch
+    if level >= 4:
+        if s["warned_level"] < 4:
+            s["warned_level"] = 4
+            _memory_pressure_modal()
+    elif level >= 2:
+        s["warned_level"] = max(s["warned_level"], 2)
+        try:
+            slicer.util.showStatusMessage(
+                "System memory low -- save your work and close memory-heavy "
+                "apps (browser tabs, VMs) to avoid a freeze.", 11000)
+        except Exception:
+            pass
+    else:
+        s["warned_level"] = 0   # pressure recovered; re-arm the warnings
+
+
+def _memory_pressure_modal():
+    msg = ("macOS reports CRITICAL system memory pressure -- a freeze "
+           "(Jetsam out-of-memory) may be imminent.\n\n"
+           "Save your work now and free memory by closing other apps -- "
+           "browser tabs, virtual machines, other editors. On a 16 GB machine "
+           "Slicer is typically a minor contributor; the freezes come from "
+           "total RAM use across all running apps, not from wgpu rendering.")
+    try:
+        slicer.util.warningDisplay(msg, windowTitle="System memory critical")
+    except Exception:
+        pass
+
+
+#
 # SceneRendering
 #
 
@@ -297,6 +380,9 @@ class SceneRenderingWidget(ScriptedLoadableModuleWidget):
 
         self._register_sh_plugin()
         self._install_scene_observers()
+        # Aggressively watch for the wgpu/Metal GPU-memory leak and prompt a
+        # restart before it can crash the machine (see _memory_watch_tick).
+        _start_memory_watchdog()
 
         # Default-ON bridge install. Synchronous: the 3D view is
         # virtually always laid out by the time setup() runs. If it
