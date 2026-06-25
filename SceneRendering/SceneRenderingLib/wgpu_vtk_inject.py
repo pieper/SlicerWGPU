@@ -2667,6 +2667,17 @@ class WgpuVolumeBridge:
         avoids the race."""
         if volume_node is None:
             return False
+        # Labelmap volumes are NOT valid volume-rendering targets. They are
+        # a subclass of vtkMRMLScalarVolumeNode (so they pass the IsA scalar
+        # test), and segmentation operations create them constantly as
+        # transient scratch volumes -- arrayFromSegmentBinaryLabelmap,
+        # ExportSegmentsToLabelmapNode, the Segment Editor. Worse,
+        # CreateDefaultVolumeRenderingNodes on a labelmap routes into
+        # vtkSlicerVolumeRenderingLogic::CopyLabelMapDisplayToVolumeRenderingDisplayNode,
+        # which SEGFAULTs (null deref) -- crashing all of Slicer. Never
+        # auto-create a VRDN for one.
+        if volume_node.IsA("vtkMRMLLabelMapVolumeNode"):
+            return False
         try:
             img = volume_node.GetImageData()
             if img is None:
@@ -2689,6 +2700,12 @@ class WgpuVolumeBridge:
             return False
 
     def _auto_create_vrdn_if_missing(self, volume_node):
+        # Defense in depth: never run VR creation on a labelmap volume --
+        # CreateDefaultVolumeRenderingNodes segfaults on it (see
+        # _is_volume_ready_for_vrdn). Callers gate on that already, but this
+        # is the function holding the dangerous call, so guard it directly.
+        if volume_node is None or volume_node.IsA("vtkMRMLLabelMapVolumeNode"):
+            return
         vol_id = volume_node.GetID()
         # Independent path owns this volume -- don't auto-create a legacy
         # VRDN for it.
@@ -3453,10 +3470,20 @@ class WgpuVolumeBridge:
         ids = vtk.vtkStringArray()
         segmentation.GetSegmentIDs(ids)
         result = []
-        for i in range(ids.GetNumberOfValues()):
-            sid = ids.GetValue(i)
-            if dn is None or dn.GetSegmentVisibility(sid):
-                result.append(sid)
+        # A just-added segment exists in the segmentation before the display
+        # node has created display properties for it; GetSegmentVisibility then
+        # emits a benign "No display properties found for segment" warning.
+        # Suppress VTK warnings for this short synchronous query loop only
+        # (nothing else runs in this window) so the console stays clean.
+        prev_warn = vtk.vtkObject.GetGlobalWarningDisplay()
+        vtk.vtkObject.GlobalWarningDisplayOff()
+        try:
+            for i in range(ids.GetNumberOfValues()):
+                sid = ids.GetValue(i)
+                if dn is None or dn.GetSegmentVisibility(sid):
+                    result.append(sid)
+        finally:
+            vtk.vtkObject.SetGlobalWarningDisplay(prev_warn)
         return result
 
     def _refresh_segments_for_record(self, record):
@@ -3471,10 +3498,20 @@ class WgpuVolumeBridge:
         realloc = False
         for sid in want:
             s = existing.get(sid)
-            if s is None:
+            is_new = s is None
+            if is_new:
                 s = SegmentField(self.device, seg_node_id, sid)
-                realloc = True
-            if s.refresh():
+            realloc_s = s.refresh()
+            # An empty segment -- e.g. the blank segment the Segment Editor
+            # adds before any painting -- has no labelmap content, so
+            # refresh() allocates no GPU texture (tex_view stays None).
+            # Including it would make the pipeline bind a None texture view,
+            # which fails the bind-group rebuild and blanks the ENTIRE view,
+            # taking the volume rendering down with it. Skip it; the
+            # content-modified observer re-runs this once the user paints in.
+            if s.tex_view is None:
+                continue
+            if is_new or realloc_s:
                 realloc = True
             self._smooth_segment(s)
             new_segments.append(s)
